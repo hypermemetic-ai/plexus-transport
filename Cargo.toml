@@ -2,11 +2,12 @@
 name = "plexus-transport"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
 
 [dependencies]
 # Core dependencies
-plexus-core = { path = "../hub-core" }
+plexus-core = "0.2.1"
 tokio = { version = "1.42", features = ["full"] }
 futures = "0.3"
 async-stream = "0.3"
@@ -42,3 +43,8 @@ path = "examples/jsexec_server.rs"
 [[example]]
 name = "full_plexus"
 path = "examples/full_plexus.rs"
+
+[patch]
+
+[patch.crates-io]
+plexus-core = { path = "../plexus-core" }

@@ -1,0 +1,7 @@
+org = "hypermemetic"
+forges = [
+    "github",
+    "codeberg",
+]
+visibility = "public"
+description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
