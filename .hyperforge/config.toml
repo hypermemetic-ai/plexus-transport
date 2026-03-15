@@ -4,3 +4,45 @@ forges = [
     "github",
 ]
 visibility = "public"
+description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
+
+[ci]
+skip_validate = false
+
+[[ci.runners]]
+type = "local"
+build = [
+    "cargo",
+    "check",
+]
+test = [
+    "cargo",
+    "test",
+    "--lib",
+]
+timeout_secs = 300
+
+[[ci.runners]]
+type = "local"
+build = [
+    "cargo",
+    "build",
+]
+test = [
+    "cargo",
+    "test",
+]
+timeout_secs = 600
+
+[[ci.runners]]
+type = "docker"
+build = [
+    "cargo",
+    "build",
+]
+test = [
+    "cargo",
+    "test",
+]
+image = "rust:latest"
+timeout_secs = 900
