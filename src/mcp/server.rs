@@ -21,6 +21,44 @@ use crate::mcp::bridge::{ActivationMcpBridge, RouteFn};
 #[cfg(feature = "sqlite-sessions")]
 use crate::mcp::session::{SqliteSessionConfig, SqliteSessionManager};
 
+/// Middleware to enforce `Authorization: Bearer <key>` on all MCP HTTP requests.
+///
+/// When the `api_key` state is `Some(key)`, requests missing or supplying the
+/// wrong token are rejected with HTTP 401. When state is `None`, all requests
+/// pass through unchanged (preserving the no-auth default).
+async fn auth_middleware(
+    axum::extract::State(api_key): axum::extract::State<Option<String>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Some(ref key) = api_key {
+        let expected = format!("Bearer {}", key);
+        let ok = request
+            .headers()
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == expected)
+            .unwrap_or(false);
+
+        if !ok {
+            tracing::warn!(
+                "MCP HTTP auth rejected: missing or invalid Authorization header (uri={})",
+                request.uri()
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(
+                    http::header::WWW_AUTHENTICATE,
+                    http::HeaderValue::from_static("Bearer realm=\"plexus\""),
+                )],
+                "Unauthorized",
+            )
+                .into_response();
+        }
+    }
+    next.run(request).await
+}
+
 /// Middleware to log all incoming HTTP requests
 async fn log_request_middleware(request: Request, next: Next) -> Response {
     let method = request.method().clone();
@@ -130,6 +168,7 @@ pub async fn serve_mcp_http<A: Activation>(
     flat_schemas: Option<Vec<plexus_core::plexus::PluginSchema>>,
     route_fn: Option<RouteFn>,
     config: McpHttpConfig,
+    api_key: Option<String>,
 ) -> Result<JoinHandle<std::result::Result<(), std::io::Error>>> {
     tracing::info!("Starting MCP HTTP transport at http://{}/mcp", config.addr);
 
@@ -186,12 +225,13 @@ pub async fn serve_mcp_http<A: Activation>(
         )
     };
 
-    // Build axum router with MCP at /mcp, debug endpoint, and request logging
+    // Build axum router with MCP at /mcp, debug endpoint, request logging, and auth
     let mcp_app = Router::new()
         .nest_service("/mcp", mcp_service)
         .route("/debug", any(debug_handler))
         .fallback(fallback_handler)
-        .layer(middleware::from_fn(log_request_middleware));
+        .layer(middleware::from_fn(log_request_middleware))
+        .layer(middleware::from_fn_with_state(api_key, auth_middleware));
 
     // Start MCP HTTP server
     let listener = tokio::net::TcpListener::bind(config.addr).await?;

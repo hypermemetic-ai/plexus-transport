@@ -11,6 +11,9 @@ pub struct TransportConfig {
     pub websocket: Option<WebSocketConfig>,
     pub stdio: Option<StdioConfig>,
     pub mcp_http: Option<McpHttpConfig>,
+    /// Optional bearer token required on all WebSocket and MCP HTTP connections.
+    /// When `None`, no authentication is required (current behaviour).
+    pub api_key: Option<String>,
 }
 
 impl Default for TransportConfig {
@@ -19,6 +22,7 @@ impl Default for TransportConfig {
             websocket: None,
             stdio: None,
             mcp_http: None,
+            api_key: None,
         }
     }
 }
@@ -27,6 +31,8 @@ impl Default for TransportConfig {
 #[derive(Debug, Clone)]
 pub struct WebSocketConfig {
     pub addr: SocketAddr,
+    /// Optional bearer token required on the HTTP upgrade request.
+    pub api_key: Option<String>,
 }
 
 impl WebSocketConfig {
@@ -35,6 +41,7 @@ impl WebSocketConfig {
             addr: format!("127.0.0.1:{}", port)
                 .parse()
                 .expect("Valid socket address"),
+            api_key: None,
         }
     }
 }
@@ -63,6 +70,8 @@ pub struct McpHttpConfig {
     pub server_name: Option<String>,
     /// Optional override for server version (defaults to activation version)
     pub server_version: Option<String>,
+    /// Optional bearer token required on all MCP HTTP requests.
+    pub api_key: Option<String>,
 }
 
 impl McpHttpConfig {
@@ -74,6 +83,7 @@ impl McpHttpConfig {
             session_storage: SessionStorage::default(),
             server_name: None,
             server_version: None,
+            api_key: None,
         }
     }
 

@@ -29,6 +29,8 @@
 //! # }
 //! ```
 
+#[cfg(feature = "mcp-gateway")]
+pub mod combined;
 pub mod config;
 pub mod server;
 pub mod stdio;
@@ -41,6 +43,8 @@ pub mod mcp;
 pub mod mcp;
 
 // Re-export main API
+#[cfg(feature = "mcp-gateway")]
+pub use combined::serve_combined;
 pub use config::{McpHttpConfig, SessionStorage, StdioConfig, TransportConfig, WebSocketConfig};
 pub use server::{TransportServer, TransportServerBuilder};
 

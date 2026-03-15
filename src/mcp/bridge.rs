@@ -15,6 +15,8 @@ use rmcp::{
     ErrorData as McpError, ServerHandler,
 };
 use serde_json::json;
+use form_urlencoded;
+use http::request::Parts;
 
 /// A function that routes a namespaced method call (e.g., "loopback.permit") to the
 /// correct activation. Used by hub activations to dispatch child calls via `hub.route()`.
@@ -248,12 +250,47 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let method_name = &request.name;
-        let arguments = request
+        let mut arguments_map = request
             .arguments
-            .map(serde_json::Value::Object)
-            .unwrap_or(json!({}));
+            .unwrap_or_else(|| serde_json::Map::new());
 
-        tracing::debug!("Calling tool: {} with args: {:?}", method_name, arguments);
+        tracing::debug!("Calling tool: {} with args: {:?}", method_name, arguments_map);
+
+        // Extract HTTP connection metadata from extensions and inject into arguments.
+        // This makes the gateway transparent: all HTTP-level metadata (query params, headers)
+        // is forwarded to the backend without the gateway needing to know what it means.
+        tracing::debug!("[MCP BRIDGE] call_tool: method={}, checking for HTTP metadata...", method_name);
+        if let Some(parts) = ctx.extensions.get::<http::request::Parts>() {
+            tracing::debug!("[MCP BRIDGE] Found HTTP Parts! URI: {}", parts.uri);
+            let mut connection_meta = serde_json::Map::new();
+
+            // Forward ALL query parameters
+            if let Some(query) = parts.uri.query() {
+                tracing::debug!("[MCP BRIDGE] Query string: {}", query);
+                for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+                    tracing::debug!("[MCP BRIDGE] Query param: {}={}", key, value);
+                    connection_meta.insert(
+                        format!("query.{}", key),
+                        json!(value.to_string()),
+                    );
+                }
+            } else {
+                tracing::debug!("[MCP BRIDGE] No query string in URI");
+            }
+
+            // If we extracted any connection metadata, inject it
+            if !connection_meta.is_empty() {
+                arguments_map.insert("_connection".to_string(), json!(connection_meta));
+                tracing::debug!("[MCP BRIDGE] Injected connection metadata: {:?}", connection_meta);
+                tracing::debug!("Injected connection metadata: {:?}", connection_meta);
+            } else {
+                tracing::debug!("[MCP BRIDGE] No connection metadata to inject");
+            }
+        } else {
+            tracing::debug!("[MCP BRIDGE] No HTTP Parts in extensions!");
+        }
+
+        let arguments_value = serde_json::Value::Object(arguments_map);
 
         // Get progress token if provided
         let progress_token = ctx.meta.get_progress_token();
@@ -266,7 +303,7 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
         // namespaced method name (e.g., "loopback.permit") to the correct child.
         // Otherwise strip the namespace prefix and call activation directly.
         let stream = if let Some(ref router) = self.router {
-            router(method_name.to_string(), arguments)
+            router(method_name.to_string(), arguments_value)
                 .await
                 .map_err(plexus_to_mcp_error)?
         } else {
@@ -276,7 +313,7 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                 method_name
             };
             self.activation
-                .call(method, arguments)
+                .call(method, arguments_value)
                 .await
                 .map_err(plexus_to_mcp_error)?
         };

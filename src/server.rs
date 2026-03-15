@@ -70,7 +70,11 @@ impl<A: Activation> TransportServer<A> {
         }
 
         // Start WebSocket transport
-        let ws_handle: Option<ServerHandle> = if let Some(ws_config) = self.config.websocket {
+        let ws_handle: Option<ServerHandle> = if let Some(mut ws_config) = self.config.websocket {
+            // Propagate the global api_key to the WebSocket config if not already set.
+            if ws_config.api_key.is_none() {
+                ws_config.api_key = self.config.api_key.clone();
+            }
             let module = module.expect("RPC module should be created for WebSocket");
             Some(serve_websocket(module, ws_config).await?)
         } else {
@@ -80,7 +84,8 @@ impl<A: Activation> TransportServer<A> {
         // Start MCP HTTP transport
         let mcp_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> =
             if let Some(mcp_config) = self.config.mcp_http {
-                Some(serve_mcp_http(self.activation.clone(), self.mcp_flat_schemas.take(), self.mcp_route_fn.take(), mcp_config).await?)
+                let api_key = self.config.api_key.clone();
+                Some(serve_mcp_http(self.activation.clone(), self.mcp_flat_schemas.take(), self.mcp_route_fn.take(), mcp_config, api_key).await?)
             } else {
                 None
             };
@@ -182,6 +187,15 @@ impl<A: Activation> TransportServerBuilder<A> {
     /// namespaced tool calls (e.g., "loopback.permit") reach the correct child.
     pub fn with_mcp_route_fn(mut self, route_fn: RouteFn) -> Self {
         self.mcp_route_fn = Some(route_fn);
+        self
+    }
+
+    /// Require `Authorization: Bearer <key>` on all WebSocket and MCP HTTP connections.
+    ///
+    /// When set, connections missing or supplying the wrong token are rejected with
+    /// HTTP 401. Passing `None` disables authentication (default behaviour).
+    pub fn with_api_key(mut self, key: Option<String>) -> Self {
+        self.config.api_key = key;
         self
     }
 
