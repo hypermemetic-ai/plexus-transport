@@ -16,7 +16,6 @@ use rmcp::{
 };
 use serde_json::json;
 use form_urlencoded;
-use http::request::Parts;
 
 /// A function that routes a namespaced method call (e.g., "loopback.permit") to the
 /// correct activation. Used by hub activations to dispatch child calls via `hub.route()`.
