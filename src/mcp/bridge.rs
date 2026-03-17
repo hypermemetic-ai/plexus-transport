@@ -15,6 +15,10 @@ use rmcp::{
     ErrorData as McpError, ServerHandler,
 };
 use serde_json::json;
+<<<<<<< HEAD
+=======
+use form_urlencoded;
+>>>>>>> 54de639 (WIP: uncommitted session work)
 
 /// A function that routes a namespaced method call (e.g., "loopback.permit") to the
 /// correct activation. Used by hub activations to dispatch child calls via `hub.route()`.
