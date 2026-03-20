@@ -11,7 +11,8 @@ pub struct TransportConfig {
     pub websocket: Option<WebSocketConfig>,
     pub stdio: Option<StdioConfig>,
     pub mcp_http: Option<McpHttpConfig>,
-    /// Optional bearer token required on all WebSocket and MCP HTTP connections.
+    pub rest_http: Option<RestHttpConfig>,
+    /// Optional bearer token required on all WebSocket, MCP HTTP, and REST HTTP connections.
     /// When `None`, no authentication is required (current behaviour).
     pub api_key: Option<String>,
 }
@@ -22,6 +23,7 @@ impl Default for TransportConfig {
             websocket: None,
             stdio: None,
             mcp_http: None,
+            rest_http: None,
             api_key: None,
         }
     }
@@ -119,5 +121,37 @@ pub enum SessionStorage {
 impl Default for SessionStorage {
     fn default() -> Self {
         Self::InMemory
+    }
+}
+
+/// REST HTTP server configuration
+#[derive(Debug, Clone)]
+pub struct RestHttpConfig {
+    pub addr: SocketAddr,
+    pub server_name: String,
+    pub server_version: String,
+}
+
+impl RestHttpConfig {
+    pub fn new(port: u16) -> Self {
+        Self {
+            addr: format!("127.0.0.1:{}", port)
+                .parse()
+                .expect("Valid socket address"),
+            server_name: "plexus-rest".to_string(),
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+
+    /// Override the server name
+    pub fn with_server_name(mut self, name: String) -> Self {
+        self.server_name = name;
+        self
+    }
+
+    /// Override the server version
+    pub fn with_server_version(mut self, version: String) -> Self {
+        self.server_version = version;
+        self
     }
 }

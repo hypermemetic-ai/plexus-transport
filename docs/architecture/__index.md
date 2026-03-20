@@ -4,6 +4,14 @@ This directory contains architecture decision records and design documents for h
 
 ## Documents (Reverse Chronological)
 
+- **[16672711854663421183_protocol-methods.md](16672711854663421183_protocol-methods.md)** (2026-03-20)
+  - Protocol-level methods architecture
+  - Schema discovery and introspection
+  - Transport comparison (REST, MCP, WebSocket)
+  - Implementation patterns and rationale
+  - Auto-generated schema method design
+  - Cache validation and backend discovery
+
 - **[16677421176026603519_infrastructure-extraction-pattern.md](16677421176026603519_infrastructure-extraction-pattern.md)** (2026-01-24)
   - How to extract infrastructure into reusable libraries
   - Step-by-step extraction process
@@ -37,9 +45,19 @@ Where `nanotime` is the current Unix timestamp in nanoseconds. This creates a de
 - stdio (MCP-compatible)
 - WebSocket (JSON-RPC)
 - MCP HTTP (SSE streaming)
+- REST HTTP (RESTful API with HTTP methods)
+
+**Protocol Methods:**
+- `schema` - Discovery (all transports)
+- `{method}.schema` - Per-method schema (REST, WebSocket)
+- `{ns}.call` - Generic invocation (WebSocket only)
+- `{ns}.hash` - Cache validation (WebSocket only)
+- `_info` - Backend discovery (WebSocket only)
 
 **Design Patterns:**
 - Builder pattern for configuration
 - Callback for Arc lifecycle preservation
 - Generic over Activation trait
 - In-memory sessions by default
+- Protocol methods as first-class methods
+- Strongly-typed HTTP method routing

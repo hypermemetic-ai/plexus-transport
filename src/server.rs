@@ -85,42 +85,58 @@ impl<A: Activation> TransportServer<A> {
         let mcp_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> =
             if let Some(mcp_config) = self.config.mcp_http {
                 let api_key = self.config.api_key.clone();
-                Some(serve_mcp_http(self.activation.clone(), self.mcp_flat_schemas.take(), self.mcp_route_fn.take(), mcp_config, api_key).await?)
+                Some(serve_mcp_http(self.activation.clone(), self.mcp_flat_schemas.clone(), self.mcp_route_fn.clone(), mcp_config, api_key).await?)
             } else {
                 None
             };
 
-        // Wait for servers to complete
-        match (ws_handle, mcp_handle) {
-            (Some(ws), Some(mcp)) => {
-                tokio::select! {
-                    _ = ws.stopped() => {
-                        tracing::info!("WebSocket server stopped");
-                    }
-                    result = mcp => {
-                        match result {
-                            Ok(Ok(())) => tracing::info!("MCP server stopped"),
-                            Ok(Err(e)) => tracing::error!("MCP server error: {}", e),
-                            Err(e) => tracing::error!("MCP server task failed: {}", e),
-                        }
+        // Start REST HTTP transport
+        #[cfg(feature = "http-gateway")]
+        let rest_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> =
+            if let Some(rest_config) = self.config.rest_http {
+                let api_key = self.config.api_key.clone();
+                Some(crate::http::serve_rest_http(self.activation.clone(), self.mcp_flat_schemas.clone(), self.mcp_route_fn.clone(), rest_config, api_key).await?)
+            } else {
+                None
+            };
+
+        #[cfg(not(feature = "http-gateway"))]
+        let rest_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> = None;
+
+        // Wait for any server to complete
+        if ws_handle.is_none() && mcp_handle.is_none() && rest_handle.is_none() {
+            tracing::warn!("No transports configured, nothing to serve");
+            return Ok(());
+        }
+
+        // Wait for first server to stop
+        tokio::select! {
+            _ = async {
+                if let Some(ws) = ws_handle {
+                    ws.stopped().await;
+                    tracing::info!("WebSocket server stopped");
+                }
+            }, if ws_handle.is_some() => {}
+
+            _ = async {
+                if let Some(mcp) = mcp_handle {
+                    match mcp.await {
+                        Ok(Ok(())) => tracing::info!("MCP server stopped"),
+                        Ok(Err(e)) => tracing::error!("MCP server error: {}", e),
+                        Err(e) => tracing::error!("MCP server task failed: {}", e),
                     }
                 }
-            }
-            (Some(ws), None) => {
-                ws.stopped().await;
-                tracing::info!("WebSocket server stopped");
-            }
-            (None, Some(mcp)) => {
-                let result = mcp.await;
-                match result {
-                    Ok(Ok(())) => tracing::info!("MCP server stopped"),
-                    Ok(Err(e)) => tracing::error!("MCP server error: {}", e),
-                    Err(e) => tracing::error!("MCP server task failed: {}", e),
+            }, if mcp_handle.is_some() => {}
+
+            _ = async {
+                if let Some(rest) = rest_handle {
+                    match rest.await {
+                        Ok(Ok(())) => tracing::info!("REST server stopped"),
+                        Ok(Err(e)) => tracing::error!("REST server error: {}", e),
+                        Err(e) => tracing::error!("REST server task failed: {}", e),
+                    }
                 }
-            }
-            (None, None) => {
-                tracing::warn!("No transports configured, nothing to serve");
-            }
+            }, if rest_handle.is_some() => {}
         }
 
         Ok(())
@@ -172,6 +188,20 @@ impl<A: Activation> TransportServerBuilder<A> {
     /// Enable MCP HTTP transport with custom configuration
     pub fn with_mcp_http_config(mut self, config: McpHttpConfig) -> Self {
         self.config.mcp_http = Some(config);
+        self
+    }
+
+    /// Enable REST HTTP transport on the specified port
+    #[cfg(feature = "http-gateway")]
+    pub fn with_rest_http(mut self, port: u16) -> Self {
+        self.config.rest_http = Some(crate::config::RestHttpConfig::new(port));
+        self
+    }
+
+    /// Enable REST HTTP transport with custom configuration
+    #[cfg(feature = "http-gateway")]
+    pub fn with_rest_http_config(mut self, config: crate::config::RestHttpConfig) -> Self {
+        self.config.rest_http = Some(config);
         self
     }
 

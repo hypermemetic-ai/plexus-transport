@@ -85,18 +85,19 @@ pub async fn serve_combined<A>(
     route_fn: Option<RouteFn>,
     addr: SocketAddr,
     api_key: Option<String>,
+    enable_rest: bool,
 ) -> Result<ServerHandle>
 where
     A: Activation + Send + Sync + 'static,
 {
     // ── MCP side ────────────────────────────────────────────────────────────
     let mut bridge = ActivationMcpBridge::with_server_info_and_schemas(
-        activation,
+        activation.clone(),
         None,
         None,
-        flat_schemas,
+        flat_schemas.clone(),
     );
-    if let Some(rf) = route_fn {
+    if let Some(rf) = route_fn.clone() {
         bridge = bridge.with_router(rf);
     }
 
@@ -108,16 +109,42 @@ where
         StreamableHttpServerConfig::default(),
     );
 
-    // Axum router — only intercepts /mcp; all other requests fall through to
+    // ── REST side (optional) ───────────────────────────────────────────────────
+    #[cfg(feature = "http-gateway")]
+    let rest_router_opt = if enable_rest {
+        let mut rest_bridge = crate::http::bridge::ActivationRestBridge::with_server_info_and_schemas(
+            activation.clone(),
+            None,
+            None,
+            flat_schemas.clone(),
+        );
+        if let Some(rf) = route_fn {
+            rest_bridge = rest_bridge.with_router(rf);
+        }
+        Some(rest_bridge.into_router())
+    } else {
+        None
+    };
+
+    #[cfg(not(feature = "http-gateway"))]
+    let rest_router_opt: Option<Router> = None;
+
+    // Axum router — intercepts /mcp and optionally /rest; all other requests fall through to
     // jsonrpsee via the else branch in the per-connection service_fn.
     // Auth middleware is applied here so that WebSocket upgrades (handled by
     // jsonrpsee below) are also protected by the check inside serve_websocket.
-    let mcp_router: Router = Router::new()
-        .nest_service("/mcp", mcp_service)
-        .layer(axum_middleware::from_fn_with_state(
-            api_key.clone(),
-            combined_auth_middleware,
-        ));
+    let mut mcp_router: Router = Router::new()
+        .nest_service("/mcp", mcp_service);
+
+    #[cfg(feature = "http-gateway")]
+    if let Some(rest_router) = rest_router_opt {
+        mcp_router = mcp_router.nest("/rest", rest_router);
+    }
+
+    let mcp_router = mcp_router.layer(axum_middleware::from_fn_with_state(
+        api_key.clone(),
+        combined_auth_middleware,
+    ));
 
     // ── JSON-RPC / WebSocket side ────────────────────────────────────────────
     let (stop_handle, server_handle) = stop_channel();
@@ -128,6 +155,10 @@ where
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("Starting WebSocket transport at ws://{}", addr);
     tracing::info!("Starting MCP HTTP transport at http://{}/mcp", addr);
+    #[cfg(feature = "http-gateway")]
+    if enable_rest {
+        tracing::info!("Starting REST HTTP transport at http://{}/rest", addr);
+    }
 
     let stop = stop_handle.clone();
     // Pre-compute the expected Authorization header value for WebSocket path checks.
@@ -162,7 +193,7 @@ where
                     let ws_auth = ws_auth.clone();
 
                     async move {
-                        if req.uri().path().starts_with("/mcp") {
+                        if req.uri().path().starts_with("/mcp") || req.uri().path().starts_with("/rest") {
                             // Axum expects Request<AxumBody>; wrap Incoming.
                             let (parts, body) = req.into_parts();
                             let axum_req =
