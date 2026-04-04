@@ -1,13 +1,13 @@
 [package]
 name = "plexus-transport"
-version = "0.1.8"
+version = "0.2.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
 
 [dependencies]
 # Core dependencies
-plexus-core = { path = "../plexus-core" }
+plexus-core = { path = "../plexus-core", version = "0.4" }
 tokio = { version = "1.42", features = ["full"] }
 futures = "0.3"
 async-stream = "0.3"

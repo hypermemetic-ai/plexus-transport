@@ -1,7 +1,7 @@
 //! Transport server builder and orchestration
 
 use anyhow::Result;
-use plexus_core::plexus::{Activation, PluginSchema};
+use plexus_core::plexus::{Activation, PluginSchema, SessionValidator};
 use jsonrpsee::server::ServerHandle;
 use jsonrpsee::RpcModule;
 use std::sync::Arc;
@@ -35,6 +35,9 @@ pub struct TransportServer<A: Activation> {
     /// Optional routing function for hub activations.
     /// When set, MCP call_tool uses it to dispatch namespaced calls via hub.route().
     mcp_route_fn: Option<RouteFn>,
+    /// Optional session validator for cookie-based authentication.
+    /// When set, validates cookies from HTTP upgrade requests.
+    session_validator: Option<Arc<dyn SessionValidator>>,
 }
 
 impl<A: Activation> TransportServer<A> {
@@ -76,7 +79,7 @@ impl<A: Activation> TransportServer<A> {
                 ws_config.api_key = self.config.api_key.clone();
             }
             let module = module.expect("RPC module should be created for WebSocket");
-            Some(serve_websocket(module, ws_config).await?)
+            Some(serve_websocket(module, ws_config, self.session_validator.clone()).await?)
         } else {
             None
         };
@@ -151,6 +154,7 @@ pub struct TransportServerBuilder<A: Activation> {
     rpc_converter: Option<RpcConverter<A>>,
     mcp_flat_schemas: Option<Vec<PluginSchema>>,
     mcp_route_fn: Option<RouteFn>,
+    session_validator: Option<Arc<dyn SessionValidator>>,
 }
 
 impl<A: Activation> TransportServerBuilder<A> {
@@ -164,6 +168,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             rpc_converter: Some(Box::new(rpc_converter)),
             mcp_flat_schemas: None,
             mcp_route_fn: None,
+            session_validator: None,
         }
     }
 
@@ -229,6 +234,19 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
+    /// Set session validator for cookie-based authentication.
+    ///
+    /// When set, the WebSocket transport will extract cookies from HTTP upgrade
+    /// requests and validate them using the provided SessionValidator. The resulting
+    /// AuthContext is stored in request Extensions and passed to RPC methods.
+    ///
+    /// This is useful for browser-based authentication where cookies are preferred
+    /// over Authorization headers.
+    pub fn with_session_validator(mut self, validator: Arc<dyn SessionValidator>) -> Self {
+        self.session_validator = Some(validator);
+        self
+    }
+
     /// Build the transport server
     pub async fn build(self) -> Result<TransportServer<A>> {
         Ok(TransportServer {
@@ -237,6 +255,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             rpc_converter: self.rpc_converter,
             mcp_flat_schemas: self.mcp_flat_schemas,
             mcp_route_fn: self.mcp_route_fn,
+            session_validator: self.session_validator,
         })
     }
 }

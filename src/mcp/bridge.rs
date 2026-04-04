@@ -93,6 +93,9 @@ fn plexus_to_mcp_error(e: PlexusError) -> McpError {
         PlexusError::TransportError(kind) => {
             McpError::internal_error(format!("Transport error: {:?}", kind), None)
         }
+        PlexusError::Unauthenticated(reason) => {
+            McpError::invalid_request(format!("Authentication required: {}", reason), None)
+        }
     }
 }
 
@@ -312,7 +315,7 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                 method_name
             };
             self.activation
-                .call(method, arguments_value)
+                .call(method, arguments_value, None)
                 .await
                 .map_err(plexus_to_mcp_error)?
         };
