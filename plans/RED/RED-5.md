@@ -1,12 +1,27 @@
 ---
 id: RED-5
 title: "Permissive-resolver audit tool (S07)"
-status: Pending
+status: Idea
 type: implementation
 blocked_by: []
 unlocks: []
 severity: Low
 ---
+
+**Deferred indefinitely Apr 23 2026.** The spike (RED-S07) confirmed
+that nothing in the framework catches a developer writing a
+`#[from_auth(self.accept_all)]` stub resolver that never rejects.
+The hole is real but low-severity (friendly-attacker only — adversarial
+bypass requires merging malicious resolver code, which has separate
+defenses like code review).
+
+Building `plexus-audit` is a new crate's worth of work, and the
+pattern-matching detection is fragile (names like
+`accept_after_validate_2024` trigger the `accept_*` pattern;
+adversarial naming bypasses it). Not prioritized.
+
+Ticket preserved as documentation of the finding. Revisit when
+there's a SOC2 audit cycle that wants a concrete linter artifact.
 
 ## Problem
 

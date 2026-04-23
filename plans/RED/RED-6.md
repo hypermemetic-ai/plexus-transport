@@ -1,12 +1,41 @@
 ---
 id: RED-6
 title: "Strict-mode activation: every method must declare auth posture explicitly"
-status: Idea
+status: Complete
 type: implementation
 blocked_by: [RED-2, RED-3, RED-4]
 unlocks: []
 severity: Medium
 ---
+
+**Implemented Apr 23 2026 (autonomous run):** `auth = "..."` attribute on
+the activation takes one of four values:
+
+- `"required"` — strict; every method must use `#[from_auth]` OR
+  `#[plexus_macros::method(public)]`. Compile error otherwise.
+- `"optional"` — default; no enforcement. RED-2 emits a warning on
+  asymmetric auth across methods.
+- `"mixed"` — like optional, suppresses the RED-2 warning (explicit
+  acknowledgment).
+- `"none"` — affirmative public; any `#[from_auth]` in the activation
+  is a compile error.
+
+The new attribute replaces RED-2's `auth_posture = "mixed"` (no external
+consumers yet; same-session rename). Default posture is `"optional"` —
+every existing activation compiles identically to today.
+
+Covered by 5 runtime tests and 3 trybuild compile-fail fixtures in
+`tests/red6_auth_posture_tests.rs` + `tests/compile/red6_*.rs`.
+
+97/97 plexus-macros tests pass.
+
+Defense-in-depth now:
+- **Strict posture** (this ticket): activation declares enforcement
+- Warning (RED-2): fires on asymmetry in `optional` default
+- Compile error (RED-3): `#[from_auth]` in activation without `request = ...`
+- Build-time (RED-4): server refuses to start without auth middleware
+- Connect-time (RED-9): WS upgrade rejects missing/bad cookies
+- Runtime (baseline): `#[from_auth]` fail-closed when AuthContext absent
 
 ## Problem
 
