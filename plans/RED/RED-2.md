@@ -1,12 +1,22 @@
 ---
 id: RED-2
 title: "Macro diagnostic on mixed-auth activation (addresses S01 + S06)"
-status: Pending
+status: Complete
 type: implementation
 blocked_by: []
 unlocks: []
 severity: High
 ---
+
+**Implemented Apr 23 2026 (autonomous run):** Compile warning landed via the
+dummy-deprecated-const pattern used by existing IR-5 warnings.
+
+- `HubMethodsAttrs.auth_posture_mixed` parses `auth_posture = "mixed"` activation-level opt-out
+- `HubMethodAttrs.public` (mirrored to `MethodInfo.public`) parses `#[method(public)]` per-method opt-out
+- `mixed_auth_warning()` in codegen/mod.rs detects asymmetry; wires into the generate() output alongside other warnings
+- 4 acceptance tests in `red2_mixed_auth_warning_tests.rs` covering all four shape combinations
+- Manual smoke: warning fires on `tests/red_s01_silent_omission.rs` (the spike fixture) and `tests/req6_from_auth_tests.rs::skip` (the request = () override case)
+- 90/90 plexus-macros tests pass
 
 ## Problem
 

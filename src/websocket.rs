@@ -24,6 +24,7 @@ pub async fn serve_websocket(
     module: RpcModule<()>,
     config: WebSocketConfig,
     session_validator: Option<Arc<dyn plexus_core::plexus::SessionValidator>>,
+    reject_on_session_failure: bool,
 ) -> Result<ServerHandle> {
     tracing::info!("Starting WebSocket transport at ws://{}", config.addr);
 
@@ -37,6 +38,7 @@ pub async fn serve_websocket(
                 service,
                 expected_bearer: expected_bearer.clone(),
                 session_validator: session_validator.clone(),
+                reject_on_session_failure,
             }
         });
         let server = Server::builder()
@@ -82,6 +84,12 @@ mod auth {
         pub(super) service: S,
         pub(super) expected_bearer: Option<String>,
         pub(super) session_validator: Option<Arc<dyn plexus_core::plexus::SessionValidator>>,
+        /// RED-9: when `true`, reject the WS upgrade with HTTP 401 if the
+        /// session validator returns `None` OR no cookie is present.
+        /// When `false` (default, backward-compat), the middleware logs and
+        /// passes through with no AuthContext — methods with `#[from_auth]`
+        /// will fail-close at runtime, but methods without it dispatch.
+        pub(super) reject_on_session_failure: bool,
     }
 
     impl<S, B> Service<HttpRequest<B>> for CombinedAuthMiddleware<S>
@@ -133,6 +141,7 @@ mod auth {
             // Tokens MUST be carried in the Cookie header — query parameters are
             // rejected because they leak to logs, browser history, and Referer headers.
             let session_validator = self.session_validator.clone();
+            let reject_on_failure = self.reject_on_session_failure;
             if let Some(validator) = session_validator {
                 let cookie_str = request.headers()
                     .get(http::header::COOKIE)
@@ -144,17 +153,61 @@ mod auth {
                     return Box::pin(async move {
                         let auth_ctx = validator.validate(&cookies).await;
 
-                        if let Some(ctx) = auth_ctx {
-                            tracing::debug!("Auth resolved for user: {}", ctx.user_id);
-                            request.extensions_mut().insert(Arc::new(ctx));
-                        } else {
-                            tracing::debug!("Cookie present but validation failed, proceeding without auth");
+                        match auth_ctx {
+                            Some(ctx) => {
+                                tracing::debug!("Auth resolved for user: {}", ctx.user_id);
+                                request.extensions_mut().insert(Arc::new(ctx));
+                                service.call(request).await.map_err(Into::into)
+                            }
+                            None if reject_on_failure => {
+                                // RED-9: cookie present but validation failed AND opt-in
+                                // strict mode is enabled — refuse the upgrade now instead
+                                // of letting the request reach the dispatch layer with
+                                // auth=None.
+                                tracing::warn!(
+                                    "WS upgrade rejected: session validation failed (uri={})",
+                                    request.uri()
+                                );
+                                let resp = http::Response::builder()
+                                    .status(http::StatusCode::UNAUTHORIZED)
+                                    .header(http::header::CONTENT_TYPE, "text/plain")
+                                    .body(jsonrpsee::server::HttpBody::from(
+                                        "Unauthorized: session invalid or expired"
+                                    ))
+                                    .expect("static response is valid");
+                                Ok(resp)
+                            }
+                            None => {
+                                // Backward-compat path: log and proceed; per-method
+                                // #[from_auth] still fail-closes at dispatch.
+                                tracing::warn!(
+                                    "Cookie present but validation failed, proceeding without auth (uri={})",
+                                    request.uri()
+                                );
+                                service.call(request).await.map_err(Into::into)
+                            }
                         }
-
-                        service.call(request).await.map_err(Into::into)
                     });
                 }
-                tracing::debug!("No cookie present, proceeding without auth");
+                if reject_on_failure {
+                    // RED-9: no cookie at all + opt-in strict mode → reject upgrade.
+                    tracing::warn!(
+                        "WS upgrade rejected: no session cookie present (uri={})",
+                        request.uri()
+                    );
+                    let resp = http::Response::builder()
+                        .status(http::StatusCode::UNAUTHORIZED)
+                        .header(http::header::CONTENT_TYPE, "text/plain")
+                        .body(jsonrpsee::server::HttpBody::from(
+                            "Unauthorized: session cookie required"
+                        ))
+                        .expect("static response is valid");
+                    return Box::pin(async move { Ok(resp) });
+                }
+                tracing::warn!(
+                    "No cookie present, proceeding without auth (uri={})",
+                    request.uri()
+                );
             }
 
             // No auth configured - pass through

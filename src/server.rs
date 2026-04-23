@@ -38,6 +38,12 @@ pub struct TransportServer<A: Activation> {
     /// Optional session validator for cookie-based authentication.
     /// When set, validates cookies from HTTP upgrade requests.
     session_validator: Option<Arc<dyn SessionValidator>>,
+    /// RED-9: opt-in strict mode for the session-validator path. When `true`,
+    /// the WS upgrade is rejected with HTTP 401 if the cookie is absent OR
+    /// the validator returns `None`. When `false` (default, backward-compat),
+    /// the middleware logs and proceeds without `AuthContext`; per-method
+    /// `#[from_auth]` checks fire-closed at dispatch instead.
+    reject_upgrade_on_auth_failure: bool,
 }
 
 impl<A: Activation> TransportServer<A> {
@@ -79,7 +85,7 @@ impl<A: Activation> TransportServer<A> {
                 ws_config.api_key = self.config.api_key.clone();
             }
             let module = module.expect("RPC module should be created for WebSocket");
-            Some(serve_websocket(module, ws_config, self.session_validator.clone()).await?)
+            Some(serve_websocket(module, ws_config, self.session_validator.clone(), self.reject_upgrade_on_auth_failure).await?)
         } else {
             None
         };
@@ -160,6 +166,9 @@ pub struct TransportServerBuilder<A: Activation> {
     /// middleware has been configured. Set by
     /// `.allow_missing_auth_middleware()`.
     allow_missing_auth: bool,
+    /// RED-9: opt-in strict-mode for the WS upgrade. Set by
+    /// `.reject_upgrade_on_auth_failure()`.
+    reject_upgrade_on_auth_failure: bool,
 }
 
 impl<A: Activation> TransportServerBuilder<A> {
@@ -175,6 +184,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             mcp_route_fn: None,
             session_validator: None,
             allow_missing_auth: false,
+            reject_upgrade_on_auth_failure: false,
         }
     }
 
@@ -253,6 +263,37 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
+    /// RED-9: opt in to strict-mode session validation at the WebSocket
+    /// upgrade.
+    ///
+    /// By default (backward-compatible), the session-validator middleware
+    /// populates `AuthContext` when a valid cookie is present and silently
+    /// passes through with no auth context when the cookie is missing or
+    /// invalid. Methods with `#[from_auth(...)]` then fail-closed at
+    /// dispatch with `Unauthenticated` — but methods without it dispatch
+    /// normally.
+    ///
+    /// When this option is enabled:
+    ///
+    /// - Missing `Cookie:` header on the WS upgrade → HTTP 401 before any
+    ///   RPC frames flow.
+    /// - Cookie present but `SessionValidator::validate()` returns `None`
+    ///   → HTTP 401 before any RPC frames flow.
+    ///
+    /// This is the right posture for backends where ANY public endpoint
+    /// would be a problem (e.g., FormVeritas-style apps where every method
+    /// requires a valid session). For backends that intentionally mix
+    /// authenticated and public endpoints on the same transport, leave
+    /// this off.
+    ///
+    /// Has no effect when no `SessionValidator` is configured. To force
+    /// auth middleware to be configured at build time, see
+    /// [`Self::allow_missing_auth_middleware`] (RED-4).
+    pub fn reject_upgrade_on_auth_failure(mut self) -> Self {
+        self.reject_upgrade_on_auth_failure = true;
+        self
+    }
+
     /// RED-4: opt out of the build-time auth-configuration check.
     ///
     /// Normally, [`Self::build`] inspects the registered activation's
@@ -316,6 +357,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             mcp_flat_schemas: self.mcp_flat_schemas,
             mcp_route_fn: self.mcp_route_fn,
             session_validator: self.session_validator,
+            reject_upgrade_on_auth_failure: self.reject_upgrade_on_auth_failure,
         })
     }
 }
