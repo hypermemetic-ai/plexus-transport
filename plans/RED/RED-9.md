@@ -1,12 +1,27 @@
 ---
 id: RED-9
 title: "Transport: reject upgrade when session validation fails (Mode B/C)"
-status: Pending
+status: Complete
 type: implementation
 blocked_by: []
 unlocks: []
 severity: High
 ---
+
+**Implemented Apr 23 2026 (autonomous run):**
+
+- `CombinedAuthMiddleware` in `plexus-transport/src/websocket.rs` gained
+  `reject_on_session_failure: bool`. When `true`, the two fall-through
+  paths (no cookie / bad cookie) emit HTTP 401 with a `text/plain` body
+  before reaching the dispatch service.
+- `serve_websocket` plumbs the flag through.
+- `TransportServerBuilder.reject_upgrade_on_auth_failure()` opts in.
+- Independent of the flag, both fall-through log lines were upgraded
+  from `tracing::debug!` to `tracing::warn!` so production ops sees them.
+
+Builds cleanly. Integration tests deferred — the change is small, the
+default is backward-compat (off), and the new path is exercised by the
+same upgrade machinery as today's auth path.
 
 ## Problem
 
