@@ -1,12 +1,57 @@
 ---
 id: REQ-11
 title: "REQ-6 end-to-end verification against uscis (FormVeritasV2)"
-status: Pending
+status: Complete
 type: implementation
 blocked_by: [REQ-6]
 unlocks: []
 severity: Low
 ---
+
+**Verified Apr 23 2026 (autonomous run):** Temporarily enabled FormVeritasV2's
+`[patch.crates-io]` block pointing at local `plexus-core` 0.5.2 /
+`plexus-macros` 0.5.6 / `plexus-transport` 0.2.2 — version requirements
+bumped from `"0.4"` to `"0.5"` so the patches resolve. uscis-notifier
+rebuilt cleanly with zero FormVeritasV2 source changes (full backward
+compatibility between plexus-macros 0.4 and 0.5 on the public API uscis
+consumes). No FormVeritasV2 changes remain on disk (Cargo.toml + Cargo.lock
+reverted from backup).
+
+### Observed in regenerated IR (`/tmp/cc-uscis-req11/ir.json`)
+
+- **58** methods carry `pdSource.from = "auth"` annotations with
+  `resolver = "self.db.validate_user"` — one per `#[from_auth]` use site
+  across all 7 FormVeritasRequest-using activations.
+- **clients.list** carries 4 non-RPC params:
+  `scope` (auth), `origin` (derived), `transport` (derived), `client_ip` (derived).
+- **health.check** (`#[plexus::method(request = ())]` override) has **zero**
+  params — the activation-level merge correctly skipped it.
+
+### Observed in regenerated TypeScript (`/tmp/cc-uscis-req11/*/client.ts`)
+
+- **58** `@requiresAuth — resolver: self.db.validate_user` JSDoc tags.
+- **177** `@server-derived <field>` tags (59 methods × 3 derived fields).
+- `health.check` JSDoc is a clean single-line `/** Check service health… */`
+  with no source tags (surfaced a bug in my REQ-9 fallback path that
+  was fixed in commit `387348e` in hub-codegen during this session).
+- `tsc --noEmit` clean.
+
+### Bug caught and fixed
+
+Tonight's REQ-9 implementation kept an activation-level fallback for
+backward-compat with pre-REQ-6 backends. The fallback fired on any
+method in a namespace with `ir_plugin_requests` — including methods
+with the `request = ()` override, because those have empty pd_source.
+REQ-11 exposed this on uscis's `health.check`. Fix: delete the
+fallback outright, matching REQ-9's stated contract.
+
+### State after this ticket
+
+- FormVeritasV2 disk state: unchanged (Cargo.toml + Cargo.lock reverted
+  from backup at `/tmp/formveritas-cargo.toml.backup`)
+- plexus-* local checkouts: unchanged (no source edits during verification)
+- hub-codegen: one follow-up commit (`387348e`) fixing the REQ-9 fallback
+- 89/89 hub-codegen tests pass with fallback deleted.
 
 ## Problem
 
