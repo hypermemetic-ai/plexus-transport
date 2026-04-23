@@ -1,11 +1,22 @@
 ---
 id: RED-S08
 title: "Spike: `AuthContext` injection via request body / unsafe deserialization"
-status: Pending
+status: Complete
 type: spike
 blocked_by: []
 unlocks: []
 ---
+
+## Verdict (Apr 23 2026): 🟢 **SAFE**
+
+Audit of 6 `AuthContext` construction sites across plexus-core and plexus-transport:
+- All construction happens server-side via the `SessionValidator` trait contract, which takes a `&str` cookie value and returns `Option<AuthContext>`.
+- `#[from_auth_context]` field semantics (plexus-macros/src/request.rs:297-309) only read from `ctx.auth` — the server-populated `RawRequestContext.auth` — never from the method's `params` body.
+- `AuthContext` derives `Deserialize` but there's no code path that deserializes it from RPC params JSON.
+- Query string extraction and header extraction are explicit per-field via `#[from_query]` / `#[from_header]`; neither auto-populates AuthContext.
+- MCP bridge path (`plexus-core/src/mcp_bridge.rs:263`) passes `None` for auth — availability concern, not a forgery vulnerability.
+
+No mitigation required. The architecture correctly enforces server-side-only population of AuthContext.
 
 ## Question
 

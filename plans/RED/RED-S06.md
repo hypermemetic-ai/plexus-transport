@@ -1,11 +1,23 @@
 ---
 id: RED-S06
 title: "Spike: mixed-auth activation — is it accepted silently?"
-status: Pending
+status: Complete
 type: spike
 blocked_by: []
-unlocks: []
+unlocks: [RED-2]
 ---
+
+## Verdict (Apr 23 2026): 🔴 **HOLE CONFIRMED — MEDIUM SEVERITY**
+
+Zero signals across the stack:
+- No compile warning from `cargo check` or `cargo clippy`
+- No flag in `PluginSchema` or `MethodSchema` indicating mixed auth posture
+- No synapse renderer logic flagging asymmetry
+- No `_self test` framework check
+
+The per-method `x-plexus-source: { from: "auth" }` annotation from REQ-6 is visible on auth'd methods, but no tool computes "this activation has mixed coverage." A developer can only spot the asymmetry via manual schema diffing.
+
+Mitigation shared with S01 under **RED-2** (macro warning on mixed-auth activations).
 
 ## Question
 

@@ -1,11 +1,19 @@
 ---
 id: RED-S03
 title: "Spike: `request = ()` bypass of AuthContext population"
-status: Pending
+status: Complete
 type: spike
 blocked_by: []
 unlocks: []
 ---
+
+## Verdict (Apr 23 2026): 🟢 **SAFE**
+
+`request = ()` only affects `activation_extraction` and `activation_param_bindings` in the generated dispatch wrapper (codegen/activation.rs:918-938). `resolver_bindings` (from `#[from_auth]`) is generated unconditionally and runs independently. The auth injection at line 910 rejects missing `AuthContext` with `Unauthenticated` before any resolver runs.
+
+A method with BOTH `request = ()` AND `#[from_auth]` compiles and fail-closes correctly at runtime. The two attributes are orthogonal.
+
+No mitigation required.
 
 ## Question
 

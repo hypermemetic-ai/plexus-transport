@@ -1,11 +1,21 @@
 ---
 id: RED-S07
 title: "Spike: fake-resolver detection — can schema flag a validator that never rejects?"
-status: Pending
+status: Complete
 type: spike
 blocked_by: []
-unlocks: []
+unlocks: [RED-5]
 ---
+
+## Verdict (Apr 23 2026): 🔴 **HOLE CONFIRMED — LOW SEVERITY**
+
+No existing tool detects resolvers that never reject. `plexus-macros` captures the resolver expression as a string in `x-plexus-source.resolver` (per REQ-6) but nothing downstream examines resolver body semantics. Neither Clippy nor any custom lint exists. The macro invokes the resolver unconditionally; any function with signature `async fn(&AuthContext) -> Result<T, E>` passes.
+
+Trait-bound defense is impractical (Rust can't enforce "this function inspects its argument"). Naming-pattern lint is cheap and catches obvious stubs (`accept_all`, `fake_validator`, etc.) — viable starting point.
+
+Low severity because this is a friendly-attacker scenario (tired dev forgets to swap a stub). Adversarial bypass would require merging malicious resolver code, which has other defenses.
+
+Mitigation tracked in **RED-5**: out-of-tree `plexus-audit` tool that walks IR schemas and flags resolver names matching known-stub patterns.
 
 ## Question
 

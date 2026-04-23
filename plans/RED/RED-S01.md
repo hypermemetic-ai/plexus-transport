@@ -1,11 +1,17 @@
 ---
 id: RED-S01
 title: "Spike: silent auth omission in a mixed-auth activation"
-status: Pending
+status: Complete
 type: spike
 blocked_by: []
-unlocks: []
+unlocks: [RED-2]
 ---
+
+## Verdict (Apr 23 2026): 🔴 **HOLE CONFIRMED — HIGH SEVERITY**
+
+Fixture at `plexus-macros/tests/red_s01_silent_omission.rs`: mixed activation with `list` (has `#[from_auth]`) and `leak` (no auth) compiles cleanly, zero warnings, and `leak`'s schema shows no auth annotation. `leak` dispatches unauthenticated. Only the JSON-level comparison reveals the asymmetry — no tool does this automatically.
+
+Mitigation tracked in **RED-2**: macro warns when mixed-auth is detected.
 
 ## Question
 

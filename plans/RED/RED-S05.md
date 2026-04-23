@@ -1,11 +1,24 @@
 ---
 id: RED-S05
 title: "Spike: builder surface — can auth middleware be omitted?"
-status: Pending
+status: Complete
 type: spike
 blocked_by: []
-unlocks: []
+unlocks: [RED-4]
 ---
+
+## Verdict (Apr 23 2026): 🔴 **HOLE CONFIRMED — CRITICAL SEVERITY**
+
+`plexus-transport/src/websocket.rs:23-52` attaches `CombinedAuthMiddleware` **only when** `.with_api_key(...)` OR `.with_session_validator(...)` was called on the builder. Auth is opt-IN (category C — the worst of the three). Both substrate's stdio mode and FormVeritasV2/uscis have real code paths where auth middleware is NOT attached (uscis when `KEYCLOAK_URL` env var is missing, substrate always in stdio mode).
+
+When middleware is absent, `AuthContext` is not populated in connection Extensions. Activations' `#[from_auth]` injections then fail with `Unauthenticated` at runtime on every call — fail-closed, but:
+
+- No startup assertion that a server deploying `#[from_auth]`-using activations has auth middleware attached
+- Admins see "why is my JWT rejected?" instead of "you forgot Keycloak config"
+
+Combined with future `#[plexus::method(public)]` support (RED-2), a misconfigured deploy could serve public endpoints from an activation that was supposed to require auth.
+
+Mitigation tracked in **RED-4** (CRITICAL): `TransportServer::build()` refuses to start when registered activations require auth but the builder was not configured with an auth middleware.
 
 ## Question
 

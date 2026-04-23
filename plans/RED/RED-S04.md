@@ -1,11 +1,19 @@
 ---
 id: RED-S04
 title: "Spike: activation without `request = ...` — does `#[from_auth]` fail-closed?"
-status: Pending
+status: Complete
 type: spike
 blocked_by: []
-unlocks: []
+unlocks: [RED-3]
 ---
+
+## Verdict (Apr 23 2026): 🟡 **PARTIAL HOLE — MEDIUM SEVERITY**
+
+Runtime behavior is SAFE: when an activation lacks `request = ...`, the auth middleware doesn't get wired, `AuthContext` is `None` in Extensions, and the macro's generated `auth.ok_or_else(|| PlexusError::Unauthenticated(...))?` at codegen/activation.rs:910 fail-closes every call. Resolver never runs.
+
+But the combination compiles cleanly with no compile diagnostic. Every call to the method 401s in production before anyone notices the misconfiguration. That's an ergonomics hole, not a security hole — yet it belongs at compile time.
+
+Mitigation tracked in **RED-3**: compile error when `#[from_auth]` is used in an activation without `request = ...`.
 
 ## Question
 

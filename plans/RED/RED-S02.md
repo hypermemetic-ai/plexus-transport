@@ -1,11 +1,17 @@
 ---
 id: RED-S02
 title: "Spike: typo'd auth-related attribute handling"
-status: Pending
+status: Complete
 type: spike
 blocked_by: []
 unlocks: []
 ---
+
+## Verdict (Apr 23 2026): 🟢 **SAFE**
+
+All typo variants (`#[from_aut]`, `#[from_autho]`, `#[From_auth]`, `#[from_auth_context]` — which is a REAL but different attribute) are rejected by rustc with "cannot find attribute X in this scope." The macro's `is_ident("from_auth")` exact-match guard never gets a chance to silently strip typos because rustc rejects unknown attributes at parse time — since `from_auth` is not in the `#[proc_macro_attribute]`'s declared attribute list.
+
+No mitigation required; the safety is incidental but complete.
 
 ## Question
 
