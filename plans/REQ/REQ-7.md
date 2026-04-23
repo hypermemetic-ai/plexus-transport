@@ -16,15 +16,32 @@ per property. uscis output: 234 `@server-derived` tags across 78
 methods, 7 activations. tsc clean.
 
 **JSDoc scope moved to REQ-9 (Apr 23):** The activation-level JSDoc
-emission is a stepping stone; REQ-9 retargets it to per-method source
-using REQ-6's `x-plexus-source` annotations. REQ-9 supersedes this
-ticket's JSDoc acceptance criteria. What remains in REQ-7:
+emission was a stepping stone; REQ-9 retargets it to per-method source
+using REQ-6's `x-plexus-source` annotations. REQ-9 superseded this
+ticket's JSDoc acceptance criteria.
 
-- `--expose-request-fields` flag for opt-in optional override arg.
-- `-32001` typed-error mapping in the transport with expected-cookie
-  hint per method.
+**Typed errors landed Apr 23 (autonomous run):** Generated
+`transport.ts` now declares and exports five typed error classes:
 
-Both remaining items are downstream of REQ-6 + REQ-9 landing.
+- `PlexusRpcError` (base)
+- `AuthenticationError` (-32001)
+- `InvalidParamsError` (-32602)
+- `MethodNotFoundError` (-32601)
+- `ExecutionError` (-32000)
+
+`handleResponse` dispatches the appropriate subclass via `rpcErrorFor`
+instead of wrapping in a bare `Error`. Client code can match with
+`instanceof` rather than parsing error strings. Committed to
+hub-codegen. Covered by 3 new tests in `req7_typed_errors_test.rs`;
+92/92 hub-codegen tests pass.
+
+**Still deferred:**
+
+- `--expose-request-fields` flag: opt-in optional override arg on
+  generated method signatures. Lower priority — most consumers rely
+  on the browser's cookie store / transport-level config. Requires
+  adding a second arg to each typed method plus transport-level
+  per-call header injection.
 
 ## Problem
 
