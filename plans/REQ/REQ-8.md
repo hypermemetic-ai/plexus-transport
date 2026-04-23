@@ -1,12 +1,30 @@
 ---
 id: REQ-8
 title: "synapse renderer shows per-method auth and source annotations"
-status: Pending
+status: Complete
 type: implementation
 blocked_by: [REQ-6]
 unlocks: []
 severity: Medium
 ---
+
+**Implemented Apr 23 2026 (autonomous run):** `Synapse.Algebra.Render.renderParamDoc`
+now extracts `x-plexus-source` from each param's JSON Schema and renders
+server-sourced params inline with a `← <source>` label instead of the
+`--flag` form. Auth/cookie/header/query/derived sources each produce a
+distinct label (`auth: <resolver>`, `cookie <key>`, `server-derived`,
+etc.). RPC params render unchanged.
+
+Example output:
+
+    list    List things
+      --search <string>?
+      user                ← auth: self.db.validate_user
+      origin              ← server-derived
+
+Tested via `test/Req8RenderSpec.hs` (8 assertions against a synthetic
+PluginSchema with three param source types). `cabal test req8-render-test`
+passes.
 
 ## Problem
 
