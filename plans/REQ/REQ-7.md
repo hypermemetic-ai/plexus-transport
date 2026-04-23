@@ -1,11 +1,30 @@
 ---
 id: REQ-7
 title: "hub-codegen TS surfaces request schema as JSDoc + opt-in typed overrides"
-status: Pending
+status: Partial
 type: implementation
 blocked_by: [REQ-5, REQ-6, SAFE-7]
 unlocks: []
 ---
+
+**Partial implementation Apr 23 2026 (autonomous run):** Activation-level
+JSDoc breadcrumbs landed and verified against uscis (FormVeritasV2).
+`render_request_jsdoc()` in `hub-codegen/src/generator/typescript/namespaces.rs`
+walks `ir.ir_plugin_requests[namespace]` and emits one of `@requiresAuth`
+/ `@reads-cookie` / `@reads-header` / `@reads-query` / `@server-derived`
+per property. uscis output: 234 `@server-derived` tags across 78
+methods, 7 activations. tsc clean.
+
+**Still deferred (see SAFE-S05 umbrella):**
+- Per-method `request = ()` override is not honored (every method in
+  an activation with psRequest gets the JSDoc). Requires REQ-6
+  (per-method `x-plexus-source` on `MethodSchema.params`).
+- Caller-facing signature still includes derived params if any
+  activation declares them on a method (uscis doesn't, so this hasn't
+  surfaced as a problem yet).
+- `--expose-request-fields` flag for opt-in optional override arg.
+- `-32001` typed-error mapping in the transport with expected-cookie
+  hint per method.
 
 ## Problem
 
