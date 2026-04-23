@@ -524,7 +524,7 @@ Results from running all programs (2026-04-08):
 | S-07 | **PASS** | Baseline `plugin_schema()` output documented. No `request` field yet (correct). Current keys: `namespace`, `version`, `description`, `self_hash`, `hash`, `methods`. `request` field must be added to `PluginSchema` type and codegen (REQ-4). Method params come as inline `params` object, not a string — important for schema inspection code. |
 | S-08 | **PASS** | schemars correctly puts `String` fields in `required`, `Option<T>` fields not. `x-plexus-source` on all three field types (cookie/header/derived) round-trips correctly. No custom schema generation needed — schemars does the right thing. |
 | S-09 | **PASS** | Existing activations with no `request =` compile and schema correctly after the `crate_path` fix applied to spike. No `request` field in output. Backward compat holds. |
-| S-10 | **PENDING** | Haskell / synapse spike not yet written. Must verify `PluginSchema` Haskell type can carry `psRequest :: Maybe Value` and that Aeson decodes/encodes it correctly. |
+| S-10 | **MOVED** | Promoted to its own ticket: `REQ-S10.md` (status: Pending). Unblocks REQ-5. The body description below is preserved for reference but the implementation tracking lives in REQ-S10. |
 
 ### Key implementation findings from spikes
 
@@ -548,5 +548,5 @@ Results from running all programs (2026-04-08):
 - [x] Each program prints `OK` or a clear failure diagnosis
 - [x] Decision matrix filled in with actual results
 - [x] Key implementation findings documented above
-- [ ] S-10 Haskell spike written and run
+- [ ] S-10 Haskell spike written and run (tracked in REQ-S10)
 - [ ] Design changes reflected in REQ-1 through REQ-5
