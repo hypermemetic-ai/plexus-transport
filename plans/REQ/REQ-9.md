@@ -1,12 +1,33 @@
 ---
 id: REQ-9
 title: "hub-codegen JSDoc emission retargeted to per-method x-plexus-source"
-status: Pending
+status: Complete
 type: implementation
 blocked_by: [REQ-6]
 unlocks: []
 severity: Medium
 ---
+
+**Implemented Apr 23 2026 (autonomous run):**
+
+- synapse `Synapse.IR.Types.ParamDef` gained `pdSource :: Maybe Value` + JSON
+  round-trip (commit `775c676d` in synapse).
+- `Synapse.IR.Builder.extractParamsFromObject` extracts `x-plexus-source`
+  per property (commit `775c676d`).
+- hub-codegen `ir::ParamDef` gained `pd_source: Option<serde_json::Value>`
+  (commit `a7334eb` in hub-codegen).
+- `render_method_jsdoc(method, namespace, ir)` in `namespaces.rs`
+  reads per-param `pd_source` and emits `@requiresAuth` / `@reads-cookie` /
+  `@reads-header` / `@reads-query` / `@server-derived` tags.
+- Per-method path takes precedence over activation-level fallback, so
+  methods with `request = ()` override emit no derived tags even when
+  the activation has a psRequest (fixes the health.check false-positive
+  from tonight's REQ-7 minimal).
+- Activation-level fallback preserved for pre-REQ-6 backends (plexus-macros
+  < 0.5) so existing consumers don't regress.
+- 7 new acceptance tests in `req9_jsdoc_test.rs`; 89/89 hub-codegen tests pass.
+
+End-to-end uscis verification remains in REQ-11.
 
 ## Problem
 
