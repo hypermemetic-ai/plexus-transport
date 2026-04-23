@@ -1,154 +1,141 @@
-# REQ-6: Per-method param schema with `x-plexus-source` annotations
+---
+id: REQ-6
+title: "plexus-macros emits per-method merged param schemas with x-plexus-source"
+status: Pending
+type: implementation
+blocked_by: []
+unlocks: [REQ-8, REQ-9, SAFE-6]
+severity: High
+---
 
-**blocked_by:** [REQ-1, REQ-4]
-**unlocks:** [REQ-5, REQ-7]
-**status:** Ready
+## Problem
 
-## Why this exists
+Today `#[plexus::activation(request = MyRequest)]` extracts `MyRequest` fields for validation side-effect, but the wire schema doesn't reflect that at the method level. Clients see only the method's RPC-facing params; `#[from_auth]` and `#[activation_param]` params are stripped entirely; the activation's request fields live in a separate `psRequest` block that clients must cross-reference.
 
-REQ-1 introduced the `x-plexus-source` annotation vocabulary on
-`PlexusRequest` derive output (cookie / header / query / peer / auth_context
-/ derived). REQ-4 surfaced the activation-level request struct's schema
-on `PluginSchema.request` so the activation gate is visible to tools.
+This creates three concrete problems:
 
-But the `#[plexus::activation]` macro still **strips** `#[from_auth]` and
-`#[activation_param]` parameters from per-method `MethodSchema.params`
-before emission. The wire schema only sees client-supplied JSON-RPC params.
-There is no way for a tool reading the schema to know:
+1. **Per-method auth invisibility.** A tool reading the schema can't tell which methods use `#[from_auth]` or which resolver guards them. The only hint is the activation-level `psRequest`, which is wrong for mixed-auth activations.
 
-- Whether a specific method requires authentication (vs the activation as a whole)
-- Which `#[from_auth]` resolver gates the method
-- Which params come from cookies, headers, query strings, or the activation request struct
-- Which RPC params the client is actually expected to provide on the wire
+2. **Activation-level override is crude.** `#[plexus::method(request = ())]` either drops the whole request struct or keeps it; there's no field-level control. `health.check` uses this to bypass everything, which then breaks any consumer (e.g., REQ-7's minimal JSDoc) that uses psRequest-presence as the sole signal.
 
-REQ-6 closes this by extending REQ-1's `x-plexus-source` vocabulary from
-"fields on a request struct" to "params on a method." Same annotations,
-same schema surface, just at a different scope.
+3. **JSDoc / help text is imprecise.** Tonight's REQ-7 minimal emits `@server-derived` on every method in any activation with psRequest — including methods that override. The signal is too coarse.
+
+## Goal
+
+Each method's `MethodSchema.params` becomes the complete contract for that method:
+
+- Every parameter appears — including `#[from_auth]`, `#[activation_param]`, and activation-injected request fields
+- Each parameter carries `x-plexus-source` identifying where it comes from (rpc / cookie / header / query / derived / auth)
+- `required` lists only RPC-sourced parameters; derived/auth params are never required of the client
+- Methods inherit the activation's request fields by default; can override individual fields when the activation permits
+
+Activation-level `psRequest` continues to carry the activation's request struct (REQ-5's wire addition); it remains the source of truth for *what gets injected*. REQ-6 makes the injection visible per method.
 
 ## Required behavior
 
-For every method in `MethodSchema.params`:
+### Source annotations
 
-1. **All parameters appear in `properties`**, including ones that today are
-   stripped (`#[from_auth]`, `#[activation_param]`).
-2. **Each parameter carries an `x-plexus-source` annotation** identifying
-   where its value comes from.
-3. **`required` lists only RPC-sourced parameters** — the ones a client
-   must provide on the JSON-RPC wire. Derived parameters (auth, cookies,
-   headers, etc.) are never required of the client.
+For each method parameter, emit `x-plexus-source` on the parameter's JSON Schema:
 
-### Source annotation values
-
-| Parameter type | `x-plexus-source` value |
+| Param shape | `x-plexus-source` value |
 |---|---|
-| Plain RPC param (today's default) | `"rpc"` (string) or absent |
-| `#[from_auth(self.db.validate_user)] u: ValidUser` | `{"from": "auth", "resolver": "self.db.validate_user"}` |
-| `#[activation_param] origin: ValidOrigin` (where the activation declares `request = FormVeritasRequest` and `FormVeritasRequest::origin` is `#[from_header("origin")]`) | `{"from": "header", "key": "origin"}` (propagated from the activation-level request struct's field) |
-| `#[activation_param] auth_token: String` (cookie source) | `{"from": "cookie", "key": "access_token"}` |
-| `#[activation_param]` referencing a `PlexusRequestField` newtype like `ValidOrigin` | `{"from": "derived"}` |
+| Plain RPC param (today's default) | `{"from": "rpc"}` (or absent — implementor chooses) |
+| `#[from_auth(expr)]` | `{"from": "auth", "resolver": "<expr-as-string>"}` |
+| `#[activation_param]` whose type comes from the activation's request struct, where that struct's field has `#[from_cookie("name")]` | `{"from": "cookie", "key": "name"}` |
+| `#[activation_param]` whose field is `#[from_header("name")]` | `{"from": "header", "key": "name"}` |
+| `#[activation_param]` whose field is `#[from_query("name")]` | `{"from": "query", "key": "name"}` |
+| `#[activation_param]` whose field is a `PlexusRequestField` newtype (e.g. `ValidOrigin`) | `{"from": "derived"}` |
+| `#[from_request(fn)]` with a custom extractor | `{"from": "derived"}` |
 
-The activation-level request struct's existing `x-plexus-source`
-annotations (generated by the `PlexusRequest` derive in REQ-1) are the
-source of truth for `#[activation_param]` propagation. The macro looks
-up the named field in the request type's schema and copies the
-annotation onto the method param.
+### Activation-level field injection
 
-### Required behavior — observable
+When an activation declares `request = FormVeritasRequest`, every method in that activation *implicitly* has the request's fields merged into its param schema, even when the method's source code doesn't name them. The method's *source-visible* signature is unchanged (only the schema is augmented). Extraction runs at dispatch time for validation side-effects.
 
-For an activation defined as:
+When a method explicitly declares a matching param (e.g., `fn list(&self, origin: ValidOrigin, ...)`), the method gets the extracted value passed through; the schema still surfaces it with the right `x-plexus-source`.
+
+### `required` array rules
+
+The method's schema `required` array contains ONLY params whose `x-plexus-source.from` is `"rpc"` or absent. Auth-sourced and derived params are never required of the client — they're populated by the server from connection state.
+
+### Per-method override with field-level locking
+
+The activation attribute gains an optional `required = [field1, field2, ...]` list naming fields that methods CANNOT override:
 
 ```rust
-#[plexus::activation(namespace = "clients", request = FormVeritasRequest)]
-impl ClientsActivation {
-    #[plexus::method(description = "List clients")]
-    async fn list(
-        &self,
-        #[from_auth(self.db.validate_user)] scope: TenantScope<ValidUser>,
-        #[activation_param] origin: ValidOrigin,
-        search: Option<String>,
-        status: Option<ClientStatus>,
-    ) -> impl Stream<Item = ClientEvent> + Send + 'static { ... }
-}
+#[plexus::activation(
+    namespace = "clients",
+    request = FormVeritasRequest,
+    required = [origin, transport],    // these fields are locked for methods
+)]                                      // client_ip is overridable
 ```
 
-The generated `MethodSchema` for `list` must satisfy:
+A method's `#[plexus::method(request = OtherRequest)]` is validated at macro expansion:
 
-- `params.properties` contains exactly: `scope`, `origin`, `search`, `status`
-- `params.properties.scope.x-plexus-source.from == "auth"`
-- `params.properties.scope.x-plexus-source.resolver == "self.db.validate_user"`
-- `params.properties.origin.x-plexus-source.from == "derived"` (because
-  `ValidOrigin` is a `PlexusRequestField` newtype)
-- `params.properties.search.x-plexus-source` is either absent or `"rpc"`
-- `params.properties.status.x-plexus-source` is either absent or `"rpc"`
-- `params.required` does NOT contain `scope` or `origin`
+- Drops a required field → compile error with clear message
+- Supplies all required fields (possibly with different types for non-required ones) → allowed; the method's schema reflects OtherRequest's fields
+- `request = ()` → compile error if ANY field is required; allowed if `required = []` or absent
 
-For an activation method with `#[plexus::method(request = ())]` override
-(e.g. `health.check`):
+When `required = []` or absent, methods may freely override (including `request = ()`). When `required` is non-empty, the activation explicitly controls what can be dropped.
 
-- `params.properties` contains the method's RPC params only — no auth,
-  no derived (same as today)
-- `params.required` lists the required RPC params
+### Strip-vs-emit split in the macro
 
-### Backward compatibility
-
-Existing tools that don't recognize `x-plexus-source` must continue to
-function. The annotation is purely additive — placing an unknown
-extension key on a JSON Schema field is well-defined behavior (ignored
-by validators that don't understand it). Existing synapse builds, the
-cached `ir.json` consumers, and any third-party schema readers continue
-to work unchanged. They just don't get the new metadata.
+The macro already strips `#[from_auth]` and `#[activation_param]` from the rustc-visible function signature (so rustc doesn't complain about unknown attributes). REQ-6 keeps that strip for the generated function, but RESTORES those params in the method enum's schema generation path — where they become the source of `x-plexus-source` annotations.
 
 ## What must NOT change
 
-- Runtime dispatch behavior. `#[from_auth]` resolution, `#[activation_param]`
-  field injection, and `request = ...` validation all run exactly as today.
-- The set of methods exposed on the wire.
-- The contents of `MethodSchema` for methods that have no derived params
-  (their schema is identical to today, modulo the optional `"rpc"` marker).
-- `PluginSchema.request` continues to carry the activation-level request
-  struct's full schema. This ticket adds per-method propagation; it does
-  not replace the activation-level schema.
-- The `PlexusRequest` derive (REQ-1) and its generated `request_schema()`
-  output. REQ-6 READS the existing annotations; it doesn't change them.
+- Runtime dispatch behavior for methods without `required = [...]` locking is byte-identical to today
+- `PluginSchema.psRequest` (activation-level) continues to exist on the wire (REQ-5 addition). REQ-6 adds *per-method* annotations but does not remove the activation-level schema. UNIFY-1 may eventually drop psRequest.
+- The set of methods exposed on the wire is unchanged
+- Existing activations without `request = ...` (no activation-level extraction) continue to produce the same method schemas as today (plain RPC params only, no `x-plexus-source` needed)
+- `PlexusRequest` derive (REQ-1) and its `request_schema()` output. REQ-6 READS the existing annotations; it doesn't change them.
+- Per-method `#[plexus::method(request = ())]` continues to work when the activation has no `required` fields. REQ-6 adds the `required` field-locking mechanism; it doesn't remove override.
 
-## Acceptance criteria — observable
+## Risks
 
-1. A method with `#[from_auth(self.db.validate_user)]` produces a schema
-   where the auth param appears in `properties` with
-   `x-plexus-source.from == "auth"` and `x-plexus-source.resolver` set
-   to the resolver expression as a string.
-2. A method with `#[activation_param] origin: ValidOrigin` (where the
-   activation has `request = FormVeritasRequest` and `FormVeritasRequest`
-   declares `origin: ValidOrigin` as a `PlexusRequestField` field)
-   produces a schema where the `origin` param has
-   `x-plexus-source.from == "derived"`.
-3. A method with `#[activation_param] auth_token: String` (where the
-   request struct has `#[from_cookie("access_token")] auth_token: String`)
-   produces a schema where the `auth_token` param has
-   `x-plexus-source.from == "cookie"` and `key == "access_token"`.
-4. A method with `#[plexus::method(request = ())]` override produces
-   a schema with only its plain RPC params and no derived/auth annotations.
-5. A method with no derived params produces a schema identical to
-   today's output (modulo the optional `x-plexus-source: "rpc"` marker on
-   each plain param — implementor decides if the marker is emitted by
-   default or omitted).
-6. The `required` array in any method's params schema never contains a
-   parameter whose `x-plexus-source.from` is anything other than `"rpc"`
-   (or absent).
-7. Existing plexus-macros tests continue to pass without modification.
-8. A new test asserts that for at least one method in the test suite,
-   all four observable behaviors above hold simultaneously.
+1. **schemars `extend` on method enum variant fields** may not compose with variant-level attributes the way single-struct `extend` does. Mitigation: REQ-6-S01 spike — write a minimal enum with one variant and a per-field `#[schemars(extend("x-plexus-source" = {...}))]`; verify the annotation lands on the right property in the generated oneOf schema.
 
-## What this enables (out of scope for this ticket)
+2. **`required` array filtering** — schemars puts all non-Option fields in `required` by default. REQ-6 needs non-RPC params to NOT be in `required` despite being declared non-Option. Options: (a) post-process the generated schema per variant, filtering names; (b) wrap non-RPC params in a synthetic Option<T> in the emitted enum variant. Option (a) is less invasive. Decide during implementation.
 
-- REQ-5 (synapse) renders per-method auth requirements in `--help`,
-  not just activation-level requirements
-- REQ-7 (synapse-cc TypeScript codegen) renders annotations as JSDoc
-  and generates auth-aware client methods
-- FormVeritas frontend route guards read the schema and gate UI based
-  on whether the methods a page calls require auth
+3. **Validation of override against `required = [...]`** must happen at macro expansion, not at runtime. This is ordinary proc-macro work (compare names, emit compile errors) but adds attribute-parsing complexity.
+
+4. **Resolver expression as a string.** `#[from_auth(self.db.validate_user)]` has an arbitrary Rust expression as the resolver. Capturing it as a string for `x-plexus-source.resolver` requires `syn`'s `ToTokens` or `Span::source_text`; the former is canonical. Test that complex expressions (generics, method chains) serialize usefully.
+
+## Acceptance criteria
+
+1. A method with `#[from_auth(self.db.validate_user)]` produces a schema where the auth param appears in `properties` with `x-plexus-source.from == "auth"` and `x-plexus-source.resolver` equal to the string `"self.db.validate_user"`.
+2. A method with `#[activation_param] origin: ValidOrigin` (where the activation has `request = FormVeritasRequest` and `FormVeritasRequest` declares `origin: ValidOrigin`) produces a schema where the `origin` param has `x-plexus-source.from == "derived"`.
+3. A method with `#[activation_param] auth_token: String` (where the request struct has `#[from_cookie("access_token")] auth_token: String`) produces a schema where `auth_token` has `x-plexus-source.from == "cookie"` and `key == "access_token"`.
+4. A method with `#[plexus::method(request = ())]` override, in an activation with `required = []` or no `required` list, produces a schema with only its plain RPC params.
+5. A method with `#[plexus::method(request = ())]` override, in an activation with `required = [origin]`, FAILS to compile with a clear error naming `origin`.
+6. An activation-injected field (the method does NOT declare it in its signature, but the activation has `request = X`) appears in the method's schema with `x-plexus-source` from X's field annotation.
+7. The `required` array in any method's params schema never contains a parameter whose `x-plexus-source.from` is anything other than `"rpc"` (or absent).
+8. A method with no activation-level request (activation lacks `request = ...`) produces a schema identical to today's output, modulo an optional `x-plexus-source: "rpc"` marker on each plain param (implementor chooses emit-or-omit by default).
+9. Existing plexus-macros tests continue to pass without modification.
+10. A new test asserts that for at least one fixture method, all observable behaviors above hold simultaneously. The fixture lives in `plexus-macros/tests/` and is committed.
+
+## Verification against uscis (FormVeritasV2)
+
+After REQ-6 lands, rebuild uscis and regenerate the IR. Expected changes:
+
+- Each method in activations declaring `request = FormVeritasRequest` gets `origin`, `transport`, `client_ip` params in its `MethodSchema.params`, each annotated `x-plexus-source: { from: "derived" }`.
+- `health.check` (with `request = ()` and no `required` on the activation) keeps only its RPC params.
+- Methods using `#[from_auth(self.db.validate_user)]` carry `x-plexus-source: { from: "auth", resolver: "self.db.validate_user" }` on the auth param.
+
+This is mechanical verification, captured as a follow-up check (not an acceptance criterion) because uscis is an external consumer.
+
+## Coordination
+
+- `unlocks: [REQ-8, REQ-9, SAFE-6]`
+- REQ-5's activation-level renderer work can remain in place (no conflict) or be augmented by REQ-8 with per-method detail
+- REQ-7's tonight-landed activation-level JSDoc emission is a stepping stone; REQ-9 replaces it with per-method emission using REQ-6's annotations
 
 ## Completion
 
-Implementor adds tests covering the eight acceptance criteria, runs the
-plexus-macros test suite, and records the test command and output.
+Implementor lands:
+- `plexus-macros/src/codegen/method_enum.rs` edits emitting per-param `x-plexus-source`
+- `plexus-macros/src/parse.rs` (or wherever activation attrs parse) gaining `required = [...]` support
+- Override validation logic with clear compile errors
+- Tests covering the 10 acceptance criteria
+- Manual verification against uscis backend (rebuild + inspect ir.json for expected annotations)
+
+Flips status to Complete in the same commit that lands the above.

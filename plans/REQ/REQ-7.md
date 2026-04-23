@@ -15,16 +15,16 @@ walks `ir.ir_plugin_requests[namespace]` and emits one of `@requiresAuth`
 per property. uscis output: 234 `@server-derived` tags across 78
 methods, 7 activations. tsc clean.
 
-**Still deferred (see SAFE-S05 umbrella):**
-- Per-method `request = ()` override is not honored (every method in
-  an activation with psRequest gets the JSDoc). Requires REQ-6
-  (per-method `x-plexus-source` on `MethodSchema.params`).
-- Caller-facing signature still includes derived params if any
-  activation declares them on a method (uscis doesn't, so this hasn't
-  surfaced as a problem yet).
+**JSDoc scope moved to REQ-9 (Apr 23):** The activation-level JSDoc
+emission is a stepping stone; REQ-9 retargets it to per-method source
+using REQ-6's `x-plexus-source` annotations. REQ-9 supersedes this
+ticket's JSDoc acceptance criteria. What remains in REQ-7:
+
 - `--expose-request-fields` flag for opt-in optional override arg.
 - `-32001` typed-error mapping in the transport with expected-cookie
   hint per method.
+
+Both remaining items are downstream of REQ-6 + REQ-9 landing.
 
 ## Problem
 
