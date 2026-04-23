@@ -1,12 +1,38 @@
 ---
 id: REQ-6
 title: "plexus-macros emits per-method merged param schemas with x-plexus-source"
-status: Pending
+status: Partial
 type: implementation
 blocked_by: []
 unlocks: [REQ-8, REQ-9, SAFE-6]
 severity: High
 ---
+
+**Partial implementation Apr 23 2026 (autonomous run):** Core merge
+behavior landed in plexus-macros 0.5.6. `method_enum::generate()` now
+takes the activation's request type, threads per-method auth resolver
+entries + override flags into the runtime schema generator, and
+augments each method's `params.properties` at runtime with:
+
+- `#[from_auth(expr)]` params tagged `x-plexus-source: { from: "auth", resolver: "<expr>" }`
+- Activation-level request struct fields merged verbatim (preserving
+  their existing `x-plexus-source` from PlexusRequest derive), when
+  the method does not override via `request = ()`
+
+Verified by 3 new tests in `req6_from_auth_tests.rs` + an updated test
+in `activation_schema_tests.rs`. All 84 plexus-macros tests pass.
+
+**Still deferred:**
+
+- Field-level `required = [...]` locking on the activation attribute.
+  Today methods can freely override with `request = ()`; no compile-time
+  check prevents dropping a semantically-mandatory field.
+- Override validation with clear compile errors (depends on `required`
+  parsing landing first).
+- Verification end-to-end against uscis (FormVeritasV2 currently pins
+  `plexus-macros = "0.4"` from crates.io; would require enabling the
+  repo's commented-out `[patch.crates-io]` block to consume the local
+  0.5.6 build).
 
 ## Problem
 
