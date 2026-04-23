@@ -1,12 +1,41 @@
 ---
 id: REQ-10
 title: "activation `required = [...]` field-locking + override validation"
-status: Pending
+status: Partial
 type: implementation
 blocked_by: [REQ-6]
 unlocks: []
 severity: Medium
 ---
+
+**Partial implementation Apr 23 2026 (autonomous run):** The `required(...)`
+attribute parses, and compile-time validation for the `request = ()` Skip
+case landed.
+
+- Syntax: `required(field_a, field_b)` in the activation attribute (matches
+  the existing `children(...)` convention; the `= [...]` form documented in
+  the original REQ-6 ticket was wishful — not what the parser accepts).
+- `HubMethodsAttrs.required_fields: Vec<syn::Ident>` captured in parse.rs.
+- `codegen/mod.rs` rejects any method with `#[method(request = ())]` at
+  macro expansion when `required_fields` is non-empty, with an error
+  naming the locked fields and three remediation suggestions.
+- Acceptance criteria 1, 2, 3 verified:
+  - AC1: compile-fail trybuild fixture at
+    `tests/compile/req10_required_rejects_override.rs` + `.stderr`.
+  - AC2/3: override allowed when activation lacks `required` attribute
+    (verified in `tests/req10_required_fields_tests.rs::override_allowed_when_activation_has_no_required_list`).
+
+**Still deferred (AC4, AC5):**
+
+- Per-method `#[method(request = OtherType)]` validation against the
+  required list. Requires the trait-bound approach described in the
+  ticket's Risks section — emit `fn __assert_has_field<T: HasField_X>()`
+  expansions — which is more invasive than tonight's Skip-only check.
+- Tests for that path (criteria 4 and 5) are intentionally missing; they
+  land when the trait-bound follow-up lands.
+
+Tracked as a known gap in REQ-10's body until a follow-up; no new ticket
+needed yet.
 
 ## Problem
 
