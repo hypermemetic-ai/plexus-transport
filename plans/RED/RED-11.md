@@ -7,6 +7,9 @@ blocked_by: []
 unlocks: []
 ---
 
+> **Implementation vehicle: DISP-3.** REST port to Dispatcher + deletion of the 2-arg `Activation::call` closes this ticket structurally — after DISP-3 lands, it becomes a compile error to dispatch without threading auth.
+
+
 ## Problem
 
 RED-S10 confirmed a critical hole: `plexus-transport/src/http/bridge.rs:178` calls `activation.call(&method, params)` — the legacy two-argument form. The four-arg form is `call(method, params, auth, raw_ctx)`. REST dispatch silently drops `auth` and `raw_ctx`.

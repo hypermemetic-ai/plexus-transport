@@ -7,6 +7,9 @@ blocked_by: []
 unlocks: []
 ---
 
+> **Implementation vehicle: DISP-1.** Recursive schema walk is absorbed into `PostureCheck::walk`. This ticket's acceptance criteria map onto DISP-1's PostureCheck unit tests.
+
+
 ## Problem
 
 RED-4 introduced a build-time assertion that refuses to start a `TransportServer` if any activation declares auth-gated methods but no `SessionValidator` is wired. RED-S09 confirmed the check only walks the root activation schema: `plexus-transport/src/server.rs` `collect_from_schema` (around L376–402) inspects `schema.methods` but not `schema.children`.

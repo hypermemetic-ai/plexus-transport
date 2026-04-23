@@ -7,6 +7,9 @@ blocked_by: []
 unlocks: []
 ---
 
+> **Implementation vehicle: DISP-1.** `OriginPolicy::new` logs WARN when the allowlist is unset; `PostureCheck` integration means an activation declaring `ValidOrigin` plus no allowlist + no `.allow_any_origin_for_dev()` opt-in refuses to start. Absorbed cleanly into the scaffolding ticket.
+
+
 ## Problem
 
 RED-S16 verdict: the `ValidOrigin` extractor propagates rejection errors correctly (safe), but the allow-all fallback when `ALLOWED_ORIGINS` env is unset is silent:

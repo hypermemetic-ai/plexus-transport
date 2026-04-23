@@ -7,6 +7,9 @@ blocked_by: []
 unlocks: []
 ---
 
+> **Implementation vehicle: DISP-4 (MCP) + DISP-5 (stdio).** Both tickets introduce the `.allow_unauthenticated_*()` opt-outs, the ConfigError on unprotected deploy, and the trust-model docs. This ticket flips to Complete once both DISPs land.
+
+
 ## Problem
 
 RED-S11 and RED-S12 confirmed that MCP (`plexus-transport/src/mcp/bridge.rs:318`) and stdio transports invoke `activation.call(..., None, None)` — `AuthContext` is always absent. No Plexus-side mechanism to populate it; no `.with_session_validator()` equivalent.

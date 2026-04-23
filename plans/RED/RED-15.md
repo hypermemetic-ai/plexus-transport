@@ -7,6 +7,9 @@ blocked_by: []
 unlocks: []
 ---
 
+> **Implementation vehicle: DISP-1.** `OriginPolicy::check` runs as the first step inside `Dispatcher::dispatch`, before any auth work. Once DISP-2+ port gateways onto Dispatcher, origin rejection happens uniformly across transports — REST, MCP, and WS inherit the same allowlist enforcement.
+
+
 ## Problem
 
 RED-S15 confirmed moderate CSRF exposure on cookie-auth WebSocket:
