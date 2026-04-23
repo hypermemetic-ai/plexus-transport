@@ -22,17 +22,10 @@ augments each method's `params.properties` at runtime with:
 Verified by 3 new tests in `req6_from_auth_tests.rs` + an updated test
 in `activation_schema_tests.rs`. All 84 plexus-macros tests pass.
 
-**Still deferred:**
+**Still deferred (now split out as their own tickets):**
 
-- Field-level `required = [...]` locking on the activation attribute.
-  Today methods can freely override with `request = ()`; no compile-time
-  check prevents dropping a semantically-mandatory field.
-- Override validation with clear compile errors (depends on `required`
-  parsing landing first).
-- Verification end-to-end against uscis (FormVeritasV2 currently pins
-  `plexus-macros = "0.4"` from crates.io; would require enabling the
-  repo's commented-out `[patch.crates-io]` block to consume the local
-  0.5.6 build).
+- **REQ-10** — activation `required = [...]` field-locking + compile-time override validation
+- **REQ-11** — REQ-6 end-to-end verification against uscis (FormVeritasV2 currently pins `plexus-macros = "0.4"` from crates.io; requires enabling the repo's commented-out `[patch.crates-io]` block)
 
 ## Problem
 
