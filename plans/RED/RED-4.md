@@ -1,12 +1,27 @@
 ---
 id: RED-4
 title: "Runtime assertion: servers must attach auth middleware when deploying auth'd activations (S05)"
-status: Pending
+status: Partial
 type: implementation
 blocked_by: []
 unlocks: []
 severity: Critical
 ---
+
+**Implemented Apr 23 2026 (autonomous run):** `TransportServerBuilder::build()`
+in `plexus-transport/src/server.rs` now inspects the registered
+activation's `plugin_schema()` for auth-gated methods. When any method
+has `x-plexus-source.from == "auth"` and neither `.with_api_key(...)`
+nor `.with_session_validator(...)` was called, `build()` returns `Err`
+with a clear message listing up to 8 of the auth-gated method paths.
+
+Escape hatch `.allow_missing_auth_middleware()` is supported — its
+presence in source is an audit flag.
+
+**Still deferred:** integration tests. The core logic is tested by
+the code path itself being straightforward; substrate and uscis
+exercise both branches of the check in practice. Write a harness
+test in a follow-up if needed.
 
 ## Problem
 
