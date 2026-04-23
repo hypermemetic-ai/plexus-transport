@@ -1,12 +1,18 @@
 ---
 id: RED-3
 title: "Compile error on `#[from_auth]` without activation-level `request = ...` (S04)"
-status: Pending
+status: Complete
 type: implementation
 blocked_by: []
 unlocks: []
 severity: Medium
 ---
+
+**Implemented Apr 23 2026 (autonomous run):** Codegen check in
+`plexus-macros/src/codegen/mod.rs` (between REQ-6 and REQ-10
+validations) emits a `syn::Error` when `args.request_type.is_none()`
+and any method has `auth_resolvers`. Trybuild fixture + test harness
+added. 87/87 plexus-macros tests pass.
 
 ## Problem
 

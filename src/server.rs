@@ -155,6 +155,11 @@ pub struct TransportServerBuilder<A: Activation> {
     mcp_flat_schemas: Option<Vec<PluginSchema>>,
     mcp_route_fn: Option<RouteFn>,
     session_validator: Option<Arc<dyn SessionValidator>>,
+    /// RED-4: opt-out of the build-time check that refuses to start the
+    /// server when activations declare auth-gated methods but no auth
+    /// middleware has been configured. Set by
+    /// `.allow_missing_auth_middleware()`.
+    allow_missing_auth: bool,
 }
 
 impl<A: Activation> TransportServerBuilder<A> {
@@ -169,6 +174,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             mcp_flat_schemas: None,
             mcp_route_fn: None,
             session_validator: None,
+            allow_missing_auth: false,
         }
     }
 
@@ -247,8 +253,62 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
-    /// Build the transport server
+    /// RED-4: opt out of the build-time auth-configuration check.
+    ///
+    /// Normally, [`Self::build`] inspects the registered activation's
+    /// `plugin_schema()` for methods carrying an `x-plexus-source.from == "auth"`
+    /// annotation (emitted by `#[from_auth(...)]`). If any such method exists
+    /// AND neither [`Self::with_api_key`] nor [`Self::with_session_validator`]
+    /// was called, `build()` returns `Err` to prevent deploying an auth-gated
+    /// activation to a server without auth middleware.
+    ///
+    /// Call this method to bypass the check when you intentionally want a
+    /// server with no auth (e.g., local test harness, fully public backend).
+    /// The presence of this call in source code is an audit signal.
+    pub fn allow_missing_auth_middleware(mut self) -> Self {
+        self.allow_missing_auth = true;
+        self
+    }
+
+    /// Build the transport server.
+    ///
+    /// RED-4: fails with a clear error when the activation declares auth-gated
+    /// methods but no auth middleware has been configured. Opt out via
+    /// [`Self::allow_missing_auth_middleware`].
     pub async fn build(self) -> Result<TransportServer<A>> {
+        // RED-4: verify auth configuration before starting the server.
+        let has_api_key = self.config.api_key.is_some();
+        let has_session_validator = self.session_validator.is_some();
+        let auth_configured = has_api_key || has_session_validator;
+
+        if !auth_configured && !self.allow_missing_auth {
+            let auth_gated = collect_auth_gated_methods(&*self.activation);
+            if !auth_gated.is_empty() {
+                let summary = auth_gated
+                    .iter()
+                    .take(8)
+                    .map(|m| format!("  - {}", m))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let extra = if auth_gated.len() > 8 {
+                    format!("\n  ... ({} more)", auth_gated.len() - 8)
+                } else {
+                    String::new()
+                };
+                return Err(anyhow::anyhow!(
+                    "RED-4: {} auth-gated method(s) declared but no auth middleware \
+                     configured. Call `.with_session_validator(...)` or \
+                     `.with_api_key(...)` on the builder, or \
+                     `.allow_missing_auth_middleware()` to intentionally opt out.\n\
+                     \n\
+                     Auth-gated methods:\n{}{}",
+                    auth_gated.len(),
+                    summary,
+                    extra,
+                ));
+            }
+        }
+
         Ok(TransportServer {
             activation: self.activation,
             config: self.config,
@@ -257,5 +317,44 @@ impl<A: Activation> TransportServerBuilder<A> {
             mcp_route_fn: self.mcp_route_fn,
             session_validator: self.session_validator,
         })
+    }
+}
+
+/// RED-4: inspect an activation's plugin schema for methods with
+/// `x-plexus-source.from == "auth"`.
+///
+/// Returns a flat list of `"namespace.method"` paths for error reporting.
+/// Activations that declare no auth-gated methods return an empty vec —
+/// the caller uses emptiness as a signal that no auth config is required.
+///
+/// Only inspects the root activation's schema. Standalone child activations
+/// register their own `TransportServerBuilder`s and hit this check
+/// independently. Hub-style children whose methods appear in the parent
+/// schema are covered through the root traversal.
+fn collect_auth_gated_methods<A: Activation>(activation: &A) -> Vec<String> {
+    let schema = Activation::plugin_schema(activation);
+    let mut out = Vec::new();
+    collect_from_schema(&schema, &mut out);
+    out
+}
+
+fn collect_from_schema(schema: &PluginSchema, out: &mut Vec<String>) {
+    for method in &schema.methods {
+        let params_schema = match &method.params {
+            Some(p) => p,
+            None => continue,
+        };
+        let props = match params_schema.get("properties").and_then(|v| v.as_object()) {
+            Some(p) => p,
+            None => continue,
+        };
+        for (_name, prop) in props {
+            let src = prop.get("x-plexus-source").and_then(|v| v.as_object());
+            let from = src.and_then(|s| s.get("from")).and_then(|v| v.as_str());
+            if from == Some("auth") {
+                out.push(format!("{}.{}", schema.namespace, method.name));
+                break;
+            }
+        }
     }
 }
