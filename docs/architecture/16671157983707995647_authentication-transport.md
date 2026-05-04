@@ -1,8 +1,10 @@
 # Transport-Layer Authentication
 
-**Status**: Implemented
-**Date**: 2026-04-07
-**Related**: plexus-core authentication-framework.md, plexus-macros authentication-codegen.md
+**Status**: Implemented (AUTHZ-BEARER-1 supersedes the historical Bearer/Cookie precedence section; see "Header layout (AUTHZ-BEARER-1)" below for the source of truth)
+**Date**: 2026-04-07 (AUTHZ-BEARER-1 amendment 2026-05-04)
+**Related**: plexus-core authentication-framework.md, plexus-macros authentication-codegen.md, `plans/AUTHZ/AUTHZ-BEARER-1.md`, `plans/AUTHZ/AUTHZ-BEARER-S01-output.md`
+
+> **Reader note (2026-05-04):** the WebSocket-upgrade middleware was rewritten under [AUTHZ-BEARER-1](../../../plans/AUTHZ/AUTHZ-BEARER-1.md). The static `api_key` admission key now lives on a dedicated header (default `X-Plexus-API-Key`); `Authorization: Bearer` is reserved for `SessionValidator` user-identity tokens. Skip directly to the [Header layout (AUTHZ-BEARER-1)](#header-layout-authz-bearer-1) section for the current contract; the older "Implementation" code excerpts below describe the pre-AUTHZ-BEARER-1 shape and have NOT been updated.
 
 ## Overview
 
@@ -317,34 +319,96 @@ Cookie-based auth **requires HTTPS** in production:
 
 **Development exception**: HTTP is acceptable for localhost testing with TestSessionValidator.
 
-## Bearer Token + Cookie Combination
+## Header layout (AUTHZ-BEARER-1)
 
-The middleware supports **both** Bearer tokens and cookies simultaneously:
+> **Status:** Updated 2026-05-04 by AUTHZ-BEARER-1. The historical "Bearer
+> token + Cookie combination" section described a different shape; this
+> subsection supersedes it. See `plans/AUTHZ/AUTHZ-BEARER-1.md` and
+> `plans/AUTHZ/AUTHZ-BEARER-S01-output.md` §4 for the full contract.
 
-**Use case:**
-- Browser clients: Use cookies (automatic, HttpOnly, secure)
-- API clients: Use Bearer tokens (easier for programmatic access)
+The transport's WebSocket-upgrade middleware separates **two unrelated**
+authentication concerns onto **two unrelated headers**:
 
-**Behavior:**
-1. If `expected_bearer` is set: Validate `Authorization` header **first**
-2. If Bearer validation fails: Return 401 (do not proceed to cookie check)
-3. If Bearer validation succeeds or no Bearer configured: Check cookies
-4. If both are configured, Bearer takes precedence (API access requires explicit header)
+| Header (default) | Carries | Consumed by | Configurable name? |
+|---|---|---|---|
+| `X-Plexus-API-Key` | Static deployment-admission key (`api_key`) | Layer-0 admission gate; never reaches `SessionValidator` | Yes — `WebSocketConfig::with_api_key_header(HeaderName)` / `TransportServerBuilder::with_api_key_header(HeaderName)` |
+| `Authorization: Bearer <token>` | User-identity token (JWT or opaque) | `SessionValidator::validate(token)` (when wired) | No — fixed by HTTP convention |
+| `Cookie: access_token=<...>` | Browser-issued user-identity session | `SessionValidator::validate(cookie_value)` (when wired) | No — fixed by HTTP convention |
+
+**Decision sequence on every WS upgrade:**
+
+1. **Static admission gate (`api_key`).** When configured, the upgrade
+   request MUST carry the configured api_key header with the matching
+   value. Header missing → HTTP 401 `"api key required"`. Value mismatch
+   → HTTP 401 `"api key invalid"`. The `SessionValidator` path is not
+   consulted.
+2. **Dynamic identity (`SessionValidator`, when wired).** Try inputs in
+   order; the first that returns `Some(AuthContext)` wins:
+   1. `Cookie` header → `SessionValidator::validate(cookie_str)`
+   2. `Authorization: Bearer <token>` (RFC 6750 prefix stripped) →
+      `SessionValidator::validate(token)`
+3. **Strict-mode reject (RED-9).** If `SessionValidator` was consulted,
+   produced no `AuthContext`, AND `reject_upgrade_on_auth_failure` is
+   ON → HTTP 401 (`"session invalid or expired"` if any input was
+   present, `"session cookie or bearer required"` if no input was
+   present).
+4. **Pass-through.** Otherwise, dispatch with whatever `AuthContext`
+   (if any) was produced.
+
+The two layers compose: when both `api_key` and `SessionValidator` are
+configured, the static gate fires first; only after it passes is the
+`SessionValidator` consulted.
 
 **Example configuration:**
 ```rust
+use http::HeaderName;
 TransportServer::builder(activation, rpc_converter)
     .with_websocket(8080)
-    .with_api_key("secret-api-key")  // Bearer token auth
-    .with_session_validator(validator)  // Cookie auth
+    .with_api_key(Some("secret-admission-key".into()))   // X-Plexus-API-Key
+    .with_session_validator(my_validator)                // Cookie OR Bearer
+    // Optional: override the api_key header name
+    // .with_api_key_header(HeaderName::from_static("x-my-key"))
+    .reject_upgrade_on_auth_failure()                    // RED-9 strict mode
     .build().await?;
 ```
 
-**Request scenarios:**
-- `Authorization: Bearer secret-api-key` + valid cookie → Authenticated (cookie)
-- `Authorization: Bearer wrong-key` + valid cookie → 401 Unauthorized (Bearer failed)
-- No `Authorization` + valid cookie → Authenticated (cookie)
-- No `Authorization` + no cookie → Anonymous (methods can handle)
+**Request scenarios** (`api_key=K`, validator wired, strict mode OFF):
+
+| `X-Plexus-API-Key` | `Cookie` | `Authorization` | Result |
+|---|---|---|---|
+| absent | any | any | 401 `"api key required"` |
+| `K_wrong` | any | any | 401 `"api key invalid"` |
+| `K` | absent | absent | 200, no AuthContext (pass through) |
+| `K` | `access_token=valid` | absent | 200, AuthContext from cookie |
+| `K` | absent | `Bearer valid-jwt` | 200, AuthContext from bearer |
+| `K` | `access_token=valid` | `Bearer valid-jwt` | 200, AuthContext from cookie (cookie wins) |
+| `K` | `access_token=garbage` | `Bearer valid-jwt` | 200, AuthContext from bearer (fallback) |
+
+### v1 compat shim (deprecated, single release window)
+
+When `api_key` is configured AND the configured api_key header is absent
+AND `Authorization: Bearer <value>` matches the api_key exactly AND
+`SessionValidator` is NOT wired, the request is accepted as if the
+api_key header had matched. A `tracing::warn!` deprecation notice
+including the configured header name is emitted. The compat shim is OFF
+whenever `SessionValidator` is configured, to prevent re-entry of the
+header-conflation defect this contract removes.
+
+A separate, future ticket (AUTHZ-BEARER-2) removes the compat shim
+after one release.
+
+### Out-of-scope follow-ups
+
+- **MCP HTTP and REST HTTP gateways** (`mcp/server.rs`, `http/server.rs`,
+  `combined.rs`) continue to enforce `api_key` against
+  `Authorization: Bearer` until a follow-up ticket aligns them with the
+  new header layout.
+- **`SessionValidator` trait input disambiguation.** The trait method
+  `validate(&str)` now receives either a Cookie-header string or a
+  bare bearer token. Existing implementations (e.g. `TrakAuth`) handle
+  both shapes; new implementations MUST disambiguate. A future trait
+  revision could split inputs by source (`CredentialSource::Cookie(&str)`
+  vs `CredentialSource::Bearer(&str)`); not part of this contract.
 
 ## Error Handling
 
