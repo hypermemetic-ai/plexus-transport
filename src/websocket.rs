@@ -95,7 +95,7 @@ pub async fn serve_websocket(
 // consumes Cookie and/or Authorization: Bearer.
 // ---------------------------------------------------------------------------
 
-mod auth {
+pub(crate) mod auth {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -121,7 +121,7 @@ mod auth {
     ///
     /// See module docs for full behavior table.
     #[derive(Clone)]
-    pub(super) struct CombinedAuthMiddleware<S> {
+    pub struct CombinedAuthMiddleware<S> {
         pub(super) service: S,
         /// AUTHZ-BEARER-1: static admission key. When `Some`, every upgrade
         /// must carry the configured header with this value.
@@ -358,3 +358,33 @@ mod auth {
 }
 
 use auth::CombinedAuthMiddleware;
+
+/// Test-only hooks for AUTHZ-BEARER-1 integration tests.
+///
+/// `#[doc(hidden)]` because this is not part of the public API contract; it
+/// exists to let integration tests in `tests/` drive the middleware
+/// directly without spinning up a real WS server.
+#[doc(hidden)]
+pub mod testing {
+    use std::sync::Arc;
+
+    /// Build the AUTHZ-BEARER-1 auth middleware, wrapping the supplied
+    /// inner service. See `serve_websocket` for the production wiring.
+    pub fn combined_auth_middleware<S>(
+        service: S,
+        api_key: Option<String>,
+        api_key_header: http::HeaderName,
+        session_validator: Option<Arc<dyn plexus_core::plexus::SessionValidator>>,
+        reject_on_session_failure: bool,
+    ) -> super::auth::CombinedAuthMiddleware<S> {
+        super::auth::CombinedAuthMiddleware {
+            service,
+            api_key,
+            api_key_header,
+            session_validator,
+            reject_on_session_failure,
+        }
+    }
+
+    pub use super::auth::CombinedAuthMiddleware;
+}

@@ -43,6 +43,8 @@ async-stream = "0.3"
 async-trait = "0.1"
 uuid = { version = "1.0", features = ["v4"] }
 tower = "0.5"
+# AUTHZ-BEARER-1 integration tests: empty HTTP body + BodyExt::collect.
+http-body-util = "0.1"
 # plexus-schemars-compat aliased as "schemars" so that #[derive(schemars::JsonSchema)]
 # in tests resolves to the no-op derive, preventing duplicate impl JsonSchema conflicts
 # with PlexusRequest's generated impl. All real schemars types/macros are re-exported.
