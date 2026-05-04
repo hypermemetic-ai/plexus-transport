@@ -80,10 +80,15 @@ impl<A: Activation> TransportServer<A> {
 
         // Start WebSocket transport
         let ws_handle: Option<ServerHandle> = if let Some(mut ws_config) = self.config.websocket {
-            // Propagate the global api_key to the WebSocket config if not already set.
+            // Propagate the global api_key + header config to the WebSocket
+            // config if not already set on the WS-specific config.
             if ws_config.api_key.is_none() {
                 ws_config.api_key = self.config.api_key.clone();
             }
+            // Always propagate the configured api_key_header from the global
+            // config — the WS-specific default is set in WebSocketConfig::new
+            // and we want the global builder method to win.
+            ws_config.api_key_header = self.config.api_key_header.clone();
             let module = module.expect("RPC module should be created for WebSocket");
             Some(serve_websocket(module, ws_config, self.session_validator.clone(), self.reject_upgrade_on_auth_failure).await?)
         } else {
@@ -241,12 +246,37 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
-    /// Require `Authorization: Bearer <key>` on all WebSocket and MCP HTTP connections.
+    /// Configure a static admission key required on all WebSocket connections.
     ///
-    /// When set, connections missing or supplying the wrong token are rejected with
-    /// HTTP 401. Passing `None` disables authentication (default behaviour).
+    /// When set, the WebSocket upgrade is rejected with HTTP 401 unless the
+    /// configured api_key header (default `X-Plexus-API-Key`, see
+    /// [`Self::with_api_key_header`]) carries the matching value. Passing
+    /// `None` disables the static admission gate (default behaviour).
+    ///
+    /// Per AUTHZ-BEARER-1, the static api_key gate is independent of the
+    /// `SessionValidator` path. The `Authorization: Bearer` header is reserved
+    /// for `SessionValidator` user-identity tokens and is not consulted by the
+    /// static admission gate. (One exception: the deprecated v1 compat shim
+    /// — see the WS middleware docs.)
+    ///
+    /// MCP HTTP and REST HTTP gateways continue to enforce api_key against
+    /// `Authorization: Bearer` until a follow-up ticket aligns them.
     pub fn with_api_key(mut self, key: Option<String>) -> Self {
         self.config.api_key = key;
+        self
+    }
+
+    /// Override the header that carries the static api_key on WebSocket upgrades.
+    ///
+    /// Default: `X-Plexus-API-Key`. Header lookup is case-insensitive per the
+    /// HTTP spec; the stored `HeaderName` is normalized to lowercase. Has no
+    /// effect when `with_api_key(None)` is configured.
+    ///
+    /// AUTHZ-BEARER-1: separates the static-admission header from the
+    /// `Authorization` header that carries `SessionValidator`-consumed Bearer
+    /// tokens.
+    pub fn with_api_key_header(mut self, header: http::HeaderName) -> Self {
+        self.config.api_key_header = header;
         self
     }
 

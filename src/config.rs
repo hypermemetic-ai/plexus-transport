@@ -5,6 +5,13 @@ use std::net::SocketAddr;
 #[cfg(feature = "sqlite-sessions")]
 use std::path::PathBuf;
 
+/// Default header name carrying the static api_key (AUTHZ-BEARER-1).
+///
+/// Per AUTHZ-BEARER-S01-output §3 and AUTHZ-0 principles 4 and 6, the static
+/// admission key MUST live on a dedicated header so the `Authorization` header
+/// is reserved exclusively for `SessionValidator` user-identity tokens.
+pub const DEFAULT_API_KEY_HEADER: &str = "X-Plexus-API-Key";
+
 /// Complete transport configuration
 #[derive(Debug, Clone)]
 pub struct TransportConfig {
@@ -12,9 +19,17 @@ pub struct TransportConfig {
     pub stdio: Option<StdioConfig>,
     pub mcp_http: Option<McpHttpConfig>,
     pub rest_http: Option<RestHttpConfig>,
-    /// Optional bearer token required on all WebSocket, MCP HTTP, and REST HTTP connections.
-    /// When `None`, no authentication is required (current behaviour).
+    /// Optional admission key required on all WebSocket, MCP HTTP, and REST HTTP connections.
+    /// When `None`, no admission gate is enforced (current default).
+    ///
+    /// Per AUTHZ-BEARER-1, this is checked against the configured `api_key_header`
+    /// (default `X-Plexus-API-Key`), NOT against `Authorization: Bearer`.
     pub api_key: Option<String>,
+    /// Header name carrying the api_key on incoming requests.
+    ///
+    /// Defaults to `X-Plexus-API-Key`. Header lookup is case-insensitive per the
+    /// HTTP spec; this value is used to construct an `http::HeaderName`.
+    pub api_key_header: http::HeaderName,
 }
 
 impl Default for TransportConfig {
@@ -25,6 +40,7 @@ impl Default for TransportConfig {
             mcp_http: None,
             rest_http: None,
             api_key: None,
+            api_key_header: http::HeaderName::from_static("x-plexus-api-key"),
         }
     }
 }
@@ -33,8 +49,14 @@ impl Default for TransportConfig {
 #[derive(Debug, Clone)]
 pub struct WebSocketConfig {
     pub addr: SocketAddr,
-    /// Optional bearer token required on the HTTP upgrade request.
+    /// Optional admission key required on the HTTP upgrade request.
+    ///
+    /// Per AUTHZ-BEARER-1, checked against the configured `api_key_header`
+    /// (default `X-Plexus-API-Key`), NOT against `Authorization: Bearer`.
     pub api_key: Option<String>,
+    /// Header name carrying the api_key on the upgrade request.
+    /// Defaults to `X-Plexus-API-Key`.
+    pub api_key_header: http::HeaderName,
 }
 
 impl WebSocketConfig {
@@ -44,7 +66,17 @@ impl WebSocketConfig {
                 .parse()
                 .expect("Valid socket address"),
             api_key: None,
+            api_key_header: http::HeaderName::from_static("x-plexus-api-key"),
         }
+    }
+
+    /// Override the header name carrying the api_key.
+    ///
+    /// Default: `X-Plexus-API-Key`. Header lookup is case-insensitive per the
+    /// HTTP spec; the stored `HeaderName` is normalized to lowercase.
+    pub fn with_api_key_header(mut self, header: http::HeaderName) -> Self {
+        self.api_key_header = header;
+        self
     }
 }
 

@@ -51,7 +51,10 @@ pub mod http;
 // Re-export main API
 #[cfg(feature = "mcp-gateway")]
 pub use combined::serve_combined;
-pub use config::{McpHttpConfig, SessionStorage, StdioConfig, TransportConfig, WebSocketConfig};
+pub use config::{
+    McpHttpConfig, SessionStorage, StdioConfig, TransportConfig, WebSocketConfig,
+    DEFAULT_API_KEY_HEADER,
+};
 
 #[cfg(feature = "http-gateway")]
 pub use config::RestHttpConfig;
