@@ -30,6 +30,12 @@
 //! # }
 //! ```
 
+/// Crate version, populated at compile time from `CARGO_PKG_VERSION`.
+///
+/// Exposed so the `plexus-rpc` umbrella can stamp it into the
+/// `Capabilities` manifest backends embed in `_info`. See UMB-2.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod request;
 
 #[cfg(feature = "mcp-gateway")]
