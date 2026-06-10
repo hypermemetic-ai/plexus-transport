@@ -96,6 +96,11 @@ fn plexus_to_mcp_error(e: PlexusError) -> McpError {
         PlexusError::Unauthenticated(reason) => {
             McpError::invalid_request(format!("Authentication required: {}", reason), None)
         }
+        // R-5 scope gate (plexus-core). The Display impl names only the
+        // unmet scope (no-enumeration posture, AUTHZ-CORE-1/5).
+        forbidden @ PlexusError::Forbidden { .. } => {
+            McpError::invalid_request(forbidden.to_string(), None)
+        }
     }
 }
 
