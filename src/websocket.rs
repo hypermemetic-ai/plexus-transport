@@ -51,13 +51,15 @@ use crate::config::WebSocketConfig;
 /// The two layers compose; see the module docs for the full behavior table
 /// (also documented in AUTHZ-BEARER-S01-output §4).
 ///
-/// Returns a handle that can be used to stop the server.
+/// Returns a handle that can be used to stop the server, plus the ACTUAL
+/// bound address (differs from `config.addr` when binding port 0 — Z2H-6
+/// registration reports the OS-assigned port).
 pub async fn serve_websocket(
     module: RpcModule<()>,
     config: WebSocketConfig,
     session_validator: Option<Arc<dyn plexus_core::plexus::SessionValidator>>,
     reject_on_session_failure: bool,
-) -> Result<ServerHandle> {
+) -> Result<(ServerHandle, std::net::SocketAddr)> {
     tracing::info!("Starting WebSocket transport at ws://{}", config.addr);
 
     let has_api_key = config.api_key.is_some();
@@ -79,13 +81,15 @@ pub async fn serve_websocket(
             .set_http_middleware(middleware)
             .build(config.addr)
             .await?;
+        let local_addr = server.local_addr()?;
         let handle = server.start(module);
-        return Ok(handle);
+        return Ok((handle, local_addr));
     }
 
     let server = Server::builder().build(config.addr).await?;
+    let local_addr = server.local_addr()?;
     let handle = server.start(module);
-    Ok(handle)
+    Ok((handle, local_addr))
 }
 
 // ---------------------------------------------------------------------------

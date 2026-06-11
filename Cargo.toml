@@ -17,7 +17,8 @@ thiserror = "1.0"
 tracing = "0.1"
 
 # JSON-RPC and WebSocket
-jsonrpsee = { version = "0.26", features = ["server"] }
+# ws-client: Z2H-6 boot-time registry self-registration (src/registry.rs)
+jsonrpsee = { version = "0.26", features = ["server", "ws-client"] }
 hyper = { version = "1", features = ["full"], optional = true }
 bytes = "1"
 http-body = "1"

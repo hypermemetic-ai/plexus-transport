@@ -10,8 +10,26 @@ use tokio::task::JoinHandle;
 use crate::config::{McpHttpConfig, StdioConfig, TransportConfig, WebSocketConfig};
 use crate::mcp::bridge::RouteFn;
 use crate::mcp::server::serve_mcp_http;
+use crate::registry::{self, RegistryRegistration};
 use crate::stdio::serve_stdio;
 use crate::websocket::serve_websocket;
+
+/// Z2H-6: builder-level configuration for boot-time registry
+/// self-registration. All fields are overrides; `Default` means
+/// "registration ON, endpoint from `PLEXUS_REGISTRY_URL` (default
+/// `ws://127.0.0.1:4444`), name from the activation's schema namespace".
+#[derive(Debug, Clone, Default)]
+pub struct RegistryOptions {
+    /// `None` = default (enabled when a WebSocket transport is configured).
+    /// `PLEXUS_NO_REGISTRY=1` wins over any builder setting.
+    pub enabled: Option<bool>,
+    /// Override the registry endpoint URL.
+    pub url: Option<String>,
+    /// Override the registered backend name.
+    pub name: Option<String>,
+    /// Override the advertised host (default `127.0.0.1`).
+    pub host: Option<String>,
+}
 
 /// Function type for converting Arc<Activation> to RpcModule
 ///
@@ -44,6 +62,8 @@ pub struct TransportServer<A: Activation> {
     /// the middleware logs and proceeds without `AuthContext`; per-method
     /// `#[from_auth]` checks fire-closed at dispatch instead.
     reject_upgrade_on_auth_failure: bool,
+    /// Z2H-6: boot-time registry self-registration configuration.
+    registry: RegistryOptions,
 }
 
 impl<A: Activation> TransportServer<A> {
@@ -59,6 +79,18 @@ impl<A: Activation> TransportServer<A> {
     ///
     /// If stdio is configured, this will block on stdio (as it's the primary transport).
     /// Otherwise, it will start WebSocket/MCP servers and wait for them to complete.
+    ///
+    /// ## Z2H-6: registry self-registration
+    ///
+    /// When a WebSocket transport is configured, the server announces
+    /// itself to the Plexus registry after binding (name, host, ACTUAL
+    /// bound port, schema identity) — a first-class, observable act.
+    /// Registration is fail-open (≤3 attempts, one warn, serve anyway).
+    /// On graceful shutdown (server stop, SIGTERM, or ctrl-c) the
+    /// registration is invalidated via `registry.deregister`. Opt out
+    /// with [`TransportServerBuilder::without_registry`] or
+    /// `PLEXUS_NO_REGISTRY=1`; point elsewhere with
+    /// `PLEXUS_REGISTRY_URL` / [`TransportServerBuilder::with_registry_url`].
     pub async fn serve(mut self) -> Result<()> {
         // Convert activation to RPC module for WebSocket/stdio
         let needs_rpc = self.config.websocket.is_some() || self.config.stdio.is_some();
@@ -79,7 +111,7 @@ impl<A: Activation> TransportServer<A> {
         }
 
         // Start WebSocket transport
-        let ws_handle: Option<ServerHandle> = if let Some(mut ws_config) = self.config.websocket {
+        let ws_started: Option<(ServerHandle, std::net::SocketAddr)> = if let Some(mut ws_config) = self.config.websocket {
             // Propagate the global api_key + header config to the WebSocket
             // config if not already set on the WS-specific config.
             if ws_config.api_key.is_none() {
@@ -94,6 +126,53 @@ impl<A: Activation> TransportServer<A> {
         } else {
             None
         };
+
+        // Z2H-6: announce ourselves to the registry (fail-open, spawned so
+        // a slow/absent registry never delays serving).
+        let registry_reg: Option<RegistryRegistration> = match &ws_started {
+            Some((_, bound_addr))
+                if self.registry.enabled.unwrap_or(true)
+                    && !registry::registry_disabled_by_env() =>
+            {
+                let schema = Activation::plugin_schema(self.activation.as_ref());
+                Some(RegistryRegistration {
+                    url: self
+                        .registry
+                        .url
+                        .clone()
+                        .unwrap_or_else(registry::registry_url_from_env),
+                    name: self
+                        .registry
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| schema.namespace.clone()),
+                    host: self
+                        .registry
+                        .host
+                        .clone()
+                        .unwrap_or_else(|| "127.0.0.1".to_string()),
+                    port: bound_addr.port(),
+                    version: schema.version.clone(),
+                    schema_hash: schema.hash.clone(),
+                })
+            }
+            _ => None,
+        };
+
+        let registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(reg) = registry_reg.clone() {
+            let registered = registered.clone();
+            tokio::spawn(async move {
+                if registry::register_with_retry(&reg).await {
+                    registered.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            });
+        }
+
+        let ws_handle: Option<ServerHandle> = ws_started.map(|(h, _)| h);
+        // Clone for the shutdown-signal branch (ServerHandle is a cheap
+        // shared handle); the original moves into the wait branch below.
+        let ws_handle_for_signal = ws_handle.clone();
 
         // Start MCP HTTP transport
         let mcp_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> =
@@ -123,7 +202,11 @@ impl<A: Activation> TransportServer<A> {
             return Ok(());
         }
 
-        // Wait for first server to stop
+        // Wait for first server to stop. When registry registration is
+        // active, also listen for shutdown signals (SIGTERM / ctrl-c) so
+        // the registration can be invalidated before exit (Z2H-6
+        // stop-invalidation; SIGKILL/crash is covered by resolver-side
+        // lazy eviction instead).
         tokio::select! {
             _ = async {
                 if let Some(ws) = ws_handle {
@@ -151,11 +234,70 @@ impl<A: Activation> TransportServer<A> {
                     }
                 }
             }, if rest_handle.is_some() => {}
+
+            _ = wait_shutdown_signal(), if registry_reg.is_some() => {
+                tracing::info!("shutdown signal received — stopping transports");
+                if let Some(ws) = &ws_handle_for_signal {
+                    let _ = ws.stop();
+                }
+            }
+        }
+
+        // Z2H-6: invalidate our registration on the way out (best-effort).
+        if let Some(reg) = &registry_reg {
+            if registered.load(std::sync::atomic::Ordering::SeqCst) {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    registry::deregister(reg),
+                )
+                .await
+                {
+                    Ok(Ok(())) => tracing::info!(
+                        "deregistered '{}' from registry at {}",
+                        reg.name, reg.url
+                    ),
+                    Ok(Err(e)) => tracing::warn!(
+                        "could not deregister '{}' from registry (entry will be \
+                         lazily evicted on next resolve): {e:#}",
+                        reg.name
+                    ),
+                    Err(_) => tracing::warn!(
+                        "timed out deregistering '{}' from registry (entry will \
+                         be lazily evicted on next resolve)",
+                        reg.name
+                    ),
+                }
+            }
         }
 
         Ok(())
     }
 
+}
+
+/// Resolve when a shutdown signal (ctrl-c, or SIGTERM on unix) arrives.
+/// Only awaited when registry registration is active — signal handlers are
+/// not installed otherwise, preserving default process behavior.
+async fn wait_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sigterm) => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = sigterm.recv() => {}
+                }
+            }
+            Err(_) => {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Builder for configuring transport servers
@@ -174,6 +316,8 @@ pub struct TransportServerBuilder<A: Activation> {
     /// RED-9: opt-in strict-mode for the WS upgrade. Set by
     /// `.reject_upgrade_on_auth_failure()`.
     reject_upgrade_on_auth_failure: bool,
+    /// Z2H-6: registry self-registration overrides.
+    registry: RegistryOptions,
 }
 
 impl<A: Activation> TransportServerBuilder<A> {
@@ -190,7 +334,37 @@ impl<A: Activation> TransportServerBuilder<A> {
             session_validator: None,
             allow_missing_auth: false,
             reject_upgrade_on_auth_failure: false,
+            registry: RegistryOptions::default(),
         }
+    }
+
+    /// Z2H-6: opt out of boot-time registry self-registration (the
+    /// `--no-register` convention). Also reachable at runtime via
+    /// `PLEXUS_NO_REGISTRY=1` without touching code.
+    pub fn without_registry(mut self) -> Self {
+        self.registry.enabled = Some(false);
+        self
+    }
+
+    /// Z2H-6: override the name this backend registers under. Default:
+    /// the activation's schema namespace (the hub root for `DynamicHub`).
+    pub fn with_registry_name(mut self, name: impl Into<String>) -> Self {
+        self.registry.name = Some(name.into());
+        self
+    }
+
+    /// Z2H-6: override the registry endpoint. Default:
+    /// `PLEXUS_REGISTRY_URL`, falling back to `ws://127.0.0.1:4444`.
+    pub fn with_registry_url(mut self, url: impl Into<String>) -> Self {
+        self.registry.url = Some(url.into());
+        self
+    }
+
+    /// Z2H-6: override the host advertised in the registration (default
+    /// `127.0.0.1`; multi-host deployments are out of Z2H-6 scope).
+    pub fn with_registry_host(mut self, host: impl Into<String>) -> Self {
+        self.registry.host = Some(host.into());
+        self
     }
 
     /// Enable WebSocket transport on the specified port
@@ -388,6 +562,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             mcp_route_fn: self.mcp_route_fn,
             session_validator: self.session_validator,
             reject_upgrade_on_auth_failure: self.reject_upgrade_on_auth_failure,
+            registry: self.registry,
         })
     }
 }
