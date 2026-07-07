@@ -17,7 +17,7 @@
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> anyhow::Result<()> {
-//! # let activation = Arc::new(());  // Your Activation implementation
+//! # let activation = Arc::new(plexus_core::plexus::DynamicHub::new("example"));
 //! let config = RestHttpConfig::new(8888);
 //! let handle = serve_rest_http(
 //!     activation,
