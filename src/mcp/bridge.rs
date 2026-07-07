@@ -259,19 +259,39 @@ impl<A: Activation> ActivationMcpBridge<A> {
         None
     }
 
-    /// PLX-17: dispatch a resolved call, threading `auth` into the 4-arg
-    /// `Activation::call` (or the hub `route_fn`) instead of the previous
-    /// hard-coded `None`. Extracted so it can be exercised directly by the
-    /// gateway auth test without constructing an rmcp `RequestContext`.
+    /// PLX-18: build a `RawRequestContext` (origin/headers/peer + resolved
+    /// identity) from the inbound HTTP request parts, so origin/CSRF
+    /// enforcement and header-derived extractors are reachable through the MCP
+    /// gateway. Returns `None` when there are no HTTP parts (e.g. a non-HTTP
+    /// transport) — dispatch then proceeds without a request context, as before.
+    fn build_raw_ctx(
+        parts: Option<&http::request::Parts>,
+        auth: Option<&AuthContext>,
+    ) -> Option<RawRequestContext> {
+        let parts = parts?;
+        Some(RawRequestContext {
+            headers: parts.headers.clone(),
+            uri: parts.uri.clone(),
+            auth: auth.cloned(),
+            peer: None,
+        })
+    }
+
+    /// PLX-17/18: dispatch a resolved call, threading `auth` and `raw_ctx` into
+    /// the 4-arg `Activation::call` (or the hub `route_fn`) instead of the
+    /// previous hard-coded `None, None`. Extracted so it can be exercised
+    /// directly by the gateway tests without constructing an rmcp
+    /// `RequestContext`.
     async fn dispatch(
         &self,
         method_name: &str,
         arguments_value: serde_json::Value,
         auth: Option<Arc<AuthContext>>,
+        raw_ctx: Option<RawRequestContext>,
     ) -> Result<PlexusStream, PlexusError> {
         if let Some(ref router) = self.router {
-            // Hub path: pass the full namespaced method and the identity through.
-            router(method_name.to_string(), arguments_value, auth, None).await
+            // Hub path: pass the full namespaced method, identity, and context through.
+            router(method_name.to_string(), arguments_value, auth, raw_ctx).await
         } else {
             let method = if method_name.contains('.') {
                 method_name.split('.').nth(1).unwrap_or(method_name)
@@ -279,7 +299,7 @@ impl<A: Activation> ActivationMcpBridge<A> {
                 method_name
             };
             self.activation
-                .call(method, arguments_value, auth.as_deref(), None)
+                .call(method, arguments_value, auth.as_deref(), raw_ctx.as_ref())
                 .await
         }
     }
@@ -392,17 +412,18 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
             tracing::debug!("[MCP BRIDGE] No HTTP Parts in extensions!");
         }
 
-        // PLX-17: resolve the per-user identity from the same HTTP request
-        // parts and thread it into dispatch. Previously the MCP gateway always
-        // dispatched with `None` — even after the static Bearer gate admitted a
-        // caller — so any method reading `auth` saw anonymous.
-        let auth = self
-            .resolve_auth(ctx.extensions.get::<http::request::Parts>())
-            .await
-            .map(Arc::new);
+        // PLX-17: resolve the per-user identity from the HTTP request parts and
+        // thread it into dispatch. Previously the MCP gateway always dispatched
+        // with `None` — even after the static Bearer gate admitted a caller — so
+        // any method reading `auth` saw anonymous.
+        // PLX-18: also build a RawRequestContext (origin/headers) from the same
+        // parts so origin/CSRF enforcement is reachable through the MCP gateway.
+        let parts = ctx.extensions.get::<http::request::Parts>();
+        let auth = self.resolve_auth(parts).await.map(Arc::new);
         if let Some(ref ctx_auth) = auth {
             tracing::debug!(user_id = %ctx_auth.user_id, "[MCP BRIDGE] resolved AuthContext");
         }
+        let raw_ctx = Self::build_raw_ctx(parts, auth.as_deref());
 
         let arguments_value = serde_json::Value::Object(arguments_map);
 
@@ -412,11 +433,11 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
         // Logger name: namespace.method (e.g., bash.execute)
         let logger = method_name.to_string();
 
-        // Call activation and get stream, threading the resolved per-user
-        // identity (PLX-17). `dispatch` handles both the hub (`route_fn`) and
-        // leaf paths; `raw_ctx` capture is PLX-18.
+        // Call activation and get stream, threading the resolved identity
+        // (PLX-17) and request context (PLX-18). `dispatch` handles both the
+        // hub (`route_fn`) and leaf paths.
         let stream = self
-            .dispatch(method_name, arguments_value, auth)
+            .dispatch(method_name, arguments_value, auth, raw_ctx)
             .await
             .map_err(plexus_to_mcp_error)?;
 
@@ -587,13 +608,31 @@ pub mod testing {
         bridge.resolve_auth(parts).await
     }
 
-    /// Dispatch a call with a resolved identity, exactly as `call_tool` does.
+    /// Dispatch a call with a resolved identity and request context, exactly as
+    /// `call_tool` does.
     pub async fn dispatch<A: Activation>(
         bridge: &ActivationMcpBridge<A>,
         method_name: &str,
         arguments_value: serde_json::Value,
         auth: Option<Arc<AuthContext>>,
+        raw_ctx: Option<RawRequestContext>,
     ) -> Result<PlexusStream, PlexusError> {
-        bridge.dispatch(method_name, arguments_value, auth).await
+        bridge.dispatch(method_name, arguments_value, auth, raw_ctx).await
+    }
+
+    /// PLX-18: exercise the full MCP gateway call path from raw HTTP request
+    /// parts — resolve identity, build the `RawRequestContext`, and dispatch —
+    /// exactly as `call_tool` does (minus the rmcp streaming envelope). Lets a
+    /// test drive origin/CSRF enforcement end-to-end through the gateway by
+    /// supplying a request with an `Origin` header.
+    pub async fn call_from_parts<A: Activation>(
+        bridge: &ActivationMcpBridge<A>,
+        parts: Option<&http::request::Parts>,
+        method_name: &str,
+        arguments_value: serde_json::Value,
+    ) -> Result<PlexusStream, PlexusError> {
+        let auth = bridge.resolve_auth(parts).await.map(Arc::new);
+        let raw_ctx = ActivationMcpBridge::<A>::build_raw_ctx(parts, auth.as_deref());
+        bridge.dispatch(method_name, arguments_value, auth, raw_ctx).await
     }
 }

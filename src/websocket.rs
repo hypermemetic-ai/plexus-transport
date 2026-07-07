@@ -161,6 +161,27 @@ pub(crate) mod auth {
         value.strip_prefix("Bearer ")
     }
 
+    /// PLX-18: build a `RawRequestContext` (origin/headers + optional resolved
+    /// identity) from the WS upgrade request and stash it in the connection
+    /// Extensions, alongside `Arc<AuthContext>`. The plexus-core `{ns}.call`
+    /// subscription extracts it and dispatches via `route_with_ctx`, so the
+    /// origin/CSRF machinery (`ValidOrigin`) and client-IP scope gates are
+    /// reachable through the WebSocket gateway. `peer` is `None` — jsonrpsee's
+    /// upgrade middleware does not expose the socket address here; origin/CSRF
+    /// derive from headers, which are present.
+    pub(super) fn attach_raw_ctx<B>(
+        request: &mut HttpRequest<B>,
+        auth: Option<plexus_core::plexus::AuthContext>,
+    ) {
+        let raw = plexus_core::request::RawRequestContext {
+            headers: request.headers().clone(),
+            uri: request.uri().clone(),
+            auth,
+            peer: None,
+        };
+        request.extensions_mut().insert(Arc::new(raw));
+    }
+
     impl<S, B> Service<HttpRequest<B>> for CombinedAuthMiddleware<S>
     where
         S: Service<HttpRequest<B>, Response = HttpResponse> + Clone + Send + 'static,
@@ -312,6 +333,9 @@ pub(crate) mod auth {
                                 user_id = %ctx.user_id,
                                 "WS upgrade: SessionValidator produced AuthContext"
                             );
+                            // PLX-18: stash the RawRequestContext (with the
+                            // resolved identity) before inserting the auth Arc.
+                            attach_raw_ctx(&mut request, Some(ctx.clone()));
                             request.extensions_mut().insert(Arc::new(ctx));
                             service.call(request).await.map_err(Into::into)
                         }
@@ -347,6 +371,9 @@ pub(crate) mod auth {
                                      proceeding without auth"
                                 );
                             }
+                            // PLX-18: thread request context even without a
+                            // resolved identity so origin/CSRF still applies.
+                            attach_raw_ctx(&mut request, None);
                             service.call(request).await.map_err(Into::into)
                         }
                     }
@@ -354,9 +381,14 @@ pub(crate) mod auth {
             }
 
             // No SessionValidator → either api_key gate already passed (or
-            // nothing was configured). Pass through.
+            // nothing was configured). Pass through — PLX-18: still attach the
+            // RawRequestContext so origin/CSRF is reachable.
             let mut service = service;
-            Box::pin(async move { service.call(request).await.map_err(Into::into) })
+            Box::pin(async move {
+                let mut request = request;
+                attach_raw_ctx(&mut request, None);
+                service.call(request).await.map_err(Into::into)
+            })
         }
     }
 }

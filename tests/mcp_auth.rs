@@ -192,7 +192,7 @@ async fn authed_dispatch_threads_identity_to_handler() {
         vec![],
         Value::Null,
     )));
-    let stream = testing::dispatch(&bridge, "secure.whoami", serde_json::json!({}), auth)
+    let stream = testing::dispatch(&bridge, "secure.whoami", serde_json::json!({}), auth, None)
         .await
         .expect("dispatch ok");
     assert_eq!(
@@ -206,7 +206,7 @@ async fn authed_dispatch_threads_identity_to_handler() {
 #[tokio::test]
 async fn anonymous_dispatch_reaches_public_method_as_none() {
     let bridge = ActivationMcpBridge::new(Arc::new(SecureApi));
-    let stream = testing::dispatch(&bridge, "secure.whoami", serde_json::json!({}), None)
+    let stream = testing::dispatch(&bridge, "secure.whoami", serde_json::json!({}), None, None)
         .await
         .expect("dispatch ok");
     assert_eq!(first_string(stream).await.as_deref(), Some("none"));
@@ -216,7 +216,7 @@ async fn anonymous_dispatch_reaches_public_method_as_none() {
 #[tokio::test]
 async fn anonymous_dispatch_to_force_auth_method_is_unauthenticated() {
     let bridge = ActivationMcpBridge::new(Arc::new(SecureApi));
-    match testing::dispatch(&bridge, "secure.admin", serde_json::json!({}), None).await {
+    match testing::dispatch(&bridge, "secure.admin", serde_json::json!({}), None, None).await {
         Err(PlexusError::Unauthenticated(_)) => {}
         Err(other) => panic!("expected Unauthenticated, got {other:?}"),
         Ok(_) => panic!("force-auth method must fail closed on anonymous dispatch"),

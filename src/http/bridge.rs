@@ -164,6 +164,11 @@ async fn rest_method_handler<A>(
     // or the request carried no valid credential — in which case dispatch
     // proceeds with `None` (anonymous) and `#[from_auth]` methods fail-close.
     auth: Option<Extension<Arc<AuthContext>>>,
+    // PLX-18: capture the request's origin/headers so the framework's origin
+    // (`ValidOrigin`) / CSRF machinery and header-derived extractors are
+    // reachable through the REST gateway.
+    headers: axum::http::HeaderMap,
+    axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
     Json(params): Json<Value>,
 ) -> Response
 where
@@ -190,19 +195,29 @@ where
         streaming: rest_method_info.streaming,
     };
 
+    // PLX-18: build the RawRequestContext (origin/headers/peer + resolved
+    // identity) and thread it into dispatch so origin/CSRF enforcement fires.
+    // Peer is `None` here (axum `ConnectInfo` isn't wired into this bridge);
+    // origin/CSRF derive from headers, which are present.
+    let raw_ctx = RawRequestContext {
+        headers,
+        uri,
+        auth: auth.as_deref().cloned(),
+        peer: None,
+    };
+
     // Call the method via activation or route_fn.
     // PLX-16: thread the per-user `AuthContext` (4-arg dispatch) instead of
-    // dropping it via the legacy 2-arg call. `raw_ctx` is `None` here; the
-    // REST gateway's `RawRequestContext` capture (origin/CSRF) lands in PLX-18.
+    // dropping it via the legacy 2-arg call. PLX-18: also thread `raw_ctx`.
     let stream_result = if let Some(route_fn) = &state.route_fn {
         // Hub activation: use route_fn to dispatch
         let full_method = format!("{}.{}", namespace, method);
-        route_fn(full_method, params, auth.clone(), None).await
+        route_fn(full_method, params, auth.clone(), Some(raw_ctx)).await
     } else {
         // Leaf activation: call directly
         state
             .activation
-            .call(&method, params, auth.as_deref(), None)
+            .call(&method, params, auth.as_deref(), Some(&raw_ctx))
             .await
     };
 
