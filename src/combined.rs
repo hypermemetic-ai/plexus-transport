@@ -19,7 +19,7 @@ use jsonrpsee::{
     RpcModule,
     server::{Server, ServerHandle, serve_with_graceful_shutdown, stop_channel},
 };
-use plexus_core::plexus::{Activation, PluginSchema};
+use plexus_core::plexus::{Activation, PluginSchema, SessionValidator};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService,
     session::local::LocalSessionManager,
@@ -86,6 +86,7 @@ pub async fn serve_combined<A>(
     addr: SocketAddr,
     api_key: Option<String>,
     enable_rest: bool,
+    session_validator: Option<Arc<dyn SessionValidator>>,
 ) -> Result<ServerHandle>
 where
     A: Activation + Send + Sync + 'static,
@@ -99,6 +100,10 @@ where
     );
     if let Some(rf) = route_fn.clone() {
         bridge = bridge.with_router(rf);
+    }
+    // PLX-17: thread the per-user identity resolver into the MCP bridge.
+    if let Some(validator) = session_validator {
+        bridge = bridge.with_session_validator(validator);
     }
 
     let session_manager = LocalSessionManager::default();

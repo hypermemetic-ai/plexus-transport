@@ -8,7 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::any, Router,
 };
-use plexus_core::plexus::Activation;
+use plexus_core::plexus::{Activation, SessionValidator};
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
@@ -169,6 +169,7 @@ pub async fn serve_mcp_http<A: Activation>(
     route_fn: Option<RouteFn>,
     config: McpHttpConfig,
     api_key: Option<String>,
+    session_validator: Option<Arc<dyn SessionValidator>>,
 ) -> Result<JoinHandle<std::result::Result<(), std::io::Error>>> {
     tracing::info!("Starting MCP HTTP transport at http://{}/mcp", config.addr);
 
@@ -180,6 +181,11 @@ pub async fn serve_mcp_http<A: Activation>(
     );
     if let Some(router) = route_fn {
         bridge = bridge.with_router(router);
+    }
+    // PLX-17: thread the per-user session validator so `call_tool` resolves an
+    // AuthContext from the request Cookie/Bearer instead of dispatching as None.
+    if let Some(validator) = session_validator {
+        bridge = bridge.with_session_validator(validator);
     }
 
     // Create session manager based on configuration

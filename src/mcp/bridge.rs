@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use plexus_core::plexus::{types::PlexusStreamItem, Activation, AuthContext, PlexusError, PlexusStream, PluginSchema};
+use plexus_core::plexus::{types::PlexusStreamItem, Activation, AuthContext, PlexusError, PlexusStream, PluginSchema, SessionValidator};
 use plexus_core::request::RawRequestContext;
 use rmcp::{
     model::*,
@@ -17,6 +17,12 @@ use rmcp::{
 };
 use serde_json::json;
 use form_urlencoded;
+
+/// Strip the RFC-6750 `Bearer ` prefix (case-sensitive) from an
+/// `Authorization` header value.
+fn strip_bearer(value: &str) -> Option<&str> {
+    value.strip_prefix("Bearer ")
+}
 
 /// A function that routes a namespaced method call (e.g., "loopback.permit") to the
 /// correct activation. Used by hub activations to dispatch child calls via `hub.route()`.
@@ -137,6 +143,11 @@ pub struct ActivationMcpBridge<A: Activation> {
     /// When set, `call_tool` uses this to dispatch namespaced calls (e.g., "loopback.permit")
     /// via `hub.route()` instead of stripping the namespace and calling `activation.call()`.
     router: Option<RouteFn>,
+    /// PLX-17: optional per-user identity resolver. When set, `call_tool`
+    /// derives an `AuthContext` from the request's `Cookie` (preferred) or
+    /// `Authorization: Bearer` header and threads it into dispatch. When
+    /// `None`, or when no credential validates, dispatch stays anonymous.
+    session_validator: Option<Arc<dyn SessionValidator>>,
 }
 
 impl<A: Activation> ActivationMcpBridge<A> {
@@ -147,6 +158,7 @@ impl<A: Activation> ActivationMcpBridge<A> {
             server_name_override: None,
             server_version_override: None,
             router: None,
+            session_validator: None,
         }
     }
 
@@ -159,6 +171,7 @@ impl<A: Activation> ActivationMcpBridge<A> {
             server_name_override: None,
             server_version_override: None,
             router: None,
+            session_validator: None,
         }
     }
 
@@ -174,6 +187,7 @@ impl<A: Activation> ActivationMcpBridge<A> {
             server_name_override: name,
             server_version_override: version,
             router: None,
+            session_validator: None,
         }
     }
 
@@ -190,6 +204,7 @@ impl<A: Activation> ActivationMcpBridge<A> {
             server_name_override: name,
             server_version_override: version,
             router: None,
+            session_validator: None,
         }
     }
 
@@ -201,6 +216,73 @@ impl<A: Activation> ActivationMcpBridge<A> {
         self.router = Some(router);
         self
     }
+
+    /// PLX-17: set the per-user session validator. When present, `call_tool`
+    /// resolves an `AuthContext` from the request's `Cookie`/`Authorization:
+    /// Bearer` header and threads it into dispatch (mirrors the WebSocket
+    /// gateway's session→identity path).
+    pub fn with_session_validator(mut self, validator: Arc<dyn SessionValidator>) -> Self {
+        self.session_validator = Some(validator);
+        self
+    }
+
+    /// PLX-17: resolve a per-user `AuthContext` from the inbound HTTP request
+    /// parts (populated by rmcp into `ctx.extensions`). Cookie wins, then
+    /// `Authorization: Bearer` — the first credential the validator accepts is
+    /// used. Returns `None` when no validator is configured, no credential is
+    /// present, or validation fails (anonymous dispatch).
+    async fn resolve_auth(&self, parts: Option<&http::request::Parts>) -> Option<AuthContext> {
+        let validator = self.session_validator.as_ref()?;
+        let parts = parts?;
+
+        let cookie_value = parts
+            .headers
+            .get(http::header::COOKIE)
+            .and_then(|v| v.to_str().ok());
+        if let Some(cookies) = cookie_value {
+            if let Some(ctx) = validator.validate(cookies).await {
+                return Some(ctx);
+            }
+        }
+
+        let bearer_token = parts
+            .headers
+            .get(http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(strip_bearer);
+        if let Some(bearer) = bearer_token {
+            if let Some(ctx) = validator.validate(bearer).await {
+                return Some(ctx);
+            }
+        }
+
+        None
+    }
+
+    /// PLX-17: dispatch a resolved call, threading `auth` into the 4-arg
+    /// `Activation::call` (or the hub `route_fn`) instead of the previous
+    /// hard-coded `None`. Extracted so it can be exercised directly by the
+    /// gateway auth test without constructing an rmcp `RequestContext`.
+    async fn dispatch(
+        &self,
+        method_name: &str,
+        arguments_value: serde_json::Value,
+        auth: Option<Arc<AuthContext>>,
+    ) -> Result<PlexusStream, PlexusError> {
+        if let Some(ref router) = self.router {
+            // Hub path: pass the full namespaced method and the identity through.
+            router(method_name.to_string(), arguments_value, auth, None).await
+        } else {
+            let method = if method_name.contains('.') {
+                method_name.split('.').nth(1).unwrap_or(method_name)
+            } else {
+                method_name
+            };
+            self.activation
+                .call(method, arguments_value, auth.as_deref(), None)
+                .await
+        }
+    }
 }
 
 impl<A: Activation> Clone for ActivationMcpBridge<A> {
@@ -211,6 +293,7 @@ impl<A: Activation> Clone for ActivationMcpBridge<A> {
             server_name_override: self.server_name_override.clone(),
             server_version_override: self.server_version_override.clone(),
             router: self.router.clone(),
+            session_validator: self.session_validator.clone(),
         }
     }
 }
@@ -309,6 +392,18 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
             tracing::debug!("[MCP BRIDGE] No HTTP Parts in extensions!");
         }
 
+        // PLX-17: resolve the per-user identity from the same HTTP request
+        // parts and thread it into dispatch. Previously the MCP gateway always
+        // dispatched with `None` — even after the static Bearer gate admitted a
+        // caller — so any method reading `auth` saw anonymous.
+        let auth = self
+            .resolve_auth(ctx.extensions.get::<http::request::Parts>())
+            .await
+            .map(Arc::new);
+        if let Some(ref ctx_auth) = auth {
+            tracing::debug!(user_id = %ctx_auth.user_id, "[MCP BRIDGE] resolved AuthContext");
+        }
+
         let arguments_value = serde_json::Value::Object(arguments_map);
 
         // Get progress token if provided
@@ -317,28 +412,13 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
         // Logger name: namespace.method (e.g., bash.execute)
         let logger = method_name.to_string();
 
-        // Call activation and get stream.
-        // If a router is available (hub activations), use it to dispatch the full
-        // namespaced method name (e.g., "loopback.permit") to the correct child.
-        // Otherwise strip the namespace prefix and call activation directly.
-        let stream = if let Some(ref router) = self.router {
-            // PLX-16: 4-arg route fn. Auth/raw_ctx threading for the MCP
-            // gateway lands in PLX-17/18; today the hub path still routes
-            // anonymously (None, None) — unchanged behavior.
-            router(method_name.to_string(), arguments_value, None, None)
-                .await
-                .map_err(plexus_to_mcp_error)?
-        } else {
-            let method = if method_name.contains('.') {
-                method_name.split('.').nth(1).unwrap_or(method_name)
-            } else {
-                method_name
-            };
-            self.activation
-                .call(method, arguments_value, None, None)
-                .await
-                .map_err(plexus_to_mcp_error)?
-        };
+        // Call activation and get stream, threading the resolved per-user
+        // identity (PLX-17). `dispatch` handles both the hub (`route_fn`) and
+        // leaf paths; `raw_ctx` capture is PLX-18.
+        let stream = self
+            .dispatch(method_name, arguments_value, auth)
+            .await
+            .map_err(plexus_to_mcp_error)?;
 
         // Stream events via notifications AND buffer for final result
         let mut had_error = false;
@@ -485,5 +565,35 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                 text_content,
             )]))
         }
+    }
+}
+
+/// Test-only hooks for PLX-17 MCP gateway auth-threading tests.
+///
+/// `#[doc(hidden)]` — not part of the public API. Exposes the private
+/// identity-resolution and dispatch seams so integration tests can assert that
+/// a validated session becomes an `AuthContext` and that it reaches the handler
+/// through `call`, without constructing an rmcp `RequestContext`.
+#[doc(hidden)]
+pub mod testing {
+    use super::*;
+
+    /// Resolve an `AuthContext` from raw HTTP request parts (Cookie then
+    /// Bearer), exactly as `call_tool` does.
+    pub async fn resolve_auth<A: Activation>(
+        bridge: &ActivationMcpBridge<A>,
+        parts: Option<&http::request::Parts>,
+    ) -> Option<AuthContext> {
+        bridge.resolve_auth(parts).await
+    }
+
+    /// Dispatch a call with a resolved identity, exactly as `call_tool` does.
+    pub async fn dispatch<A: Activation>(
+        bridge: &ActivationMcpBridge<A>,
+        method_name: &str,
+        arguments_value: serde_json::Value,
+        auth: Option<Arc<AuthContext>>,
+    ) -> Result<PlexusStream, PlexusError> {
+        bridge.dispatch(method_name, arguments_value, auth).await
     }
 }

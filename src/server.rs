@@ -178,7 +178,7 @@ impl<A: Activation> TransportServer<A> {
         let mcp_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> =
             if let Some(mcp_config) = self.config.mcp_http {
                 let api_key = self.config.api_key.clone();
-                Some(serve_mcp_http(self.activation.clone(), self.mcp_flat_schemas.clone(), self.mcp_route_fn.clone(), mcp_config, api_key).await?)
+                Some(serve_mcp_http(self.activation.clone(), self.mcp_flat_schemas.clone(), self.mcp_route_fn.clone(), mcp_config, api_key, self.session_validator.clone()).await?)
             } else {
                 None
             };
