@@ -188,7 +188,7 @@ impl<A: Activation> TransportServer<A> {
         let rest_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> =
             if let Some(rest_config) = self.config.rest_http {
                 let api_key = self.config.api_key.clone();
-                Some(crate::http::serve_rest_http(self.activation.clone(), self.mcp_flat_schemas.clone(), self.mcp_route_fn.clone(), rest_config, api_key).await?)
+                Some(crate::http::serve_rest_http(self.activation.clone(), self.mcp_flat_schemas.clone(), self.mcp_route_fn.clone(), rest_config, api_key, self.session_validator.clone()).await?)
             } else {
                 None
             };

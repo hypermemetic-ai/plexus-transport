@@ -11,12 +11,13 @@ use std::sync::Arc;
 use axum::{
     Router,
     routing::{get, post, put, delete, patch, MethodRouter},
-    extract::{Path, State},
+    extract::{Path, State, Extension},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use plexus_core::plexus::{Activation, PlexusError, PlexusStream, PluginSchema, schema::HttpMethod};
+use plexus_core::plexus::{Activation, AuthContext, PlexusError, PlexusStream, PluginSchema, schema::HttpMethod};
+use plexus_core::request::RawRequestContext;
 use serde_json::Value;
 
 use crate::http::handler::{handle_method_call, MethodInfo};
@@ -24,9 +25,20 @@ use crate::http::handler::{handle_method_call, MethodInfo};
 /// A function that routes a namespaced method call (e.g., "loopback.permit") to the
 /// correct activation. Used by hub activations to dispatch child calls via `hub.route()`.
 ///
-/// Signature: `fn(method: String, params: Value) -> Future<Output = Result<PlexusStream, PlexusError>>`
+/// PLX-16: this is the **4-arg** dispatch signature — it carries the per-user
+/// `AuthContext` and the `RawRequestContext` through hub routing so that neither
+/// is dropped on the way to the leaf activation. It wraps
+/// `DynamicHub::route_with_ctx(method, params, auth, raw_ctx)`.
+///
+/// Signature: `fn(method, params, auth, raw_ctx) -> Future<Output = Result<PlexusStream, PlexusError>>`.
+/// `auth` / `raw_ctx` are owned (`Arc` / value) so the returned future is `'static`.
 pub type RouteFn = Arc<
-    dyn Fn(String, Value) -> Pin<Box<dyn Future<Output = Result<PlexusStream, PlexusError>> + Send>>
+    dyn Fn(
+            String,
+            Value,
+            Option<Arc<AuthContext>>,
+            Option<RawRequestContext>,
+        ) -> Pin<Box<dyn Future<Output = Result<PlexusStream, PlexusError>> + Send>>
         + Send
         + Sync,
 >;
@@ -85,9 +97,22 @@ impl MethodRegistry {
     }
 }
 
-/// Convert activation schemas to REST routes
+/// Convert activation schemas to REST routes.
 ///
-/// Creates Axum routes for each method with the appropriate HTTP method (GET, POST, PUT, DELETE, PATCH).
+/// Registers a **single parameterized route** `/{namespace}/{method}` that
+/// dispatches every method through [`rest_method_handler`], which resolves the
+/// `{namespace}/{method}` pair against the registry (404 on miss) and reads the
+/// method's streaming flag.
+///
+/// PLX-16: this replaces the previous per-method registration at *literal*
+/// paths (`format!("/{namespace}/{method}", …)`). Those literal segments
+/// captured **zero** path parameters, so the handler's `Path<(String, String)>`
+/// extractor failed with "Expected 2 but got 0" and every REST request 500'd —
+/// the gateway never actually routed a call to an activation, let alone
+/// threaded auth. All HTTP verbs are accepted on the parameterized route; the
+/// method's declared verb is metadata, validated by the registry rather than by
+/// the router (registering the same parameterized path once per verb is both
+/// sufficient and avoids axum's duplicate-path panic).
 fn schemas_to_rest_routes<A>(
     activation: Arc<A>,
     schemas: Vec<PluginSchema>,
@@ -100,28 +125,18 @@ where
     let state = Arc::new(RestBridgeState {
         activation,
         route_fn,
-        registry: registry.clone(),
+        registry,
     });
 
-    let mut router = Router::new();
+    let method_router: MethodRouter<Arc<RestBridgeState<A>>, _> = get(rest_method_handler)
+        .post(rest_method_handler)
+        .put(rest_method_handler)
+        .delete(rest_method_handler)
+        .patch(rest_method_handler);
 
-    // Register each method with its specific HTTP method
-    for method_info in registry.all_methods() {
-        let path = format!("/{}/{}", method_info.namespace, method_info.method);
-
-        // Choose the appropriate routing method based on http_method
-        let method_router: MethodRouter<Arc<RestBridgeState<A>>, _> = match method_info.http_method {
-            HttpMethod::Get => get(rest_method_handler),
-            HttpMethod::Post => post(rest_method_handler),
-            HttpMethod::Put => put(rest_method_handler),
-            HttpMethod::Delete => delete(rest_method_handler),
-            HttpMethod::Patch => patch(rest_method_handler),
-        };
-
-        router = router.route(&path, method_router);
-    }
-
-    router.with_state(state)
+    Router::new()
+        .route("/{namespace}/{method}", method_router)
+        .with_state(state)
 }
 
 // =============================================================================
@@ -143,11 +158,18 @@ struct RestBridgeState<A: Activation> {
 async fn rest_method_handler<A>(
     Path((namespace, method)): Path<(String, String)>,
     State(state): State<Arc<RestBridgeState<A>>>,
+    // PLX-16: the per-user identity resolved by the REST session-auth
+    // middleware (`http::server::rest_session_auth`) and stashed in the
+    // request extensions. Absent when no `SessionValidator` is configured
+    // or the request carried no valid credential — in which case dispatch
+    // proceeds with `None` (anonymous) and `#[from_auth]` methods fail-close.
+    auth: Option<Extension<Arc<AuthContext>>>,
     Json(params): Json<Value>,
 ) -> Response
 where
     A: Activation + 'static,
 {
+    let auth: Option<Arc<AuthContext>> = auth.map(|Extension(a)| a);
     // Look up method info to determine if streaming
     let rest_method_info = match state.registry.get(&namespace, &method) {
         Some(info) => info.clone(),
@@ -168,14 +190,20 @@ where
         streaming: rest_method_info.streaming,
     };
 
-    // Call the method via activation or route_fn
+    // Call the method via activation or route_fn.
+    // PLX-16: thread the per-user `AuthContext` (4-arg dispatch) instead of
+    // dropping it via the legacy 2-arg call. `raw_ctx` is `None` here; the
+    // REST gateway's `RawRequestContext` capture (origin/CSRF) lands in PLX-18.
     let stream_result = if let Some(route_fn) = &state.route_fn {
         // Hub activation: use route_fn to dispatch
         let full_method = format!("{}.{}", namespace, method);
-        route_fn(full_method, params).await
+        route_fn(full_method, params, auth.clone(), None).await
     } else {
         // Leaf activation: call directly
-        state.activation.call(&method, params).await
+        state
+            .activation
+            .call(&method, params, auth.as_deref(), None)
+            .await
     };
 
     // Handle the result
@@ -209,6 +237,16 @@ fn plexus_error_to_response(e: PlexusError) -> Response {
         }
         PlexusError::TransportError(kind) => {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Transport error: {:?}", kind))
+        }
+        // PLX-16: auth errors reach the REST mapper now that the gateway
+        // threads AuthContext. Unauthenticated → 401, Forbidden (R-5 scope
+        // gate) → 403. The Forbidden Display names only the unmet scope
+        // (no-enumeration posture, AUTHZ-CORE-1/5).
+        PlexusError::Unauthenticated(reason) => {
+            (StatusCode::UNAUTHORIZED, format!("Authentication required: {}", reason))
+        }
+        forbidden @ PlexusError::Forbidden { .. } => {
+            (StatusCode::FORBIDDEN, forbidden.to_string())
         }
     };
 

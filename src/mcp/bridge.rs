@@ -8,7 +8,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use plexus_core::plexus::{types::PlexusStreamItem, Activation, PlexusError, PlexusStream, PluginSchema};
+use plexus_core::plexus::{types::PlexusStreamItem, Activation, AuthContext, PlexusError, PlexusStream, PluginSchema};
+use plexus_core::request::RawRequestContext;
 use rmcp::{
     model::*,
     service::{RequestContext, RoleServer},
@@ -20,9 +21,20 @@ use form_urlencoded;
 /// A function that routes a namespaced method call (e.g., "loopback.permit") to the
 /// correct activation. Used by hub activations to dispatch child calls via `hub.route()`.
 ///
-/// Signature: `fn(method: String, params: Value) -> Future<Output = Result<PlexusStream, PlexusError>>`
+/// PLX-16/17: the **4-arg** dispatch signature — carries the per-user
+/// `AuthContext` and `RawRequestContext` through hub routing (wraps
+/// `DynamicHub::route_with_ctx`). Structurally identical to
+/// `http::bridge::RouteFn` so `TransportServer` can share one route fn across
+/// the MCP and REST gateways. `auth` / `raw_ctx` are owned so the future is `'static`.
+///
+/// Signature: `fn(method, params, auth, raw_ctx) -> Future<Output = Result<PlexusStream, PlexusError>>`
 pub type RouteFn = Arc<
-    dyn Fn(String, serde_json::Value) -> Pin<Box<dyn Future<Output = Result<PlexusStream, PlexusError>> + Send>>
+    dyn Fn(
+            String,
+            serde_json::Value,
+            Option<Arc<AuthContext>>,
+            Option<RawRequestContext>,
+        ) -> Pin<Box<dyn Future<Output = Result<PlexusStream, PlexusError>> + Send>>
         + Send
         + Sync,
 >;
@@ -310,7 +322,10 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
         // namespaced method name (e.g., "loopback.permit") to the correct child.
         // Otherwise strip the namespace prefix and call activation directly.
         let stream = if let Some(ref router) = self.router {
-            router(method_name.to_string(), arguments_value)
+            // PLX-16: 4-arg route fn. Auth/raw_ctx threading for the MCP
+            // gateway lands in PLX-17/18; today the hub path still routes
+            // anonymously (None, None) — unchanged behavior.
+            router(method_name.to_string(), arguments_value, None, None)
                 .await
                 .map_err(plexus_to_mcp_error)?
         } else {

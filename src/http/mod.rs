@@ -25,6 +25,7 @@
 //!     None,  // route_fn for hub routing
 //!     config,
 //!     None,  // api_key for auth
+//!     None,  // session_validator (per-user AuthContext)
 //! ).await?;
 //!
 //! handle.await??;
