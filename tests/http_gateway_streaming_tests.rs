@@ -291,4 +291,131 @@ mod http_streaming_tests {
             "Should reject when total bytes exceeds limit"
         );
     }
+
+    // =========================================================================
+    // PLX-107 - SSE vs JSON is decided by the DECLARED flag, not the return type
+    // =========================================================================
+    //
+    // PLX-91 recorded that `MethodSchema.streaming` (declared by
+    // `#[method(streaming)]`) and `MethodIr::is_streaming` (derived from the
+    // return type) disagree, and PLX-107 was dispatched to make the derived
+    // value win here, at the routing boundary. Investigating it falsified the
+    // premise, and these tests are the record of the contract that was kept.
+    //
+    // In this DX the transport envelope is *always* a stream: a one-shot method
+    // and a many-shot method are both spelled `impl Stream<Item = T>`, the first
+    // yielding one `Data` then `Done`. plexus-core says so itself on the field
+    // (`schema.rs`): "All methods use the same streaming protocol under the
+    // hood, but this flag tells clients how to present the result." So the
+    // return type cannot distinguish the two, `is_streaming` is true for very
+    // nearly every method ever written, and deriving this flag from it would
+    // have flipped ~154 live methods — all 10 of plexus-idp's (`register`,
+    // `login`, `refresh`, `me`, …, none of which declare `streaming`), all 8 of
+    // plexus-registry's, and ~136 of plexus-substrate's 142 — from a JSON body
+    // to `text/event-stream`. That is a wire-format break of every REST client
+    // of every Plexus backend, not a bug fix.
+    //
+    // The declared flag is the only place the one-shot/many-shot distinction is
+    // expressible, so it is load-bearing. These tests fail if someone applies
+    // the `m.streaming || m.stream_item_type.is_some()` one-liner, at the macro
+    // or at the bridge.
+
+    use plexus_core::plexus::PluginSchema;
+    use plexus_transport::http::bridge::MethodRegistry;
+
+    /// Two methods that are *identical in return type* — both stream
+    /// `IdentityEvent`-shaped items — and differ only in the declared flag.
+    fn plx107_schema() -> PluginSchema {
+        serde_json::from_value(json!({
+            "namespace": "idplike",
+            "version": "1.0.0",
+            "description": "two methods, same return type, different declared flag",
+            "self_hash": "h",
+            "hash": "h",
+            "methods": [
+                // The shape plexus-idp's `login` has today: returns
+                // `impl Stream<Item = IdentityEvent>`, does NOT declare
+                // `streaming`, and is served as a single JSON body.
+                { "name": "login", "description": "one-shot", "hash": "h", "streaming": false },
+                // The shape plexus-substrate's flagged methods have: same
+                // return type, but the author declared the intent to stream.
+                { "name": "chat",  "description": "many-shot", "hash": "h", "streaming": true  }
+            ]
+        }))
+        .expect("PluginSchema fixture must deserialize")
+    }
+
+    /// The bridge copies the DECLARED flag through verbatim. It does not, and
+    /// must not, derive it from anything.
+    #[test]
+    fn plx107_registry_carries_the_declared_flag_verbatim() {
+        let registry = MethodRegistry::from_schemas(vec![plx107_schema()]);
+
+        let login = registry
+            .get("idplike", "login")
+            .expect("login must be registered");
+        assert!(
+            !login.streaming,
+            "a stream-returning method that does NOT declare `streaming` must stay \
+             non-streaming at the routing boundary; deriving it from the return type \
+             would flip every plexus-idp method to SSE"
+        );
+
+        let chat = registry
+            .get("idplike", "chat")
+            .expect("chat must be registered");
+        assert!(
+            chat.streaming,
+            "a method that declares `streaming` must reach the router as streaming"
+        );
+    }
+
+    /// And the flag the bridge carried is what picks the wire format. This is
+    /// the observation the whole chain exists to make: same stream in, two
+    /// different content types out, decided only by the declared flag.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn plx107_declared_flag_picks_json_or_sse_for_the_same_stream() {
+        let registry = MethodRegistry::from_schemas(vec![plx107_schema()]);
+
+        let info_for = |method: &str| {
+            let rest = registry.get("idplike", method).unwrap();
+            MethodInfo {
+                namespace: rest.namespace.clone(),
+                method: rest.method.clone(),
+                streaming: rest.streaming,
+            }
+        };
+
+        // Undeclared → JSON body, collected.
+        let response = handle_method_call(create_normal_stream(), info_for("login")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            content_type.starts_with("application/json"),
+            "an undeclared stream-returning method must still be served as JSON, \
+             got content-type {content_type:?}"
+        );
+        let body_bytes = body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body_bytes)
+            .expect("the JSON route must produce a parseable JSON body");
+        assert!(parsed.get("data").is_some(), "JSON route returns a `data` envelope");
+
+        // Declared → SSE.
+        let response = handle_method_call(create_normal_stream(), info_for("chat")).await;
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            content_type.starts_with("text/event-stream"),
+            "a declared-streaming method must be served as SSE, got content-type {content_type:?}"
+        );
+    }
 }
