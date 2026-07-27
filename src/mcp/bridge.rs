@@ -559,32 +559,67 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
             };
             Ok(CallToolResult::error(vec![Content::text(error_content)]))
         } else {
-            // Convert buffered data to content
-            let text_content = if buffered_data.is_empty() {
-                "(no output)".to_string()
-            } else if buffered_data.len() == 1 {
-                // Single value - return as text if string, otherwise JSON
-                match &buffered_data[0] {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => serde_json::to_string_pretty(other).unwrap_or_default(),
-                }
-            } else {
-                // Multiple values - join strings or return as JSON array
-                let all_strings = buffered_data.iter().all(|v| v.is_string());
-                if all_strings {
-                    buffered_data
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .collect::<Vec<_>>()
-                        .join("")
-                } else {
-                    serde_json::to_string_pretty(&buffered_data).unwrap_or_default()
-                }
-            };
-
             Ok(CallToolResult::success(vec![Content::text(
-                text_content,
+                render_tool_text(&buffered_data),
             )]))
+        }
+    }
+}
+
+/// The MCP tool-response text rule: buffered `Data` payloads → `content[0].text`.
+///
+/// # PLX-105 — extracted so it can be asserted, not re-described
+///
+/// Before this extraction the rule lived inline in [`ServerHandler::call_tool`],
+/// which no test can reach: constructing an rmcp `RequestContext<RoleServer>` is
+/// infeasible from an integration test, and `tests/mcp_auth.rs` says so in its
+/// own header. The consequence, measured by PLX-116 and confirmed here, was that
+/// **no test anywhere asserted `content[0].text`** — while the spawned Claude
+/// CLI's `--permission-prompt-tool` contract depends on it byte for byte.
+///
+/// The rule is **count- and type-dependent**, and this is the whole of it:
+///
+/// | buffered `Data` payloads | `content[0].text` |
+/// |---|---|
+/// | none | the literal `(no output)` |
+/// | one, a JSON string | that string's *contents*, unquoted |
+/// | one, anything else | that value, pretty-printed |
+/// | many, all JSON strings | their contents concatenated, no separator |
+/// | many, mixed | the whole buffer as a pretty-printed JSON **array** |
+///
+/// Two consequences worth stating where they bind:
+///
+/// 1. **`content_type` is not read.** `plexus-core`'s turn projection
+///    distinguishes an update (`<dotted_id>.update`) from a terminal
+///    (`<dotted_id>.terminal`) *only* by that field, and both arrive as the same
+///    `Data` variant. So an update and a terminal are indistinguishable here and
+///    are simply two entries in the buffer.
+/// 2. **Changing how many items a method emits changes the top-level JSON type
+///    of the text.** That is the CLI's protocol, not this gateway's, which is why
+///    the rule is now pinned by tests rather than left to inference.
+///
+/// Behaviour is byte-identical to the inline version this replaced.
+#[must_use]
+pub fn render_tool_text(buffered_data: &[serde_json::Value]) -> String {
+    if buffered_data.is_empty() {
+        "(no output)".to_string()
+    } else if buffered_data.len() == 1 {
+        // Single value - return as text if string, otherwise JSON
+        match &buffered_data[0] {
+            serde_json::Value::String(s) => s.clone(),
+            other => serde_json::to_string_pretty(other).unwrap_or_default(),
+        }
+    } else {
+        // Multiple values - join strings or return as JSON array
+        let all_strings = buffered_data.iter().all(serde_json::Value::is_string);
+        if all_strings {
+            buffered_data
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect::<Vec<_>>()
+                .join("")
+        } else {
+            serde_json::to_string_pretty(&buffered_data).unwrap_or_default()
         }
     }
 }
@@ -634,5 +669,55 @@ pub mod testing {
         let auth = bridge.resolve_auth(parts).await.map(Arc::new);
         let raw_ctx = ActivationMcpBridge::<A>::build_raw_ctx(parts, auth.as_deref());
         bridge.dispatch(method_name, arguments_value, auth, raw_ctx).await
+    }
+
+    /// PLX-105: the exact `content[0].text` a tool caller reads back from a
+    /// [`PlexusStream`], with **no rmcp `RequestContext` required**.
+    ///
+    /// This is the missing half of [`call_from_parts`], whose doc comment says
+    /// it runs the gateway path *"minus the rmcp streaming envelope"* — the
+    /// envelope being precisely the untested rule. It reproduces `call_tool`'s
+    /// buffering loop over the stream (which items are buffered, which are
+    /// ignored, where the stream stops) and then calls the **same**
+    /// [`super::render_tool_text`] the gateway calls, so a drift in either half
+    /// is a test failure rather than a silent protocol change.
+    ///
+    /// Returns `Err(joined error messages)` for the `had_error` branch, matching
+    /// `CallToolResult::error`.
+    pub async fn tool_text(stream: PlexusStream) -> Result<String, String> {
+        let mut had_error = false;
+        let mut buffered_data: Vec<serde_json::Value> = Vec::new();
+        let mut error_messages: Vec<String> = Vec::new();
+
+        tokio::pin!(stream);
+        while let Some(item) = stream.next().await {
+            match &item {
+                // The gateway buffers `content` and never looks at `content_type`.
+                PlexusStreamItem::Data { content, .. } => buffered_data.push(content.clone()),
+                PlexusStreamItem::Error {
+                    message,
+                    recoverable,
+                    ..
+                } => {
+                    error_messages.push(message.clone());
+                    if !recoverable {
+                        had_error = true;
+                    }
+                }
+                PlexusStreamItem::Done { .. } => break,
+                // Progress and Request are notifications only; neither reaches
+                // the tool result.
+                PlexusStreamItem::Progress { .. } | PlexusStreamItem::Request { .. } => {}
+            }
+        }
+
+        if had_error {
+            return Err(if error_messages.is_empty() {
+                "Stream completed with errors".to_string()
+            } else {
+                error_messages.join("\n")
+            });
+        }
+        Ok(super::render_tool_text(&buffered_data))
     }
 }
