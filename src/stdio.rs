@@ -2,6 +2,28 @@
 //!
 //! This transport is MCP-compatible and is the standard way to integrate
 //! with Claude Desktop and other MCP clients.
+//!
+//! # This is NOT the ACP transport (PLX-139)
+//!
+//! ACP is also "line-delimited JSON-RPC over stdin/stdout", so this module is
+//! the obvious thing to reach for and it is the wrong one. Three reasons, each
+//! of which an editor would find within a minute:
+//!
+//! 1. **It is strictly sequential.** The loop below reads one line, runs it to
+//!    completion, and only then reads the next. ACP's `session/prompt` runs for
+//!    as long as a model takes, and `session/cancel` — the only way to stop it
+//!    — would queue behind the very turn it is cancelling.
+//! 2. **It has no server-to-client request direction.** ACP agents *ask*:
+//!    `session/request_permission`, `fs/read_text_file`. `RpcModule` answers
+//!    requests and forwards subscription notifications; it does not originate
+//!    correlated requests.
+//! 3. **stdout is unprotected.** Nothing here stops a `println!` anywhere in
+//!    the process from landing between two frames.
+//!
+//! The ACP transport is `plexus_acp::v1::transport` behind that crate's
+//! `stdio` feature: upstream's own NDJSON connection, every handler spawned so
+//! both directions multiplex, and fd 1 taken away from the process before the
+//! first frame. This module is left exactly as it was, for MCP.
 
 use anyhow::Result;
 use jsonrpsee::RpcModule;
