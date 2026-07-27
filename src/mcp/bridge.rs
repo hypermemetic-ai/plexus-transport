@@ -478,8 +478,13 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                     content_type,
                     ..
                 } => {
-                    // Buffer data for final result
-                    buffered_data.push(content.clone());
+                    // PLX-145: buffer what this item CONTRIBUTES, which is not
+                    // always its `content` — a turn terminal's envelope is
+                    // stripped. See `tool_payload` for the decision and its
+                    // effect on every MCP tool.
+                    if let Some(payload) = tool_payload(content_type, content) {
+                        buffered_data.push(payload);
+                    }
 
                     // Also stream via notifications for real-time consumers
                     let _ = ctx
@@ -566,7 +571,126 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
     }
 }
 
+/// What a single `Data` item contributes to the tool-response buffer — the one
+/// place in the gateway that reads `content_type`.
+///
+/// # PLX-145 — the gateway-wide decision, stated where it binds
+///
+/// PLX-105 measured that `content[0].text` for `loopback.permit` had become
+///
+/// ```text
+/// ["{\"behavior\":\"allow\",…}", {"stop":{"kind":"complete"},"value":null}]
+/// ```
+///
+/// where the spawned Claude CLI's `--permission-prompt-tool` contract requires
+/// the object alone. Nothing edited the loopback: M2's turn switchover made
+/// every non-bidirectional `#[method]` turn-native, and
+/// `plexus_core::runtime::bridge::turn_stream_to_plexus_stream` projects a turn
+/// as its updates (`Data { content_type: "<dotted_id>.update" }`) **plus the
+/// terminal as a second `Data`** (`"<dotted_id>.terminal"`, payload
+/// `{"stop":…,"value":…}`). The gateway buffered both because it never read
+/// `content_type`, and two mixed-type items render as a JSON array.
+///
+/// ## The decision
+///
+/// The gateway now reads `content_type`, and it does so to **strip the turn
+/// envelope** — not to select "only the terminal" and not to select "only the
+/// updates". Both of those were on the table and both are wrong:
+///
+/// - *only the terminal's `value`* discards every streaming method's output,
+///   which for a streaming tool **is** the answer;
+/// - *only the updates* renders every unary method as `(no output)`, because a
+///   unary method's whole result is its terminal value.
+///
+/// Envelope-stripping is the only rule that removes exactly the bytes the turn
+/// projection added and nothing else. A `Data` item contributes:
+///
+/// | item | contributes |
+/// |---|---|
+/// | a turn terminal, `stop.kind == "complete"`, `value` non-null | the `value` |
+/// | a turn terminal, `stop.kind == "complete"`, `value` null | **nothing** |
+/// | a turn terminal, any other `stop.kind` | the whole `{"stop":…,"value":…}` envelope |
+/// | anything else (`.update`, legacy, hand-written) | its `content`, unchanged |
+///
+/// The third row is why a `Failed`'s structured error and a `Refused`'s
+/// `StopDetail` are still legible to a tool caller: a non-`complete` terminal is
+/// the only record that the turn did not do what was asked, so it is never
+/// dropped.
+///
+/// ## What this changes for every MCP tool
+///
+/// 1. **Unary methods** (`Result<T, E>`): text was
+///    `{"stop":{"kind":"complete"},"value":X}`, is now `X`. The caller gets the
+///    value the method declared.
+/// 2. **Unary unit** (`Result<(), E>`): text was
+///    `{"stop":{"kind":"complete"},"value":null}`, is now `(no output)`.
+/// 3. **Streaming methods**: text was a JSON array of `[updates…, terminal]`, is
+///    now the updates alone — so an all-string stream concatenates (see
+///    `render_tool_text`'s `join("")` branch) and a non-string stream is an array
+///    of just the updates. A single-update stream — `loopback.permit` — is
+///    unwrapped to its contents, **which is the CLI contract this restores**.
+/// 4. **Failing / refused / limited / cancelled turns**: unchanged. The envelope
+///    survives verbatim.
+/// 5. **Bidirectional methods** (`BidirType != None`): unchanged. They stay on
+///    the legacy dispatch path, whose `content_type` is `<ns>.<method>` with no
+///    `.terminal` suffix and whose payload is not an envelope, so neither of the
+///    two guards below fires.
+/// 6. **Hand-written activations** that emit raw `Data` + `Done`: unchanged, for
+///    the same reason.
+/// 7. **`Error` items and the `had_error` branch**: untouched.
+///
+/// ## Why the guard is both nominal and structural
+///
+/// A legacy `content_type` is `<namespace>.<method>`, so a method actually
+/// *named* `terminal` would collide with a suffix-only test. The payload must
+/// therefore also *look* like the projection's envelope: a JSON object with
+/// exactly the keys `stop` and `value`, whose `stop` is an object carrying a
+/// string `kind`. A tool that happens to be called `terminal` and returns
+/// anything else is untouched.
+#[must_use]
+pub fn tool_payload(content_type: &str, content: &serde_json::Value) -> Option<serde_json::Value> {
+    let Some(stop_kind) = turn_terminal_stop_kind(content_type, content) else {
+        return Some(content.clone());
+    };
+
+    if stop_kind != "complete" {
+        // A refusal, a failure, a limit, a cancellation: the envelope IS the
+        // result. Keep every byte of it.
+        return Some(content.clone());
+    }
+
+    match content.get("value") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(value.clone()),
+    }
+}
+
+/// `Some(stop.kind)` iff this `Data` item is the turn projection's terminal.
+///
+/// See [`tool_payload`] for why the test is both nominal (`.terminal` suffix)
+/// and structural (an exact `{stop, value}` object with a string `stop.kind`).
+fn turn_terminal_stop_kind<'a>(
+    content_type: &str,
+    content: &'a serde_json::Value,
+) -> Option<&'a str> {
+    if !content_type.ends_with(".terminal") {
+        return None;
+    }
+    let obj = content.as_object()?;
+    if obj.len() != 2 || !obj.contains_key("value") {
+        return None;
+    }
+    obj.get("stop")?.as_object()?.get("kind")?.as_str()
+}
+
 /// The MCP tool-response text rule: buffered `Data` payloads → `content[0].text`.
+///
+/// **PLX-145 note.** This function is *unchanged* — all five branches below are
+/// exactly what PLX-105 pinned, including the `join("")` correction. What
+/// changed is what reaches the buffer: [`tool_payload`] now strips the turn
+/// envelope on the way in. The two are deliberately separate so that the
+/// count-and-type rule the CLI depends on stays pinned by its own tests while
+/// the envelope decision is pinned by its own.
 ///
 /// # PLX-105 — extracted so it can be asserted, not re-described
 ///
@@ -589,16 +713,18 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
 ///
 /// Two consequences worth stating where they bind:
 ///
-/// 1. **`content_type` is not read.** `plexus-core`'s turn projection
-///    distinguishes an update (`<dotted_id>.update`) from a terminal
-///    (`<dotted_id>.terminal`) *only* by that field, and both arrive as the same
-///    `Data` variant. So an update and a terminal are indistinguishable here and
-///    are simply two entries in the buffer.
+/// 1. **`content_type` is not read *here*.** PLX-105 recorded that the gateway
+///    never read it at all; PLX-145 changed that, but in [`tool_payload`] — the
+///    item-level rule that decides what enters `buffered_data` — not in this
+///    function, which still sees only an anonymous list of payloads. A turn
+///    terminal no longer reaches this list unless it is non-`complete` or carries
+///    a non-null value.
 /// 2. **Changing how many items a method emits changes the top-level JSON type
 ///    of the text.** That is the CLI's protocol, not this gateway's, which is why
 ///    the rule is now pinned by tests rather than left to inference.
 ///
-/// Behaviour is byte-identical to the inline version this replaced.
+/// Behaviour is byte-identical to the inline version this replaced, and PLX-145
+/// did not touch it.
 #[must_use]
 pub fn render_tool_text(buffered_data: &[serde_json::Value]) -> String {
     if buffered_data.is_empty() {
@@ -685,6 +811,26 @@ pub mod testing {
     /// Returns `Err(joined error messages)` for the `had_error` branch, matching
     /// `CallToolResult::error`.
     pub async fn tool_text(stream: PlexusStream) -> Result<String, String> {
+        tool_text_and_terminal(stream).await.0
+    }
+
+    /// PLX-145: [`tool_text`], plus the raw turn-terminal envelope the gateway
+    /// stripped on the way in.
+    ///
+    /// Once the gateway strips a `complete` terminal, a test can no longer read
+    /// the terminal's `stop.kind` out of the rendered text — but PLX-105's
+    /// finding that *a denial is a successful turn and not a refusal* is a fact
+    /// about the stream, not about the text, and must not stop being asserted
+    /// just because the text improved. This hook keeps it assertable at the
+    /// layer where it is actually true.
+    ///
+    /// The second element is the last `Data` item whose `content_type` ends in
+    /// `.terminal`, verbatim, or `None` if the stream produced no terminal (a
+    /// hand-written activation, or a bidirectional method).
+    pub async fn tool_text_and_terminal(
+        stream: PlexusStream,
+    ) -> (Result<String, String>, Option<serde_json::Value>) {
+        let mut terminal: Option<serde_json::Value> = None;
         let mut had_error = false;
         let mut buffered_data: Vec<serde_json::Value> = Vec::new();
         let mut error_messages: Vec<String> = Vec::new();
@@ -692,8 +838,20 @@ pub mod testing {
         tokio::pin!(stream);
         while let Some(item) = stream.next().await {
             match &item {
-                // The gateway buffers `content` and never looks at `content_type`.
-                PlexusStreamItem::Data { content, .. } => buffered_data.push(content.clone()),
+                // PLX-145: the gateway reads `content_type` to strip the turn
+                // envelope, through the same `tool_payload` `call_tool` uses.
+                PlexusStreamItem::Data {
+                    content,
+                    content_type,
+                    ..
+                } => {
+                    if content_type.ends_with(".terminal") {
+                        terminal = Some(content.clone());
+                    }
+                    if let Some(payload) = super::tool_payload(content_type, content) {
+                        buffered_data.push(payload);
+                    }
+                }
                 PlexusStreamItem::Error {
                     message,
                     recoverable,
@@ -712,12 +870,13 @@ pub mod testing {
         }
 
         if had_error {
-            return Err(if error_messages.is_empty() {
+            let err = Err(if error_messages.is_empty() {
                 "Stream completed with errors".to_string()
             } else {
                 error_messages.join("\n")
             });
+            return (err, terminal);
         }
-        Ok(super::render_tool_text(&buffered_data))
+        (Ok(super::render_tool_text(&buffered_data)), terminal)
     }
 }
