@@ -46,10 +46,7 @@ pub mod server;
 pub mod stdio;
 pub mod websocket;
 
-#[cfg(feature = "sqlite-sessions")]
-pub mod mcp;
-
-#[cfg(not(feature = "sqlite-sessions"))]
+#[cfg(feature = "mcp")]
 pub mod mcp;
 
 #[cfg(feature = "http-gateway")]
@@ -74,10 +71,11 @@ pub use request::{ValidOrigin, init_allowed_origins};
 #[cfg(feature = "sqlite-sessions")]
 pub use mcp::{bridge::ActivationMcpBridge, session::SqliteSessionManager};
 
-#[cfg(not(feature = "sqlite-sessions"))]
+#[cfg(all(feature = "mcp", not(feature = "sqlite-sessions")))]
 pub use mcp::bridge::ActivationMcpBridge;
 
-pub use mcp::bridge::RouteFn;
+// RouteFn feeds both the MCP and REST bridges; always available.
+pub use server::RouteFn;
 
 // Re-export REST HTTP bridge for advanced usage
 #[cfg(feature = "http-gateway")]

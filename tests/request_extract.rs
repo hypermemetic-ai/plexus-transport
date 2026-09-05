@@ -9,7 +9,7 @@
 
 use plexus_transport::request::{PlexusRequest, RawRequestContext};
 use plexus_core::plexus::AuthContext;
-use plexus_macros::PlexusRequest;
+use schemars::PlexusRequest;
 use std::net::SocketAddr;
 
 /// Helper: build a RawRequestContext from header pairs and optional peer addr.

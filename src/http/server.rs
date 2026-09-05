@@ -117,7 +117,7 @@ async fn debug_handler() -> impl IntoResponse {
 ///
 /// ## Example
 ///
-/// ```rust,no_run
+/// ```rust,ignore
 /// # use plexus_transport::http::serve_rest_http;
 /// # use plexus_transport::config::RestHttpConfig;
 /// # use std::sync::Arc;

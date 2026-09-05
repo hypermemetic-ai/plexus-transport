@@ -1,6 +1,6 @@
 [package]
 name = "plexus-transport"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
@@ -9,31 +9,35 @@ repository = "https://github.com/hypermemetic/plexus-transport"
 [dependencies]
 # Core dependencies
 plexus-core = { path = "../plexus-core", version = "0.6" }
-tokio = { version = "1.42", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 futures = "0.3"
 async-stream = "0.3"
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 tracing = "0.1"
 
 # JSON-RPC and WebSocket
 # ws-client: Z2H-6 boot-time registry self-registration (src/registry.rs)
 jsonrpsee = { version = "0.26", features = ["server", "ws-client"] }
-hyper = { version = "1", features = ["full"], optional = true }
+hyper = { version = "1.11", features = ["full"], optional = true }
 bytes = "1"
 http-body = "1"
 
-# MCP protocol
-rmcp = { version = "0.12", features = ["server", "transport-streamable-http-server"] }
+# MCP protocol (feature "mcp", default-OFF as of 0.5.0).
+# Held at 0.12 deliberately: plexus-core 0.6 depends on rmcp 0.12
+# unconditionally, so bumping here (latest is 3.x) would compile two rmcp
+# stacks into every mcp build.
+rmcp = { version = "0.12", features = ["server", "transport-streamable-http-server"], optional = true }
 
 # HTTP server
-axum = "0.8"
-tower = { version = "0.5", features = ["util"] }
-http = "1.0"  # For extracting HTTP request parts from RequestContext
+axum = "0.8.9"
+tower = { version = "0.5.3", features = ["util"] }
+http = "1.5"  # For extracting HTTP request parts from RequestContext
 form_urlencoded = "1.2"  # For parsing query parameters
 
 # Optional SQLite session storage (feature-gated)
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite"], optional = true }
+# sqlx 0.9 split the old "runtime-tokio-rustls" feature; sqlite needs no TLS.
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"], optional = true }
 tokio-stream = { version = "0.1", optional = true }
 
 # Utilities
@@ -43,19 +47,25 @@ serde_json = "1.0"
 [dev-dependencies]
 async-stream = "0.3"
 async-trait = "0.1"
-uuid = { version = "1.0", features = ["v4"] }
+uuid = { version = "1.6", features = ["v4"] }
 tower = "0.5"
 # AUTHZ-BEARER-1 integration tests: empty HTTP body + BodyExt::collect.
 http-body-util = "0.1"
-# plexus-schemars-compat aliased as "schemars" so that #[derive(schemars::JsonSchema)]
-# in tests resolves to the no-op derive, preventing duplicate impl JsonSchema conflicts
-# with PlexusRequest's generated impl. All real schemars types/macros are re-exported.
-schemars = { path = "../plexus-schemars-compat", package = "plexus-schemars-compat" }
-plexus-macros = { path = "../plexus-macros" }
+# plexus-macros aliased as "schemars" (schemars-compat feature) so that
+# #[derive(schemars::JsonSchema)] in tests resolves to the no-op derive,
+# preventing duplicate impl JsonSchema conflicts with PlexusRequest's
+# generated impl. (Replaces the retired plexus-schemars-compat crate; real
+# schemars types are reachable via plexus_core::__schemars. Cargo forbids
+# depending on the same crate under two names, so tests import PlexusRequest
+# through the alias too: `use schemars::PlexusRequest;`.)
+schemars = { path = "../plexus-macros", package = "plexus-macros", features = ["schemars-compat"] }
 plexus-core = { path = "../plexus-core", version = "0.6" }
 
 [features]
 default = []
-mcp-gateway = ["hyper"]
+# MCP transport (rmcp-based). Default-OFF as of 0.5.0: REST/WebSocket-only
+# consumers no longer pull in the rmcp stack. Enable with `--features mcp`.
+mcp = ["dep:rmcp"]
+mcp-gateway = ["mcp", "hyper"]
 http-gateway = ["hyper"]
-sqlite-sessions = ["sqlx", "tokio-stream"]
+sqlite-sessions = ["mcp", "sqlx", "tokio-stream"]

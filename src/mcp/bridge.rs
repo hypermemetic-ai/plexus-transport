@@ -3,12 +3,10 @@
 //! This module implements the MCP protocol using the rmcp crate,
 //! bridging MCP tool calls to activation methods.
 
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use plexus_core::plexus::{types::PlexusStreamItem, Activation, PlexusError, PlexusStream, PluginSchema};
+use plexus_core::plexus::{types::PlexusStreamItem, Activation, PlexusError, PluginSchema};
 use rmcp::{
     model::*,
     service::{RequestContext, RoleServer},
@@ -20,12 +18,9 @@ use form_urlencoded;
 /// A function that routes a namespaced method call (e.g., "loopback.permit") to the
 /// correct activation. Used by hub activations to dispatch child calls via `hub.route()`.
 ///
-/// Signature: `fn(method: String, params: Value) -> Future<Output = Result<PlexusStream, PlexusError>>`
-pub type RouteFn = Arc<
-    dyn Fn(String, serde_json::Value) -> Pin<Box<dyn Future<Output = Result<PlexusStream, PlexusError>> + Send>>
-        + Send
-        + Sync,
->;
+/// Canonical definition lives in [`crate::server`] so it is available with or
+/// without the `mcp` feature.
+pub use crate::server::RouteFn;
 
 // =============================================================================
 // Schema Transformation

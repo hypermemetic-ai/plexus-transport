@@ -3,7 +3,7 @@
 //! Run with: cargo test --test request_schema
 
 use plexus_transport::request::PlexusRequest;
-use plexus_macros::PlexusRequest;
+use schemars::PlexusRequest;
 use std::net::SocketAddr;
 
 #[derive(PlexusRequest, schemars::JsonSchema)]
@@ -21,7 +21,9 @@ struct TestRequest {
 }
 
 fn schema_value() -> serde_json::Value {
-    let schema = schemars::schema_for!(TestRequest);
+    // `schemars` is aliased to plexus-macros' no-op JsonSchema derive in
+    // dev-dependencies; the real schemars macros live at plexus_core::__schemars.
+    let schema = plexus_core::__schemars::schema_for!(TestRequest);
     serde_json::to_value(&schema).unwrap()
 }
 

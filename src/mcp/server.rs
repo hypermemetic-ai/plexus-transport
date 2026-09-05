@@ -182,48 +182,53 @@ pub async fn serve_mcp_http<A: Activation>(
         bridge = bridge.with_router(router);
     }
 
-    // Create session manager based on configuration
+    // Create session manager based on configuration, then serve. The two
+    // session-manager types produce distinct `StreamableHttpService<_, M>`
+    // types, so each arm calls the generic tail directly rather than trying
+    // to unify the service values in one binding.
     #[cfg(feature = "sqlite-sessions")]
-    let mcp_service = match config.session_storage {
+    match config.session_storage {
         crate::config::SessionStorage::InMemory => {
-            let session_manager = LocalSessionManager::new();
-            let server_config = StreamableHttpServerConfig::default();
-            let bridge_clone = bridge.clone();
-            StreamableHttpService::new(
-                move || Ok(bridge_clone.clone()),
-                session_manager.into(),
-                server_config,
-            )
+            serve_with_session_manager(bridge, LocalSessionManager::default(), config, api_key)
+                .await
         }
-        crate::config::SessionStorage::Sqlite { path } => {
+        crate::config::SessionStorage::Sqlite { ref path } => {
             let sqlite_config = SqliteSessionConfig {
-                db_path: path,
+                db_path: path.clone(),
                 ..Default::default()
             };
             let session_manager = SqliteSessionManager::new(sqlite_config)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to initialize SQLite session manager: {}", e))?;
-            let server_config = StreamableHttpServerConfig::default();
-            let bridge_clone = bridge.clone();
-            StreamableHttpService::new(
-                move || Ok(bridge_clone.clone()),
-                session_manager.into(),
-                server_config,
-            )
+            serve_with_session_manager(bridge, session_manager, config, api_key).await
         }
-    };
+    }
 
     #[cfg(not(feature = "sqlite-sessions"))]
-    let mcp_service = {
-        let session_manager = LocalSessionManager::default();
-        let server_config = StreamableHttpServerConfig::default();
-        let bridge_clone = bridge.clone();
-        StreamableHttpService::new(
-            move || Ok(bridge_clone.clone()),
-            session_manager.into(),
-            server_config,
-        )
-    };
+    serve_with_session_manager(bridge, LocalSessionManager::default(), config, api_key).await
+}
+
+/// Build the MCP axum app around a session manager and start the HTTP server.
+///
+/// Generic over the rmcp `SessionManager` implementation so callers can pick
+/// in-memory or SQLite-backed sessions without unifying the resulting
+/// `StreamableHttpService` types.
+async fn serve_with_session_manager<A, M>(
+    bridge: ActivationMcpBridge<A>,
+    session_manager: M,
+    config: McpHttpConfig,
+    api_key: Option<String>,
+) -> Result<JoinHandle<std::result::Result<(), std::io::Error>>>
+where
+    A: Activation,
+    M: rmcp::transport::streamable_http_server::session::SessionManager,
+{
+    let server_config = StreamableHttpServerConfig::default();
+    let mcp_service = StreamableHttpService::new(
+        move || Ok(bridge.clone()),
+        session_manager.into(),
+        server_config,
+    );
 
     // Build axum router with MCP at /mcp, debug endpoint, request logging, and auth
     let mcp_app = Router::new()

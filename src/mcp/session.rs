@@ -89,12 +89,13 @@ impl SqliteSessionManager {
     /// Create a new SQLite session manager
     pub async fn new(config: SqliteSessionConfig) -> Result<Self, SqliteSessionError> {
         let db_url = format!("sqlite:{}?mode=rwc", config.db_path.display());
-        let mut connect_options: SqliteConnectOptions = db_url
+        let connect_options: SqliteConnectOptions = db_url
             .parse()
             .map_err(|e| SqliteSessionError::DatabaseError(format!("Failed to parse DB URL: {}", e)))?;
-        connect_options.disable_statement_logging();
+        // sqlx 0.8: disable_statement_logging takes self by value and returns Self
+        let connect_options = connect_options.disable_statement_logging();
 
-        let pool = SqlitePool::connect_with(connect_options.clone())
+        let pool = SqlitePool::connect_with(connect_options)
             .await
             .map_err(|e| SqliteSessionError::DatabaseError(format!("Failed to connect: {}", e)))?;
 

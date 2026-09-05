@@ -1,18 +1,36 @@
 //! Transport server builder and orchestration
 
 use anyhow::Result;
-use plexus_core::plexus::{Activation, PluginSchema, SessionValidator};
+use plexus_core::plexus::{Activation, PlexusError, PlexusStream, PluginSchema, SessionValidator};
 use jsonrpsee::server::ServerHandle;
 use jsonrpsee::RpcModule;
+use serde_json::Value;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
-use crate::config::{McpHttpConfig, StdioConfig, TransportConfig, WebSocketConfig};
-use crate::mcp::bridge::RouteFn;
+use crate::config::{StdioConfig, TransportConfig, WebSocketConfig};
+#[cfg(feature = "mcp")]
+use crate::config::McpHttpConfig;
+#[cfg(feature = "mcp")]
 use crate::mcp::server::serve_mcp_http;
 use crate::registry::{self, RegistryRegistration};
 use crate::stdio::serve_stdio;
 use crate::websocket::serve_websocket;
+
+/// A function that routes a namespaced method call (e.g., "loopback.permit") to the
+/// correct activation. Used by hub activations to dispatch child calls via `hub.route()`.
+///
+/// Signature: `fn(method: String, params: Value) -> Future<Output = Result<PlexusStream, PlexusError>>`
+///
+/// Shared by the MCP and REST HTTP bridges; defined here so it is available
+/// regardless of which transport features are enabled.
+pub type RouteFn = Arc<
+    dyn Fn(String, Value) -> Pin<Box<dyn Future<Output = Result<PlexusStream, PlexusError>> + Send>>
+        + Send
+        + Sync,
+>;
 
 /// Z2H-6: builder-level configuration for boot-time registry
 /// self-registration. All fields are overrides; `Default` means
@@ -47,12 +65,15 @@ pub struct TransportServer<A: Activation> {
     activation: Arc<A>,
     config: TransportConfig,
     rpc_converter: Option<RpcConverter<A>>,
-    /// Pre-computed flat schema list for MCP tool exposure.
-    /// When set, the MCP bridge exposes all listed schemas as tools.
-    mcp_flat_schemas: Option<Vec<PluginSchema>>,
+    /// Pre-computed flat schema list for gateway exposure (MCP tools and/or
+    /// REST routes). When set, the bridges expose all listed schemas.
+    #[cfg_attr(not(any(feature = "mcp", feature = "http-gateway")), allow(dead_code))]
+    flat_schemas: Option<Vec<PluginSchema>>,
     /// Optional routing function for hub activations.
-    /// When set, MCP call_tool uses it to dispatch namespaced calls via hub.route().
-    mcp_route_fn: Option<RouteFn>,
+    /// When set, MCP call_tool and REST dispatch use it to route namespaced
+    /// calls via hub.route().
+    #[cfg_attr(not(any(feature = "mcp", feature = "http-gateway")), allow(dead_code))]
+    route_fn: Option<RouteFn>,
     /// Optional session validator for cookie-based authentication.
     /// When set, validates cookies from HTTP upgrade requests.
     session_validator: Option<Arc<dyn SessionValidator>>,
@@ -174,21 +195,32 @@ impl<A: Activation> TransportServer<A> {
         // shared handle); the original moves into the wait branch below.
         let ws_handle_for_signal = ws_handle.clone();
 
-        // Start MCP HTTP transport
+        // Start MCP HTTP transport (requires the `mcp` feature)
+        #[cfg(feature = "mcp")]
         let mcp_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> =
             if let Some(mcp_config) = self.config.mcp_http {
                 let api_key = self.config.api_key.clone();
-                Some(serve_mcp_http(self.activation.clone(), self.mcp_flat_schemas.clone(), self.mcp_route_fn.clone(), mcp_config, api_key).await?)
+                Some(serve_mcp_http(self.activation.clone(), self.flat_schemas.clone(), self.route_fn.clone(), mcp_config, api_key).await?)
             } else {
                 None
             };
+
+        #[cfg(not(feature = "mcp"))]
+        let mcp_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> = {
+            if self.config.mcp_http.is_some() {
+                tracing::warn!(
+                    "MCP HTTP transport configured but the 'mcp' feature is disabled; ignoring"
+                );
+            }
+            None
+        };
 
         // Start REST HTTP transport
         #[cfg(feature = "http-gateway")]
         let rest_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> =
             if let Some(rest_config) = self.config.rest_http {
                 let api_key = self.config.api_key.clone();
-                Some(crate::http::serve_rest_http(self.activation.clone(), self.mcp_flat_schemas.clone(), self.mcp_route_fn.clone(), rest_config, api_key).await?)
+                Some(crate::http::serve_rest_http(self.activation.clone(), self.flat_schemas.clone(), self.route_fn.clone(), rest_config, api_key).await?)
             } else {
                 None
             };
@@ -305,8 +337,8 @@ pub struct TransportServerBuilder<A: Activation> {
     activation: Arc<A>,
     config: TransportConfig,
     rpc_converter: Option<RpcConverter<A>>,
-    mcp_flat_schemas: Option<Vec<PluginSchema>>,
-    mcp_route_fn: Option<RouteFn>,
+    flat_schemas: Option<Vec<PluginSchema>>,
+    route_fn: Option<RouteFn>,
     session_validator: Option<Arc<dyn SessionValidator>>,
     /// RED-4: opt-out of the build-time check that refuses to start the
     /// server when activations declare auth-gated methods but no auth
@@ -329,8 +361,8 @@ impl<A: Activation> TransportServerBuilder<A> {
             activation,
             config: TransportConfig::default(),
             rpc_converter: Some(Box::new(rpc_converter)),
-            mcp_flat_schemas: None,
-            mcp_route_fn: None,
+            flat_schemas: None,
+            route_fn: None,
             session_validator: None,
             allow_missing_auth: false,
             reject_upgrade_on_auth_failure: false,
@@ -380,12 +412,14 @@ impl<A: Activation> TransportServerBuilder<A> {
     }
 
     /// Enable MCP HTTP transport on the specified port
+    #[cfg(feature = "mcp")]
     pub fn with_mcp_http(mut self, port: u16) -> Self {
         self.config.mcp_http = Some(McpHttpConfig::new(port));
         self
     }
 
     /// Enable MCP HTTP transport with custom configuration
+    #[cfg(feature = "mcp")]
     pub fn with_mcp_http_config(mut self, config: McpHttpConfig) -> Self {
         self.config.mcp_http = Some(config);
         self
@@ -405,19 +439,39 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
-    /// Set pre-computed flat schemas for MCP tool exposure.
+    /// Set pre-computed flat schemas for gateway exposure (MCP tools and/or
+    /// REST routes — this hook feeds both bridges and works with or without
+    /// the `mcp` feature).
     /// For hub activations, pass `hub.list_plugin_schemas()` to expose all child schemas.
-    pub fn with_mcp_flat_schemas(mut self, schemas: Vec<PluginSchema>) -> Self {
-        self.mcp_flat_schemas = Some(schemas);
+    pub fn with_flat_schemas(mut self, schemas: Vec<PluginSchema>) -> Self {
+        self.flat_schemas = Some(schemas);
         self
     }
 
-    /// Set routing function for MCP call_tool dispatch.
+    /// Set the routing function for gateway dispatch (MCP call_tool and REST
+    /// method calls — this hook feeds both bridges and works with or without
+    /// the `mcp` feature).
     /// For hub activations, provide a closure wrapping `hub.route()` so that
     /// namespaced tool calls (e.g., "loopback.permit") reach the correct child.
-    pub fn with_mcp_route_fn(mut self, route_fn: RouteFn) -> Self {
-        self.mcp_route_fn = Some(route_fn);
+    pub fn with_route_fn(mut self, route_fn: RouteFn) -> Self {
+        self.route_fn = Some(route_fn);
         self
+    }
+
+    /// Deprecated alias of [`Self::with_flat_schemas`]. The `mcp_` prefix was
+    /// misleading: these schemas also feed the REST HTTP bridge
+    /// (`http-gateway` feature) and do not require the `mcp` feature.
+    #[deprecated(since = "0.5.0", note = "renamed to `with_flat_schemas` — the schemas feed the REST bridge too, not just MCP")]
+    pub fn with_mcp_flat_schemas(self, schemas: Vec<PluginSchema>) -> Self {
+        self.with_flat_schemas(schemas)
+    }
+
+    /// Deprecated alias of [`Self::with_route_fn`]. The `mcp_` prefix was
+    /// misleading: the routing function also feeds the REST HTTP bridge
+    /// (`http-gateway` feature) and does not require the `mcp` feature.
+    #[deprecated(since = "0.5.0", note = "renamed to `with_route_fn` — the routing function feeds the REST bridge too, not just MCP")]
+    pub fn with_mcp_route_fn(self, route_fn: RouteFn) -> Self {
+        self.with_route_fn(route_fn)
     }
 
     /// Configure a static admission key required on all WebSocket connections.
@@ -558,8 +612,8 @@ impl<A: Activation> TransportServerBuilder<A> {
             activation: self.activation,
             config: self.config,
             rpc_converter: self.rpc_converter,
-            mcp_flat_schemas: self.mcp_flat_schemas,
-            mcp_route_fn: self.mcp_route_fn,
+            flat_schemas: self.flat_schemas,
+            route_fn: self.route_fn,
             session_validator: self.session_validator,
             reject_upgrade_on_auth_failure: self.reject_upgrade_on_auth_failure,
             registry: self.registry,
