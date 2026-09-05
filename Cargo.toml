@@ -1,13 +1,13 @@
 [package]
 name = "plexus-transport"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
 
 [dependencies]
 # Core dependencies
-plexus-core = { path = "../plexus-core", version = "0.5" }
+plexus-core = "0.5"
 tokio = { version = "1.42", features = ["full"] }
 futures = "0.3"
 async-stream = "0.3"
@@ -21,8 +21,8 @@ hyper = { version = "1", features = ["full"], optional = true }
 bytes = "1"
 http-body = "1"
 
-# MCP protocol
-rmcp = { version = "0.12", features = ["server", "transport-streamable-http-server"] }
+# MCP protocol (feature "mcp", default-on)
+rmcp = { version = "0.12", features = ["server", "transport-streamable-http-server"], optional = true }
 
 # HTTP server
 axum = "0.8"
@@ -43,15 +43,22 @@ async-stream = "0.3"
 async-trait = "0.1"
 uuid = { version = "1.0", features = ["v4"] }
 tower = "0.5"
-# plexus-schemars-compat aliased as "schemars" so that #[derive(schemars::JsonSchema)]
-# in tests resolves to the no-op derive, preventing duplicate impl JsonSchema conflicts
-# with PlexusRequest's generated impl. All real schemars types/macros are re-exported.
-schemars = { path = "../plexus-schemars-compat", package = "plexus-schemars-compat" }
-plexus-macros = { path = "../plexus-macros" }
-plexus-core = { path = "../plexus-core", version = "0.5" }
+# plexus-macros aliased as "schemars" (schemars-compat feature) so that
+# #[derive(schemars::JsonSchema)] in tests resolves to the no-op derive, preventing
+# duplicate impl JsonSchema conflicts with PlexusRequest's generated impl.
+# (Replaces the unpublished plexus-schemars-compat path dependency; real schemars
+# types are reachable via plexus_core::__schemars. Cargo forbids depending on the
+# same crate version under two names, so tests import PlexusRequest through the
+# alias too: `use schemars::PlexusRequest;`.)
+schemars = { version = "0.5.5", package = "plexus-macros", features = ["schemars-compat"] }
+plexus-core = "0.5"
 
 [features]
-default = []
-mcp-gateway = ["hyper"]
+default = ["mcp"]
+# MCP transport (rmcp-based). Default-on so existing 0.2.x consumers keep
+# compiling unchanged; disable default features for REST/WebSocket-only builds
+# that must not pull in the rmcp stack.
+mcp = ["dep:rmcp"]
+mcp-gateway = ["mcp", "hyper"]
 http-gateway = ["hyper"]
-sqlite-sessions = ["sqlx", "tokio-stream"]
+sqlite-sessions = ["mcp", "sqlx", "tokio-stream"]

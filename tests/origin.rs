@@ -9,7 +9,7 @@
 use plexus_transport::request::{PlexusRequest, RawRequestContext};
 use plexus_transport::request::origin::{ValidOrigin, init_allowed_origins};
 use plexus_core::plexus::{PlexusError, PlexusRequestField};
-use plexus_macros::PlexusRequest;
+use schemars::PlexusRequest;
 
 fn make_raw(headers: &[(&str, &str)]) -> RawRequestContext {
     let mut h = http::HeaderMap::new();

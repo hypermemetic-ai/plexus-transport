@@ -4,19 +4,17 @@
 //! exposing each method as a POST endpoint at `/rest/{namespace}/{method}`.
 
 use std::collections::HashMap;
-use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use axum::{
     Router,
-    routing::{get, post, put, delete, patch, MethodRouter},
-    extract::{Path, State},
-    http::StatusCode,
+    routing::any,
+    extract::{FromRequest, Path, Request, State},
+    http::{header, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use plexus_core::plexus::{Activation, PlexusError, PlexusStream, PluginSchema, schema::HttpMethod};
+use plexus_core::plexus::{Activation, PlexusError, PluginSchema, schema::HttpMethod};
 use serde_json::Value;
 
 use crate::http::handler::{handle_method_call, MethodInfo};
@@ -24,12 +22,9 @@ use crate::http::handler::{handle_method_call, MethodInfo};
 /// A function that routes a namespaced method call (e.g., "loopback.permit") to the
 /// correct activation. Used by hub activations to dispatch child calls via `hub.route()`.
 ///
-/// Signature: `fn(method: String, params: Value) -> Future<Output = Result<PlexusStream, PlexusError>>`
-pub type RouteFn = Arc<
-    dyn Fn(String, Value) -> Pin<Box<dyn Future<Output = Result<PlexusStream, PlexusError>> + Send>>
-        + Send
-        + Sync,
->;
+/// Canonical definition lives in [`crate::server`] so it is available with or
+/// without the `mcp` feature.
+pub use crate::server::RouteFn;
 
 // =============================================================================
 // Schema → REST Routes Transformation
@@ -103,25 +98,14 @@ where
         registry: registry.clone(),
     });
 
-    let mut router = Router::new();
-
-    // Register each method with its specific HTTP method
-    for method_info in registry.all_methods() {
-        let path = format!("/{}/{}", method_info.namespace, method_info.method);
-
-        // Choose the appropriate routing method based on http_method
-        let method_router: MethodRouter<Arc<RestBridgeState<A>>, _> = match method_info.http_method {
-            HttpMethod::Get => get(rest_method_handler),
-            HttpMethod::Post => post(rest_method_handler),
-            HttpMethod::Put => put(rest_method_handler),
-            HttpMethod::Delete => delete(rest_method_handler),
-            HttpMethod::Patch => patch(rest_method_handler),
-        };
-
-        router = router.route(&path, method_router);
-    }
-
-    router.with_state(state)
+    // A single parameterized route serves every method. The handler resolves
+    // (namespace, method) against the registry (404 for unknown methods) and
+    // enforces the schema's HTTP verb (405 on mismatch). Literal per-method
+    // paths cannot be combined with the `Path` extractor: axum rejects `Path`
+    // extraction on routes without captures (every request would 500).
+    Router::new()
+        .route("/{namespace}/{method}", any(rest_method_handler))
+        .with_state(state)
 }
 
 // =============================================================================
@@ -139,11 +123,22 @@ struct RestBridgeState<A: Activation> {
 // REST Method Handler
 // =============================================================================
 
+/// Map a schema-declared HTTP method to the axum/http verb type
+fn http_method_to_verb(http_method: &HttpMethod) -> Method {
+    match http_method {
+        HttpMethod::Get => Method::GET,
+        HttpMethod::Post => Method::POST,
+        HttpMethod::Put => Method::PUT,
+        HttpMethod::Delete => Method::DELETE,
+        HttpMethod::Patch => Method::PATCH,
+    }
+}
+
 /// Axum handler for REST method calls
 async fn rest_method_handler<A>(
     Path((namespace, method)): Path<(String, String)>,
     State(state): State<Arc<RestBridgeState<A>>>,
-    Json(params): Json<Value>,
+    request: Request,
 ) -> Response
 where
     A: Activation + 'static,
@@ -161,6 +156,29 @@ where
         }
     };
 
+    // Enforce the per-method HTTP verb (the single parameterized route accepts
+    // all verbs; the schema says which one is valid for this method).
+    let expected_verb = http_method_to_verb(&rest_method_info.http_method);
+    if request.method() != expected_verb {
+        return (
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, expected_verb.as_str().to_string())],
+            Json(serde_json::json!({
+                "error": format!(
+                    "{} not allowed for {}.{}; use {}",
+                    request.method(), namespace, method, expected_verb
+                )
+            })),
+        ).into_response();
+    }
+
+    // Parse the JSON body after the 404/405 checks so verb mismatches are
+    // reported even without a body. Malformed JSON → 400 via Json's rejection.
+    let Json(params) = match Json::<Value>::from_request(request, &()).await {
+        Ok(json) => json,
+        Err(rejection) => return rejection.into_response(),
+    };
+
     // Convert to handler MethodInfo (which doesn't need http_method)
     let method_info = MethodInfo {
         namespace: rest_method_info.namespace.clone(),
@@ -174,8 +192,9 @@ where
         let full_method = format!("{}.{}", namespace, method);
         route_fn(full_method, params).await
     } else {
-        // Leaf activation: call directly
-        state.activation.call(&method, params).await
+        // Leaf activation: call directly (no auth / raw-request context in the
+        // REST bridge; matches the MCP bridge's call shape)
+        state.activation.call(&method, params, None, None).await
     };
 
     // Handle the result
@@ -209,6 +228,9 @@ fn plexus_error_to_response(e: PlexusError) -> Response {
         }
         PlexusError::TransportError(kind) => {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Transport error: {:?}", kind))
+        }
+        PlexusError::Unauthenticated(reason) => {
+            (StatusCode::UNAUTHORIZED, format!("Authentication required: {}", reason))
         }
     };
 
