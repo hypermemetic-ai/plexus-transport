@@ -9,15 +9,18 @@ use std::sync::Arc;
 use axum::{
     Router,
     routing::any,
-    extract::{FromRequest, Path, Request, State},
+    extract::{rejection::JsonRejection, FromRequest, Path, Request, State},
     http::{header, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
-use plexus_core::plexus::{Activation, PlexusError, PluginSchema, schema::HttpMethod};
+use plexus_core::plexus::{
+    schema::HttpMethod, Activation, Cardinality, ParamProblem, PlexusError, PluginSchema,
+    RemoteError,
+};
 use serde_json::Value;
 
-use crate::http::handler::{handle_method_call, MethodInfo};
+use crate::http::handler::{handle_method_call, remote_error_response, MethodInfo};
 
 /// A function that routes a namespaced method call (e.g., "loopback.permit") to the
 /// correct activation. Used by hub activations to dispatch child calls via `hub.route()`.
@@ -35,7 +38,8 @@ pub use crate::server::RouteFn;
 pub struct RestMethodInfo {
     pub namespace: String,
     pub method: String,
-    pub streaming: bool,
+    /// `one` → one JSON body; `many` → SSE (RETURNS-5's `cardinality`).
+    pub cardinality: Cardinality,
     pub http_method: HttpMethod,
 }
 
@@ -57,7 +61,7 @@ impl MethodRegistry {
                 methods.insert(key, RestMethodInfo {
                     namespace: schema.namespace.clone(),
                     method: method.name.clone(),
-                    streaming: method.streaming,
+                    cardinality: method.cardinality,
                     http_method: method.http_method,
                 });
             }
@@ -77,6 +81,12 @@ impl MethodRegistry {
     /// Get all methods for route registration
     pub fn all_methods(&self) -> Vec<&RestMethodInfo> {
         self.methods.values().collect()
+    }
+
+    /// Whether any registered method belongs to `namespace` — tells an
+    /// unknown method from an unknown activation.
+    pub fn has_namespace(&self, namespace: &str) -> bool {
+        self.methods.values().any(|info| info.namespace == namespace)
     }
 }
 
@@ -143,16 +153,17 @@ async fn rest_method_handler<A>(
 where
     A: Activation + 'static,
 {
-    // Look up method info to determine if streaming
+    // Look up method info (its verb and cardinality). Unknown → 404 with the
+    // typed `RemoteError`, as a hub's own route would answer it.
     let rest_method_info = match state.registry.get(&namespace, &method) {
         Some(info) => info.clone(),
         None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!("Method not found: {}.{}", namespace, method)
-                }))
-            ).into_response();
+            let error = if state.registry.has_namespace(&namespace) {
+                RemoteError::MethodNotFound { activation: namespace, method }
+            } else {
+                RemoteError::ActivationNotFound { activation: namespace }
+            };
+            return remote_error_response(error);
         }
     };
 
@@ -173,9 +184,17 @@ where
     }
 
     // Parse the JSON body after the 404/405 checks so verb mismatches are
-    // reported even without a body. Malformed JSON → 400 via Json's rejection.
+    // reported even without a body. A body that is not JSON → 400 with a
+    // typed `invalid_params`; any other rejection (e.g. a missing
+    // content-type, 415) keeps axum's own answer.
     let Json(params) = match Json::<Value>::from_request(request, &()).await {
         Ok(json) => json,
+        Err(rejection @ (JsonRejection::JsonSyntaxError(_) | JsonRejection::JsonDataError(_))) => {
+            return remote_error_response(RemoteError::InvalidParams {
+                param: None,
+                problem: ParamProblem::Malformed { detail: rejection.body_text() },
+            });
+        }
         Err(rejection) => return rejection.into_response(),
     };
 
@@ -183,7 +202,7 @@ where
     let method_info = MethodInfo {
         namespace: rest_method_info.namespace.clone(),
         method: rest_method_info.method.clone(),
-        streaming: rest_method_info.streaming,
+        cardinality: rest_method_info.cardinality,
     };
 
     // Call the method via activation or route_fn
@@ -208,43 +227,11 @@ where
 // Error Mapping
 // =============================================================================
 
-/// Convert PlexusError to HTTP response
+/// Convert a `PlexusError` (the call was rejected before its stream started)
+/// to an HTTP response: the typed `RemoteError` it maps to, its status per
+/// [`crate::http::handler::remote_error_status`].
 fn plexus_error_to_response(e: PlexusError) -> Response {
-    let (status, error_msg) = match e {
-        PlexusError::ActivationNotFound(name) => {
-            (StatusCode::NOT_FOUND, format!("Unknown activation: {}", name))
-        }
-        PlexusError::MethodNotFound { activation, method } => {
-            (StatusCode::NOT_FOUND, format!("Unknown method: {}.{}", activation, method))
-        }
-        PlexusError::InvalidParams(reason) => {
-            (StatusCode::BAD_REQUEST, format!("Invalid parameters: {}", reason))
-        }
-        PlexusError::ExecutionError(error) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Execution error: {}", error))
-        }
-        PlexusError::HandleNotSupported(activation) => {
-            (StatusCode::BAD_REQUEST, format!("Handle resolution not supported: {}", activation))
-        }
-        PlexusError::TransportError(kind) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Transport error: {:?}", kind))
-        }
-        PlexusError::Unauthenticated(reason) => {
-            (StatusCode::UNAUTHORIZED, format!("Authentication required: {}", reason))
-        }
-        // R-5 scope gate (plexus-core 0.6). The Display impl names only the
-        // unmet scope (no-enumeration posture, AUTHZ-CORE-1/5).
-        forbidden @ PlexusError::Forbidden { .. } => {
-            (StatusCode::FORBIDDEN, forbidden.to_string())
-        }
-    };
-
-    (
-        status,
-        Json(serde_json::json!({
-            "error": error_msg
-        }))
-    ).into_response()
+    remote_error_response(RemoteError::from(&e))
 }
 
 // =============================================================================

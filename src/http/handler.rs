@@ -1,13 +1,36 @@
 //! Request/response handlers for REST HTTP transport
 //!
 //! Handles PlexusStream responses, converting them to either:
-//! - JSON responses for non-streaming methods
-//! - Server-Sent Events (SSE) for streaming methods
+//! - one JSON body for a method of cardinality `one`
+//! - Server-Sent Events (SSE) for a method of cardinality `many`
+//!
+//! ## Frames (plexus 0.7, RETURNS-11)
+//!
+//! A transport never inspects `content`; it forwards `content` and `error`
+//! whole. The only interpretation it does is the status mapping
+//! ([`remote_error_status`]). An `{"ok": …}` / `{"err": …}` item is data:
+//! it travels like any other item and a unary response stays `200`.
+//!
+//! | frame | unary JSON body | SSE event |
+//! | -- | -- | -- |
+//! | data | `"data": [<content>…]` | `event: data`, `{"content": <content>}` |
+//! | progress | `"progress": [<P>…]` | `event: progress`, `{"content_type": …, "content": <P>}` |
+//! | error | status per kind; `"error": <RemoteError>` beside `data` | `event: error`, `{"recoverable": …, "error": <RemoteError>}` |
+//! | done | ends the body | `event: done`, `{}` |
+//!
+//! A call rejected before its stream starts (unknown method, bad params,
+//! auth) is answered `{"error": <RemoteError>}` with the same status mapping,
+//! whatever the method's cardinality.
+//!
+//! Answers that no `RemoteError` kind describes — they come from this
+//! transport, not the call — keep a human-readable string under `"error"`:
+//! 405 (wrong verb), 413 (the unary buffer limits), 504 (the method timed
+//! out). A request without a JSON content-type gets axum's own 415.
 //!
 //! ## Protection Mechanisms
 //!
 //! - **Timeouts**: Methods timeout after 5 minutes to prevent infinite streams
-//! - **Buffer Limits**: Non-streaming methods enforce max item count and byte limits
+//! - **Buffer Limits**: Unary (cardinality `one`) methods enforce max item count and byte limits
 //! - **Memory Safety**: Prevents unbounded buffering and OOM crashes
 
 use axum::{
@@ -16,8 +39,9 @@ use axum::{
     Json,
 };
 use futures::StreamExt;
-use plexus_core::plexus::{types::PlexusStreamItem, PlexusStream};
-use serde_json::json;
+use plexus_core::plexus::{types::PlexusStreamItem, Cardinality, PlexusStream, RemoteError};
+use serde::Serialize;
+use serde_json::{json, Value};
 use std::time::Duration;
 
 // =============================================================================
@@ -27,10 +51,10 @@ use std::time::Duration;
 /// Maximum time to wait for a method to complete (5 minutes)
 const METHOD_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Maximum number of items to buffer for non-streaming methods
+/// Maximum number of items to buffer for a unary (cardinality `one`) method
 const MAX_BUFFERED_ITEMS: usize = 10_000;
 
-/// Maximum total bytes to buffer for non-streaming methods (100MB)
+/// Maximum total bytes to buffer for a unary (cardinality `one`) method (100MB)
 const MAX_BUFFER_BYTES: usize = 100 * 1024 * 1024;
 
 // =============================================================================
@@ -42,22 +66,56 @@ const MAX_BUFFER_BYTES: usize = 100 * 1024 * 1024;
 pub struct MethodInfo {
     pub namespace: String,
     pub method: String,
-    pub streaming: bool,
+    /// The schema's cardinality (RETURNS-5): `one` → one JSON body,
+    /// `many` → SSE.
+    pub cardinality: Cardinality,
+}
+
+// =============================================================================
+// Error Mapping
+// =============================================================================
+
+/// The HTTP status a [`RemoteError`] is answered with, so curl users and
+/// proxies see the failure class without parsing the body.
+///
+/// Exhaustive on purpose: a new `RemoteError` kind fails this build until it
+/// has a status.
+pub fn remote_error_status(error: &RemoteError) -> StatusCode {
+    match error {
+        RemoteError::ActivationNotFound { .. } | RemoteError::MethodNotFound { .. } => {
+            StatusCode::NOT_FOUND
+        }
+        RemoteError::InvalidParams { .. } => StatusCode::BAD_REQUEST,
+        RemoteError::Unauthenticated => StatusCode::UNAUTHORIZED,
+        RemoteError::Forbidden { .. } => StatusCode::FORBIDDEN,
+        RemoteError::HandleNotSupported { .. } => StatusCode::NOT_IMPLEMENTED,
+        RemoteError::Execution { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// Answer a call rejected before its stream started:
+/// [`remote_error_status`] and `{"error": <RemoteError>}`.
+pub fn remote_error_response(error: RemoteError) -> Response {
+    (remote_error_status(&error), Json(json!({ "error": error }))).into_response()
 }
 
 // =============================================================================
 // Response Handling
 // =============================================================================
 
-/// Handle a method call, routing to JSON or SSE response based on streaming flag
+/// Handle a method call, routing to JSON or SSE response by the method's
+/// cardinality
 ///
 /// This function applies timeout protection to prevent infinite streams from hanging forever.
 pub async fn handle_method_call(stream: PlexusStream, method_info: MethodInfo) -> Response {
     // Apply timeout to prevent infinite streams
-    let result = if method_info.streaming {
-        tokio::time::timeout(METHOD_TIMEOUT, stream_sse_response(stream)).await
-    } else {
-        tokio::time::timeout(METHOD_TIMEOUT, collect_and_respond(stream)).await
+    let result = match method_info.cardinality {
+        Cardinality::Many => {
+            tokio::time::timeout(METHOD_TIMEOUT, stream_sse_response(stream)).await
+        }
+        Cardinality::One => {
+            tokio::time::timeout(METHOD_TIMEOUT, collect_and_respond(stream)).await
+        }
     };
 
     match result {
@@ -91,8 +149,8 @@ pub async fn handle_method_call(stream: PlexusStream, method_info: MethodInfo) -
 /// - Maximum total bytes: 100MB
 async fn collect_and_respond(mut stream: PlexusStream) -> Response {
     let mut data_items = Vec::new();
-    let mut progress_items = Vec::new();
-    let mut error_msg: Option<String> = None;
+    let mut progress_items: Vec<Value> = Vec::new();
+    let mut error: Option<RemoteError> = None;
     let mut total_bytes: usize = 0;
 
     while let Some(item) = stream.next().await {
@@ -143,17 +201,12 @@ async fn collect_and_respond(mut stream: PlexusStream) -> Response {
 
                 data_items.push(content);
             }
-            PlexusStreamItem::Progress { message, percentage, .. } => {
-                let mut progress_obj = json!({
-                    "message": message,
-                });
-                if let Some(pct) = percentage {
-                    progress_obj["percentage"] = json!(pct);
-                }
-                progress_items.push(progress_obj);
+            PlexusStreamItem::Progress { content, .. } => {
+                // The method's progress value `P`, forwarded whole.
+                progress_items.push(content);
             }
-            PlexusStreamItem::Error { message, .. } => {
-                error_msg = Some(message);
+            PlexusStreamItem::Error { error: e, .. } => {
+                error = Some(e);
                 break;
             }
             PlexusStreamItem::Done { .. } => {
@@ -176,15 +229,50 @@ async fn collect_and_respond(mut stream: PlexusStream) -> Response {
         response_obj["progress"] = json!(progress_items);
     }
 
-    if let Some(error) = error_msg {
+    if let Some(error) = error {
+        let status = remote_error_status(&error);
         response_obj["error"] = json!(error);
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(response_obj),
-        ).into_response();
+        return (status, Json(response_obj)).into_response();
     }
 
     (StatusCode::OK, Json(response_obj)).into_response()
+}
+
+/// An SSE `progress` event's data. A struct (not `json!`) so the key order
+/// is the documented one: `{"content_type": …, "content": <P>}`.
+#[derive(Serialize)]
+struct SseProgress<'a> {
+    content_type: &'a str,
+    content: &'a Value,
+}
+
+/// An SSE `error` event's data: `{"recoverable": …, "error": <RemoteError>}`.
+#[derive(Serialize)]
+struct SseError<'a> {
+    recoverable: bool,
+    error: &'a RemoteError,
+}
+
+/// An SSE `error` event. Every `event: error` the bridge sends has this
+/// shape, so a client decodes it as one type.
+fn sse_error_event(recoverable: bool, error: &RemoteError) -> Event {
+    Event::default()
+        .event("error")
+        .json_data(SseError { recoverable, error })
+        // Unreachable (a `RemoteError` always serializes); last resort only.
+        .unwrap_or_else(|_| Event::default().event("error").data(error.to_string()))
+}
+
+/// A frame whose JSON could not be written: a typed, recoverable error event
+/// in its place (the stream goes on). Not reached in practice — the frame's
+/// payload is already a `serde_json::Value`.
+fn sse_unserializable(frame: &str, e: axum::Error) -> Event {
+    sse_error_event(
+        true,
+        &RemoteError::Execution {
+            message: format!("failed to serialize {frame}: {e}"),
+        },
+    )
 }
 
 /// Stream PlexusStream items as Server-Sent Events
@@ -195,41 +283,16 @@ async fn stream_sse_response(stream: PlexusStream) -> Response {
                 Ok(Event::default()
                     .event("data")
                     .json_data(json!({ "content": content }))
-                    .unwrap_or_else(|e| {
-                        Event::default()
-                            .event("error")
-                            .data(format!("Failed to serialize data: {}", e))
-                    }))
+                    .unwrap_or_else(|e| sse_unserializable("data", e)))
             }
-            PlexusStreamItem::Progress { message, percentage, .. } => {
-                let mut progress_obj = json!({
-                    "message": message,
-                });
-                if let Some(pct) = percentage {
-                    progress_obj["percentage"] = json!(pct);
-                }
+            PlexusStreamItem::Progress { content_type, content, .. } => {
                 Ok(Event::default()
                     .event("progress")
-                    .json_data(progress_obj)
-                    .unwrap_or_else(|e| {
-                        Event::default()
-                            .event("error")
-                            .data(format!("Failed to serialize progress: {}", e))
-                    }))
+                    .json_data(SseProgress { content_type: &content_type, content: &content })
+                    .unwrap_or_else(|e| sse_unserializable("progress", e)))
             }
-            PlexusStreamItem::Error { message, code, .. } => {
-                let mut error_obj = json!({ "message": message });
-                if let Some(c) = code {
-                    error_obj["code"] = json!(c);
-                }
-                Ok(Event::default()
-                    .event("error")
-                    .json_data(error_obj)
-                    .unwrap_or_else(|_| {
-                        Event::default()
-                            .event("error")
-                            .data(message)
-                    }))
+            PlexusStreamItem::Error { recoverable, error, .. } => {
+                Ok(sse_error_event(recoverable, &error))
             }
             PlexusStreamItem::Done { .. } => {
                 Ok(Event::default()
