@@ -57,6 +57,11 @@ pub struct WebSocketConfig {
     /// Header name carrying the api_key on the upgrade request.
     /// Defaults to `X-Plexus-API-Key`.
     pub api_key_header: http::HeaderName,
+    /// IDENTITY-20: the origins a browser page may open a socket from. Empty
+    /// (the default) checks nothing. Otherwise an upgrade whose `Origin` is
+    /// anything else — `null` included — is refused 403 before any
+    /// credential is read; one with no `Origin` (a CLI, a server) proceeds.
+    pub allowed_origins: Vec<String>,
 }
 
 impl WebSocketConfig {
@@ -67,6 +72,7 @@ impl WebSocketConfig {
                 .expect("Valid socket address"),
             api_key: None,
             api_key_header: http::HeaderName::from_static("x-plexus-api-key"),
+            allowed_origins: Vec::new(),
         }
     }
 
