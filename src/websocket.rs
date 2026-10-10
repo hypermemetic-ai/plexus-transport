@@ -41,13 +41,91 @@
 //! [`UpgradeOptions::protected_resource`] serves RFC 9728 metadata at
 //! `/.well-known/oauth-protected-resource` on this port, ahead of every
 //! check, and adds `resource_metadata="…"` to each session 401.
+//!
+//! ## A sign-in that ends closes its socket (AUTH-11)
+//!
+//! Each connection has its own stop handle ([`Connection`], in every
+//! request's extensions). When the upgrade signs a caller in, a watcher
+//! asks the validator ([`SessionValidator::alive`]) every
+//! [`LIVENESS_EVERY`] while the socket is open, and closes it once the
+//! session is signed out, revoked or expired — rather than leaving it to
+//! the next call (which the hub's gate refuses anyway).
+//!
+//! [`SessionValidator::alive`]: plexus_core::plexus::SessionValidator::alive
 
 use anyhow::Result;
-use jsonrpsee::server::{Server, ServerHandle};
+use futures::FutureExt;
+use jsonrpsee::server::{serve_with_graceful_shutdown, stop_channel, Server, ServerHandle};
 use jsonrpsee::RpcModule;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tower::Service;
 
 use crate::config::WebSocketConfig;
+
+/// AUTH-11: how often an open, signed-in socket asks whether its sign-in
+/// still stands.
+pub const LIVENESS_EVERY: Duration = Duration::from_secs(1);
+
+/// One accepted TCP connection, in the extensions of every request it
+/// carries (and so of the WebSocket it upgrades to, for as long as that
+/// lives): who is at the other end, and how to close it.
+#[derive(Debug)]
+pub struct Connection {
+    peer: SocketAddr,
+    handle: ServerHandle,
+}
+
+impl Connection {
+    /// The peer's address, as accepted (no proxy headers).
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+
+    /// Close this connection (its WebSocket, after in-flight calls).
+    pub fn close(&self) {
+        let _ = self.handle.stop();
+    }
+
+    /// Whether it has been closed.
+    pub fn is_closed(&self) -> bool {
+        self.handle.is_stopped()
+    }
+}
+
+impl Drop for Connection {
+    /// Gone from every request: the connection is over; release its stop
+    /// handle's watchers.
+    fn drop(&mut self) {
+        let _ = self.handle.stop();
+    }
+}
+
+/// AUTH-11: watch a signed-in socket; close it once its sign-in no longer
+/// stands. Holds the connection weakly: when the socket ends on its own,
+/// the watch ends at its next tick.
+fn watch_liveness(
+    conn: std::sync::Weak<Connection>,
+    validator: Arc<dyn plexus_core::plexus::SessionValidator>,
+    ctx: plexus_core::plexus::AuthContext,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(LIVENESS_EVERY).await;
+            let Some(conn) = conn.upgrade() else { return };
+            if conn.is_closed() {
+                return;
+            }
+            if let Err(why) = validator.alive(&ctx) {
+                tracing::info!(user_id = %ctx.user_id, peer = %conn.peer, reason = %why, "closing socket: its sign-in ended");
+                conn.close();
+                return;
+            }
+        }
+    });
+}
 
 /// Serve RPC module over WebSocket
 ///
@@ -119,40 +197,71 @@ pub async fn serve_websocket_with(
 ) -> Result<(ServerHandle, std::net::SocketAddr)> {
     tracing::info!("Starting WebSocket transport at ws://{}", config.addr);
 
-    let has_api_key = config.api_key.is_some();
-    let has_session = session_validator.is_some();
-    let has_origins = !config.allowed_origins.is_empty();
-    let has_metadata = options.protected_resource.is_some();
+    // The middleware is always in: with nothing configured it passes every
+    // request through, as the bare server did.
+    let api_key = config.api_key.clone();
+    let api_key_header = config.api_key_header.clone();
+    let allowed_origins = auth::normalized_origins(&config.allowed_origins);
+    let policy: Arc<auth::Policy> = (&options).into();
+    let middleware = tower::ServiceBuilder::new().layer_fn(move |service| CombinedAuthMiddleware {
+        service,
+        api_key: api_key.clone(),
+        api_key_header: api_key_header.clone(),
+        session_validator: session_validator.clone(),
+        reject_on_session_failure: options.reject_on_session_failure,
+        allowed_origins: allowed_origins.clone(),
+        policy: policy.clone(),
+    });
+    let svc_builder = Server::builder().set_http_middleware(middleware).to_service_builder();
+    let methods = jsonrpsee::Methods::from(module);
 
-    if has_api_key || has_session || has_origins || has_metadata {
-        let api_key = config.api_key.clone();
-        let api_key_header = config.api_key_header.clone();
-        let allowed_origins = auth::normalized_origins(&config.allowed_origins);
-        let policy: Arc<auth::Policy> = (&options).into();
-        let middleware = tower::ServiceBuilder::new().layer_fn(move |service| {
-            CombinedAuthMiddleware {
-                service,
-                api_key: api_key.clone(),
-                api_key_header: api_key_header.clone(),
-                session_validator: session_validator.clone(),
-                reject_on_session_failure: options.reject_on_session_failure,
-                allowed_origins: allowed_origins.clone(),
-                policy: policy.clone(),
-            }
-        });
-        let server = Server::builder()
-            .set_http_middleware(middleware)
-            .build(config.addr)
-            .await?;
-        let local_addr = server.local_addr()?;
-        let handle = server.start(module);
-        return Ok((handle, local_addr));
-    }
+    let listener = TcpListener::bind(config.addr).await?;
+    let local_addr = listener.local_addr()?;
+    let (stop_handle, server_handle) = stop_channel();
 
-    let server = Server::builder().build(config.addr).await?;
-    let local_addr = server.local_addr()?;
-    let handle = server.start(module);
-    Ok((handle, local_addr))
+    // AUTH-11: jsonrpsee's low-level accept loop, so each connection gets
+    // its own stop handle (a socket can be closed alone) and its peer
+    // address rides into the middleware.
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = tokio::select! {
+                res = listener.accept() => match res {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::error!("websocket accept: {e}");
+                        continue;
+                    }
+                },
+                _ = stop_handle.clone().shutdown() => break,
+            };
+            let (conn_stop, conn_handle) = stop_channel();
+            // The server's stop closes every connection.
+            let server_stop = stop_handle.clone();
+            let forward = conn_handle.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = server_stop.shutdown() => { let _ = forward.stop(); }
+                    _ = forward.clone().stopped() => {}
+                }
+            });
+            let conn = Arc::new(Connection { peer, handle: conn_handle });
+            let svc_builder = svc_builder.clone();
+            let methods = methods.clone();
+            let conn_stop_for_serve = conn_stop.clone();
+            let svc = tower::service_fn(move |mut req: http::Request<hyper::body::Incoming>| {
+                req.extensions_mut().insert(conn.clone());
+                let mut svc = svc_builder.clone().build(methods.clone(), conn_stop.clone());
+                async move { svc.call(req).await.map_err(anyhow::Error::from_boxed) }.boxed()
+            });
+            tokio::spawn(async move {
+                if let Err(e) = serve_with_graceful_shutdown(sock, svc, conn_stop_for_serve.shutdown()).await {
+                    tracing::debug!("websocket connection closed: {e}");
+                }
+            });
+        }
+    });
+
+    Ok((server_handle, local_addr))
 }
 
 // ---------------------------------------------------------------------------
@@ -505,6 +614,13 @@ pub(crate) mod auth {
                                 user_id = %ctx.user_id,
                                 "WS upgrade: SessionValidator produced AuthContext"
                             );
+                            // AUTH-11: a socket signed in is watched, and
+                            // closed once its sign-in ends.
+                            if jsonrpsee::server::ws::is_upgrade_request(&request) {
+                                if let Some(conn) = request.extensions().get::<Arc<super::Connection>>() {
+                                    super::watch_liveness(Arc::downgrade(conn), validator.clone(), ctx.clone());
+                                }
+                            }
                             request.extensions_mut().insert(Arc::new(ctx));
                             service.call(request).await.map_err(Into::into)
                         }
