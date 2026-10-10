@@ -62,6 +62,39 @@ pub struct WebSocketConfig {
     /// anything else — `null` included — is refused 403 before any
     /// credential is read; one with no `Origin` (a CLI, a server) proceeds.
     pub allowed_origins: Vec<String>,
+    /// AUTH-12: how many sockets may be open, in all and per caller.
+    pub quotas: ConnectionQuotas,
+}
+
+/// AUTH-12: connection quotas on the WebSocket port, so no one caller —
+/// least of all an anonymous one — can take every connection. A socket
+/// counts against [`Self::max_connections`] and its IP's
+/// [`Self::max_per_ip`]; then, under a session validator, against its
+/// principal's [`Self::max_per_principal`] if the upgrade signed someone
+/// in, else against [`Self::max_anonymous`] and its IP's
+/// [`Self::max_anonymous_per_ip`]. (Without a validator no socket is anyone,
+/// so only the total and the per-IP quota apply.) Over a quota, the upgrade
+/// is refused 429. A plain HTTP JSON-RPC request counts only against the
+/// total, while it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionQuotas {
+    /// Every connection, set on jsonrpsee explicitly (its default is 100).
+    pub max_connections: u32,
+    /// Sockets from one IP address, signed in or not.
+    pub max_per_ip: u32,
+    /// Sockets one signed-in principal holds.
+    pub max_per_principal: u32,
+    /// Sockets that proved no one — held well below the total, so they can
+    /// never lock a signed-in caller out.
+    pub max_anonymous: u32,
+    /// Anonymous sockets from one IP address.
+    pub max_anonymous_per_ip: u32,
+}
+
+impl Default for ConnectionQuotas {
+    fn default() -> Self {
+        Self { max_connections: 1024, max_per_ip: 256, max_per_principal: 64, max_anonymous: 128, max_anonymous_per_ip: 32 }
+    }
 }
 
 impl WebSocketConfig {
@@ -73,6 +106,7 @@ impl WebSocketConfig {
             api_key: None,
             api_key_header: http::HeaderName::from_static("x-plexus-api-key"),
             allowed_origins: Vec::new(),
+            quotas: ConnectionQuotas::default(),
         }
     }
 

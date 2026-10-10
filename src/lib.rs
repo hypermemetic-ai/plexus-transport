@@ -57,7 +57,7 @@ pub mod http;
 #[cfg(feature = "mcp-gateway")]
 pub use combined::serve_combined;
 pub use config::{
-    McpHttpConfig, SessionStorage, StdioConfig, TransportConfig, WebSocketConfig,
+    ConnectionQuotas, McpHttpConfig, SessionStorage, StdioConfig, TransportConfig, WebSocketConfig,
     DEFAULT_API_KEY_HEADER,
 };
 
