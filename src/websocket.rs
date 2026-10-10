@@ -64,10 +64,12 @@ pub async fn serve_websocket(
 
     let has_api_key = config.api_key.is_some();
     let has_session = session_validator.is_some();
+    let has_origins = !config.allowed_origins.is_empty();
 
-    if has_api_key || has_session {
+    if has_api_key || has_session || has_origins {
         let api_key = config.api_key.clone();
         let api_key_header = config.api_key_header.clone();
+        let allowed_origins = auth::normalized_origins(&config.allowed_origins);
         let middleware = tower::ServiceBuilder::new().layer_fn(move |service| {
             CombinedAuthMiddleware {
                 service,
@@ -75,6 +77,7 @@ pub async fn serve_websocket(
                 api_key_header: api_key_header.clone(),
                 session_validator: session_validator.clone(),
                 reject_on_session_failure,
+                allowed_origins: allowed_origins.clone(),
             }
         });
         let server = Server::builder()
@@ -141,6 +144,40 @@ pub(crate) mod auth {
         /// `#[from_auth]` will fail-close at runtime, but methods without it
         /// dispatch.
         pub(super) reject_on_session_failure: bool,
+        /// IDENTITY-20: normalized allowed origins; empty checks nothing.
+        pub(super) allowed_origins: Arc<Vec<String>>,
+    }
+
+    /// IDENTITY-20: an origin as compared: lowercase, no trailing slash.
+    fn normalize_origin(origin: &str) -> String {
+        origin.trim().trim_end_matches('/').to_ascii_lowercase()
+    }
+
+    /// IDENTITY-20: the allow-list, normalized once.
+    pub(crate) fn normalized_origins(origins: &[String]) -> Arc<Vec<String>> {
+        Arc::new(origins.iter().map(|o| normalize_origin(o)).collect())
+    }
+
+    /// IDENTITY-20: `Some(the refusal)` when an allow-list is set and the
+    /// request's `Origin` is present and not on it.
+    fn origin_refused(allowed: &[String], headers: &http::HeaderMap) -> Option<String> {
+        if allowed.is_empty() {
+            return None;
+        }
+        let origin = headers.get(http::header::ORIGIN)?;
+        let Ok(origin) = origin.to_str() else {
+            return Some("<not text>".to_string());
+        };
+        let normalized = normalize_origin(origin);
+        (!allowed.iter().any(|a| *a == normalized)).then(|| origin.to_string())
+    }
+
+    fn forbidden(body: &'static str) -> HttpResponse {
+        http::Response::builder()
+            .status(http::StatusCode::FORBIDDEN)
+            .header(http::header::CONTENT_TYPE, "text/plain")
+            .body(jsonrpsee::server::HttpBody::from(body))
+            .expect("static response is valid")
     }
 
     /// Helper: build a 401 response with the substrate-wire-protocol
@@ -181,6 +218,14 @@ pub(crate) mod auth {
 
         fn call(&mut self, mut request: HttpRequest<B>) -> Self::Future {
             let service = self.service.clone();
+
+            // ── Step 0: the origin (IDENTITY-20) ───────────────────────────
+            // Before any credential is read: a page from another origin on
+            // the same host would otherwise carry the person's cookies.
+            if let Some(origin) = origin_refused(&self.allowed_origins, request.headers()) {
+                tracing::warn!(origin = %origin, uri = %request.uri(), "WS upgrade rejected: origin not allowed");
+                return Box::pin(async move { Ok(forbidden("Forbidden: origin not allowed")) });
+            }
 
             // ── Step 1: static api_key admission gate ──────────────────────
             // AUTHZ-BEARER-1: read from the configured api_key header, NOT
@@ -387,6 +432,24 @@ pub mod testing {
             api_key_header,
             session_validator,
             reject_on_session_failure,
+            allowed_origins: Arc::new(Vec::new()),
+        }
+    }
+
+    /// IDENTITY-20: [`combined_auth_middleware`] with an origin allow-list.
+    pub fn combined_auth_middleware_with_origins<S>(
+        service: S,
+        session_validator: Option<Arc<dyn plexus_core::plexus::SessionValidator>>,
+        reject_on_session_failure: bool,
+        allowed_origins: &[String],
+    ) -> super::auth::CombinedAuthMiddleware<S> {
+        super::auth::CombinedAuthMiddleware {
+            service,
+            api_key: None,
+            api_key_header: http::HeaderName::from_static("x-plexus-api-key"),
+            session_validator,
+            reject_on_session_failure,
+            allowed_origins: super::auth::normalized_origins(allowed_origins),
         }
     }
 

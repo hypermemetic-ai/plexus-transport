@@ -83,6 +83,8 @@ pub struct TransportServer<A: Activation> {
     /// the middleware logs and proceeds without `AuthContext`; per-method
     /// `#[from_auth]` checks fire-closed at dispatch instead.
     reject_upgrade_on_auth_failure: bool,
+    /// IDENTITY-20: the origins a browser page may open the socket from.
+    allowed_origins: Vec<String>,
     /// Z2H-6: boot-time registry self-registration configuration.
     registry: RegistryOptions,
 }
@@ -142,6 +144,11 @@ impl<A: Activation> TransportServer<A> {
             // config — the WS-specific default is set in WebSocketConfig::new
             // and we want the global builder method to win.
             ws_config.api_key_header = self.config.api_key_header.clone();
+            // IDENTITY-20: the builder's allow-list, unless the WS config
+            // already names one.
+            if ws_config.allowed_origins.is_empty() {
+                ws_config.allowed_origins = self.allowed_origins.clone();
+            }
             let module = module.expect("RPC module should be created for WebSocket");
             Some(serve_websocket(module, ws_config, self.session_validator.clone(), self.reject_upgrade_on_auth_failure).await?)
         } else {
@@ -348,6 +355,8 @@ pub struct TransportServerBuilder<A: Activation> {
     /// RED-9: opt-in strict-mode for the WS upgrade. Set by
     /// `.reject_upgrade_on_auth_failure()`.
     reject_upgrade_on_auth_failure: bool,
+    /// IDENTITY-20: set by `.with_allowed_origins()`.
+    allowed_origins: Vec<String>,
     /// Z2H-6: registry self-registration overrides.
     registry: RegistryOptions,
 }
@@ -366,6 +375,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             session_validator: None,
             allow_missing_auth: false,
             reject_upgrade_on_auth_failure: false,
+            allowed_origins: Vec::new(),
             registry: RegistryOptions::default(),
         }
     }
@@ -552,6 +562,25 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
+    /// IDENTITY-20: the origins a browser page may open the WebSocket from,
+    /// e.g. `http://127.0.0.1:4456` for an app served there.
+    ///
+    /// Cookies are scoped to a host, not a port, so any page on the same
+    /// host would otherwise open a socket that carries a person's session.
+    /// With an allow-list, an upgrade whose `Origin` header is not on it —
+    /// `null`, from a sandboxed frame, included — is refused with 403 before
+    /// any credential is read. An upgrade with no `Origin` (synapse, a
+    /// server, a CLI: browsers always send one) proceeds. Origins compare
+    /// case-insensitively, without a trailing slash. Empty: no check.
+    pub fn with_allowed_origins<I, S>(mut self, origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_origins = origins.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// RED-4: opt out of the build-time auth-configuration check.
     ///
     /// Normally, [`Self::build`] inspects the registered activation's
@@ -616,6 +645,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             route_fn: self.route_fn,
             session_validator: self.session_validator,
             reject_upgrade_on_auth_failure: self.reject_upgrade_on_auth_failure,
+            allowed_origins: self.allowed_origins,
             registry: self.registry,
         })
     }
