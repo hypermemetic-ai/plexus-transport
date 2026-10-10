@@ -41,6 +41,7 @@ pub mod request;
 #[cfg(feature = "mcp-gateway")]
 pub mod combined;
 pub mod config;
+pub mod protected_resource;
 pub mod registry;
 pub mod server;
 pub mod stdio;
@@ -65,6 +66,8 @@ pub use config::RestHttpConfig;
 
 pub use registry::{RegistryRegistration, DEFAULT_REGISTRY_URL, NO_REGISTRY_ENV, REGISTRY_URL_ENV};
 pub use server::{RegistryOptions, TransportServer, TransportServerBuilder};
+pub use protected_resource::ProtectedResource;
+pub use websocket::UpgradeOptions;
 pub use request::{ValidOrigin, init_allowed_origins};
 
 // Re-export MCP bridge for advanced usage

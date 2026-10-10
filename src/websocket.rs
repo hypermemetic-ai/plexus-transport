@@ -29,6 +29,18 @@
 //! `tracing::warn!` deprecation notice is emitted. The compat shim is OFF
 //! whenever `SessionValidator` is configured, to prevent re-entry of the
 //! header-conflation defect this ticket exists to remove.
+//!
+//! ## The anonymous view and RFC 9728 (AUTH-6)
+//!
+//! [`UpgradeOptions::anonymous_view`]: with a `SessionValidator`, an upgrade
+//! that presents no credential is admitted without an `AuthContext` (the
+//! hub shows it the anonymous view); one that presents a credential the
+//! validator rejects is refused 401 with `error="invalid_token"`. Presented
+//! = an `Authorization` header, or a cookie named in
+//! [`UpgradeOptions::credential_cookies`] with a value.
+//! [`UpgradeOptions::protected_resource`] serves RFC 9728 metadata at
+//! `/.well-known/oauth-protected-resource` on this port, ahead of every
+//! check, and adds `resource_metadata="…"` to each session 401.
 
 use anyhow::Result;
 use jsonrpsee::server::{Server, ServerHandle};
@@ -60,24 +72,72 @@ pub async fn serve_websocket(
     session_validator: Option<Arc<dyn plexus_core::plexus::SessionValidator>>,
     reject_on_session_failure: bool,
 ) -> Result<(ServerHandle, std::net::SocketAddr)> {
+    serve_websocket_with(
+        module,
+        config,
+        session_validator,
+        UpgradeOptions { reject_on_session_failure, ..UpgradeOptions::default() },
+    )
+    .await
+}
+
+/// AUTH-6: how the upgrade treats a caller's credential, beyond the
+/// [`WebSocketConfig`]. `Default` is today's behavior: no strict mode, no
+/// anonymous view, no protected-resource metadata.
+#[derive(Debug, Clone, Default)]
+pub struct UpgradeOptions {
+    /// RED-9: with a `SessionValidator`, refuse (401) an upgrade that yields
+    /// no `AuthContext`, credential or not. Under [`Self::anonymous_view`]
+    /// only a presented credential is refused.
+    pub reject_on_session_failure: bool,
+    /// AUTH-6: with a `SessionValidator`, an upgrade that presents NO
+    /// credential is admitted without an `AuthContext` (the hub's gate shows
+    /// it the anonymous view), and one that presents a credential the
+    /// validator rejects is refused 401. What counts as presented: an
+    /// `Authorization` header (any scheme), or a cookie named in
+    /// [`Self::credential_cookies`] with a non-empty value. Unrelated
+    /// cookies (`theme=dark`) present nothing.
+    pub anonymous_view: bool,
+    /// AUTH-6: the names of the cookies that carry a credential (e.g.
+    /// `access_token`). Only these, under [`Self::anonymous_view`], make a
+    /// `Cookie` header a presentation; the validator still sees the whole
+    /// header, so a valid credential in any cookie still signs the caller
+    /// in. Empty: no cookie is a presentation — a stale cookie falls back
+    /// to the anonymous view rather than a 401.
+    pub credential_cookies: Vec<String>,
+    /// AUTH-6: RFC 9728 metadata, served at its well-known path on this
+    /// port and named in every session 401's `WWW-Authenticate`.
+    pub protected_resource: Option<crate::protected_resource::ProtectedResource>,
+}
+
+/// [`serve_websocket`] with the full [`UpgradeOptions`] (AUTH-6).
+pub async fn serve_websocket_with(
+    module: RpcModule<()>,
+    config: WebSocketConfig,
+    session_validator: Option<Arc<dyn plexus_core::plexus::SessionValidator>>,
+    options: UpgradeOptions,
+) -> Result<(ServerHandle, std::net::SocketAddr)> {
     tracing::info!("Starting WebSocket transport at ws://{}", config.addr);
 
     let has_api_key = config.api_key.is_some();
     let has_session = session_validator.is_some();
     let has_origins = !config.allowed_origins.is_empty();
+    let has_metadata = options.protected_resource.is_some();
 
-    if has_api_key || has_session || has_origins {
+    if has_api_key || has_session || has_origins || has_metadata {
         let api_key = config.api_key.clone();
         let api_key_header = config.api_key_header.clone();
         let allowed_origins = auth::normalized_origins(&config.allowed_origins);
+        let policy: Arc<auth::Policy> = (&options).into();
         let middleware = tower::ServiceBuilder::new().layer_fn(move |service| {
             CombinedAuthMiddleware {
                 service,
                 api_key: api_key.clone(),
                 api_key_header: api_key_header.clone(),
                 session_validator: session_validator.clone(),
-                reject_on_session_failure,
+                reject_on_session_failure: options.reject_on_session_failure,
                 allowed_origins: allowed_origins.clone(),
+                policy: policy.clone(),
             }
         });
         let server = Server::builder()
@@ -146,6 +206,79 @@ pub(crate) mod auth {
         pub(super) reject_on_session_failure: bool,
         /// IDENTITY-20: normalized allowed origins; empty checks nothing.
         pub(super) allowed_origins: Arc<Vec<String>>,
+        /// AUTH-6: the anonymous view, credential cookies, RFC 9728.
+        pub(super) policy: Arc<Policy>,
+    }
+
+    /// AUTH-6: [`super::UpgradeOptions`], prepared once.
+    #[derive(Debug, Default)]
+    pub struct Policy {
+        pub(super) anonymous_view: bool,
+        pub(super) credential_cookies: Vec<String>,
+        pub(super) metadata: Option<crate::protected_resource::Prepared>,
+    }
+
+    impl From<&super::UpgradeOptions> for Arc<Policy> {
+        fn from(o: &super::UpgradeOptions) -> Self {
+            Arc::new(Policy {
+                anonymous_view: o.anonymous_view,
+                credential_cookies: o.credential_cookies.clone(),
+                metadata: o.protected_resource.as_ref().map(Into::into),
+            })
+        }
+    }
+
+    impl Policy {
+        /// AUTH-6: does the upgrade present a credential? An `Authorization`
+        /// header of any scheme does; so does a declared credential cookie
+        /// with a non-empty value. Nothing else — `theme=dark` is not one.
+        fn presents_credential(&self, headers: &http::HeaderMap) -> bool {
+            if headers.contains_key(http::header::AUTHORIZATION) {
+                return true;
+            }
+            headers
+                .get_all(http::header::COOKIE)
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .flat_map(|v| v.split(';'))
+                .filter_map(|pair| pair.split_once('='))
+                .any(|(name, value)| {
+                    !value.trim().is_empty()
+                        && self.credential_cookies.iter().any(|c| c == name.trim())
+                })
+        }
+
+        /// AUTH-6: the metadata document, when this request asks for it.
+        fn metadata_response<B>(&self, request: &HttpRequest<B>) -> Option<HttpResponse> {
+            let m = self.metadata.as_ref()?;
+            let path = request.uri().path().trim_end_matches('/');
+            if request.method() != http::Method::GET || path != m.path {
+                return None;
+            }
+            Some(
+                http::Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                    .header(http::header::CACHE_CONTROL, "max-age=3600")
+                    .body(jsonrpsee::server::HttpBody::from(m.body.clone()))
+                    .expect("static response is valid"),
+            )
+        }
+
+        /// The 401 for a session refusal: `invalid_token` when a credential
+        /// was presented (RFC 6750 §3.1 — none when it was absent), and the
+        /// RFC 9728 `resource_metadata` when configured.
+        fn session_unauthorized(&self, body: &'static str, presented: bool) -> HttpResponse {
+            let mut challenge = String::from("Bearer realm=\"plexus\"");
+            if presented {
+                challenge.push_str(", error=\"invalid_token\"");
+            }
+            if let Some(m) = &self.metadata {
+                challenge.push_str(&format!(", resource_metadata=\"{}\"", m.url));
+            }
+            unauthorized_with(body, &challenge)
+        }
     }
 
     /// IDENTITY-20: an origin as compared: lowercase, no trailing slash.
@@ -183,9 +316,15 @@ pub(crate) mod auth {
     /// Helper: build a 401 response with the substrate-wire-protocol
     /// `WWW-Authenticate: Bearer realm="plexus"` header preserved.
     fn unauthorized(body: &'static str) -> HttpResponse {
+        unauthorized_with(body, "Bearer realm=\"plexus\"")
+    }
+
+    fn unauthorized_with(body: &'static str, challenge: &str) -> HttpResponse {
+        let challenge = http::HeaderValue::from_str(challenge)
+            .unwrap_or_else(|_| http::HeaderValue::from_static("Bearer realm=\"plexus\""));
         http::Response::builder()
             .status(http::StatusCode::UNAUTHORIZED)
-            .header(http::header::WWW_AUTHENTICATE, "Bearer realm=\"plexus\"")
+            .header(http::header::WWW_AUTHENTICATE, challenge)
             .header(http::header::CONTENT_TYPE, "text/plain")
             .body(jsonrpsee::server::HttpBody::from(body))
             .expect("static response is valid")
@@ -218,6 +357,11 @@ pub(crate) mod auth {
 
         fn call(&mut self, mut request: HttpRequest<B>) -> Self::Future {
             let service = self.service.clone();
+
+            // ── AUTH-6: RFC 9728 metadata — public, before anything else ───
+            if let Some(resp) = self.policy.metadata_response(&request) {
+                return Box::pin(async move { Ok(resp) });
+            }
 
             // ── Step 0: the origin (IDENTITY-20) ───────────────────────────
             // Before any credential is read: a page from another origin on
@@ -328,6 +472,10 @@ pub(crate) mod auth {
 
                 let attempted_input =
                     cookie_value.is_some() || bearer_token.is_some();
+                // AUTH-6: under the anonymous view, only a credential the
+                // server recognises as one counts as presented.
+                let policy = self.policy.clone();
+                let presented = policy.presents_credential(request.headers());
 
                 let mut service = service;
                 return Box::pin(async move {
@@ -360,6 +508,28 @@ pub(crate) mod auth {
                             request.extensions_mut().insert(Arc::new(ctx));
                             service.call(request).await.map_err(Into::into)
                         }
+                        None if policy.anonymous_view && presented => {
+                            // AUTH-6: a credential was presented and is bad:
+                            // only its absence is the anonymous view.
+                            tracing::warn!(
+                                uri = %request.uri(),
+                                "WS upgrade rejected: presented credential invalid"
+                            );
+                            Ok(policy.session_unauthorized(
+                                "Unauthorized: session invalid or expired",
+                                true,
+                            ))
+                        }
+                        None if policy.anonymous_view => {
+                            // AUTH-6: no credential — admitted without an
+                            // AuthContext; the hub's gate shows the
+                            // anonymous view.
+                            tracing::debug!(
+                                uri = %request.uri(),
+                                "WS upgrade: no credential presented; admitted anonymous"
+                            );
+                            service.call(request).await.map_err(Into::into)
+                        }
                         None if reject_on_failure => {
                             // RED-9 strict-mode: distinguish "credentials
                             // were supplied but invalid" from "no credentials
@@ -374,7 +544,7 @@ pub(crate) mod auth {
                                 attempted_input,
                                 "WS upgrade rejected: SessionValidator produced no AuthContext"
                             );
-                            Ok(unauthorized(body))
+                            Ok(policy.session_unauthorized(body, attempted_input))
                         }
                         None => {
                             // Backward-compat path: log and proceed; per-method
@@ -433,6 +603,26 @@ pub mod testing {
             session_validator,
             reject_on_session_failure,
             allowed_origins: Arc::new(Vec::new()),
+            policy: Default::default(),
+        }
+    }
+
+    /// AUTH-6: the middleware with full [`super::UpgradeOptions`] and an
+    /// optional origin allow-list.
+    pub fn combined_auth_middleware_with_options<S>(
+        service: S,
+        session_validator: Option<Arc<dyn plexus_core::plexus::SessionValidator>>,
+        allowed_origins: &[String],
+        options: &super::UpgradeOptions,
+    ) -> super::auth::CombinedAuthMiddleware<S> {
+        super::auth::CombinedAuthMiddleware {
+            service,
+            api_key: None,
+            api_key_header: http::HeaderName::from_static("x-plexus-api-key"),
+            session_validator,
+            reject_on_session_failure: options.reject_on_session_failure,
+            allowed_origins: super::auth::normalized_origins(allowed_origins),
+            policy: options.into(),
         }
     }
 
@@ -450,6 +640,7 @@ pub mod testing {
             session_validator,
             reject_on_session_failure,
             allowed_origins: super::auth::normalized_origins(allowed_origins),
+            policy: Default::default(),
         }
     }
 
