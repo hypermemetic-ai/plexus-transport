@@ -17,7 +17,8 @@ use crate::config::McpHttpConfig;
 use crate::mcp::server::serve_mcp_http;
 use crate::registry::{self, RegistryRegistration};
 use crate::stdio::serve_stdio;
-use crate::websocket::serve_websocket;
+use crate::protected_resource::ProtectedResource;
+use crate::websocket::{serve_websocket_with, UpgradeOptions};
 
 /// A function that routes a namespaced method call (e.g., "loopback.permit") to the
 /// correct activation. Used by hub activations to dispatch child calls via `hub.route()`.
@@ -85,6 +86,8 @@ pub struct TransportServer<A: Activation> {
     reject_upgrade_on_auth_failure: bool,
     /// IDENTITY-20: the origins a browser page may open the socket from.
     allowed_origins: Vec<String>,
+    /// AUTH-6: the anonymous view, credential cookies, RFC 9728 metadata.
+    upgrade: UpgradeOptions,
     /// Z2H-6: boot-time registry self-registration configuration.
     registry: RegistryOptions,
 }
@@ -150,7 +153,11 @@ impl<A: Activation> TransportServer<A> {
                 ws_config.allowed_origins = self.allowed_origins.clone();
             }
             let module = module.expect("RPC module should be created for WebSocket");
-            Some(serve_websocket(module, ws_config, self.session_validator.clone(), self.reject_upgrade_on_auth_failure).await?)
+            let upgrade = UpgradeOptions {
+                reject_on_session_failure: self.reject_upgrade_on_auth_failure,
+                ..self.upgrade.clone()
+            };
+            Some(serve_websocket_with(module, ws_config, self.session_validator.clone(), upgrade).await?)
         } else {
             None
         };
@@ -357,6 +364,9 @@ pub struct TransportServerBuilder<A: Activation> {
     reject_upgrade_on_auth_failure: bool,
     /// IDENTITY-20: set by `.with_allowed_origins()`.
     allowed_origins: Vec<String>,
+    /// AUTH-6: set by `.anonymous_view()`, `.credential_cookies()`,
+    /// `.with_protected_resource()`.
+    upgrade: UpgradeOptions,
     /// Z2H-6: registry self-registration overrides.
     registry: RegistryOptions,
 }
@@ -376,6 +386,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             allow_missing_auth: false,
             reject_upgrade_on_auth_failure: false,
             allowed_origins: Vec::new(),
+            upgrade: UpgradeOptions::default(),
             registry: RegistryOptions::default(),
         }
     }
@@ -581,6 +592,57 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
+    /// AUTH-6: admit an upgrade that presents no credential into the
+    /// anonymous view, instead of refusing it.
+    ///
+    /// With a [`SessionValidator`] configured:
+    ///
+    /// - no credential presented → admitted with no `AuthContext`; the hub's
+    ///   gate answers it with the anonymous view (how to sign in);
+    /// - a credential presented that the validator rejects → HTTP 401, with
+    ///   `WWW-Authenticate: Bearer realm="plexus", error="invalid_token"`
+    ///   (and `resource_metadata="…"` under
+    ///   [`Self::with_protected_resource`]);
+    /// - a credential the validator accepts → admitted with its
+    ///   `AuthContext`, as always.
+    ///
+    /// Presented means an `Authorization` header (any scheme) or a cookie
+    /// named by [`Self::credential_cookies`] with a non-empty value; other
+    /// cookies (`theme=dark`) present nothing. This supersedes
+    /// [`Self::reject_upgrade_on_auth_failure`] for the no-credential case
+    /// when both are set. Has no effect without a `SessionValidator`.
+    pub fn anonymous_view(mut self) -> Self {
+        self.upgrade.anonymous_view = true;
+        self
+    }
+
+    /// AUTH-6: the cookies that carry a credential (e.g.
+    /// `["menger_session_4456", "access_token"]`). Under
+    /// [`Self::anonymous_view`], an upgrade whose `Cookie` header holds one
+    /// of these with a value presents a credential, so a bad value is a 401
+    /// rather than the anonymous view. The validator still receives the
+    /// whole `Cookie` header. Names compare exactly (RFC 6265).
+    pub fn credential_cookies<I, S>(mut self, names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.upgrade.credential_cookies = names.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// AUTH-6: publish RFC 9728 protected-resource metadata.
+    ///
+    /// The WebSocket port answers `GET /.well-known/oauth-protected-resource`
+    /// (followed by the resource's path, if it has one — RFC 9728 §3.1) with
+    /// the document as `application/json`, before any origin or credential
+    /// check; and every session 401 at the upgrade carries
+    /// `resource_metadata="<that URL>"` in its `WWW-Authenticate`.
+    pub fn with_protected_resource(mut self, resource: ProtectedResource) -> Self {
+        self.upgrade.protected_resource = Some(resource);
+        self
+    }
+
     /// RED-4: opt out of the build-time auth-configuration check.
     ///
     /// Normally, [`Self::build`] inspects the registered activation's
@@ -646,6 +708,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             session_validator: self.session_validator,
             reject_upgrade_on_auth_failure: self.reject_upgrade_on_auth_failure,
             allowed_origins: self.allowed_origins,
+            upgrade: self.upgrade,
             registry: self.registry,
         })
     }
