@@ -10,7 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
-use crate::config::{StdioConfig, TransportConfig, WebSocketConfig};
+use crate::config::{ConnectionQuotas, StdioConfig, TransportConfig, WebSocketConfig};
 #[cfg(feature = "mcp")]
 use crate::config::McpHttpConfig;
 #[cfg(feature = "mcp")]
@@ -86,6 +86,8 @@ pub struct TransportServer<A: Activation> {
     reject_upgrade_on_auth_failure: bool,
     /// IDENTITY-20: the origins a browser page may open the socket from.
     allowed_origins: Vec<String>,
+    /// AUTH-12: the WebSocket's connection quotas, when not the default.
+    connection_quotas: Option<ConnectionQuotas>,
     /// AUTH-6: the anonymous view, credential cookies, RFC 9728 metadata.
     upgrade: UpgradeOptions,
     /// Z2H-6: boot-time registry self-registration configuration.
@@ -151,6 +153,10 @@ impl<A: Activation> TransportServer<A> {
             // already names one.
             if ws_config.allowed_origins.is_empty() {
                 ws_config.allowed_origins = self.allowed_origins.clone();
+            }
+            // AUTH-12: the builder's quotas, when set.
+            if let Some(q) = self.connection_quotas.clone() {
+                ws_config.quotas = q;
             }
             let module = module.expect("RPC module should be created for WebSocket");
             let upgrade = UpgradeOptions {
@@ -364,6 +370,8 @@ pub struct TransportServerBuilder<A: Activation> {
     reject_upgrade_on_auth_failure: bool,
     /// IDENTITY-20: set by `.with_allowed_origins()`.
     allowed_origins: Vec<String>,
+    /// AUTH-12: set by `.with_connection_quotas()`.
+    connection_quotas: Option<ConnectionQuotas>,
     /// AUTH-6: set by `.anonymous_view()`, `.credential_cookies()`,
     /// `.with_protected_resource()`.
     upgrade: UpgradeOptions,
@@ -386,6 +394,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             allow_missing_auth: false,
             reject_upgrade_on_auth_failure: false,
             allowed_origins: Vec::new(),
+            connection_quotas: None,
             upgrade: UpgradeOptions::default(),
             registry: RegistryOptions::default(),
         }
@@ -592,6 +601,14 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
+    /// AUTH-12: the WebSocket port's connection quotas — in all, per IP,
+    /// per signed-in principal, and for anonymous sockets (see
+    /// [`ConnectionQuotas`]). Default: [`ConnectionQuotas::default`].
+    pub fn with_connection_quotas(mut self, quotas: ConnectionQuotas) -> Self {
+        self.connection_quotas = Some(quotas);
+        self
+    }
+
     /// AUTH-6: admit an upgrade that presents no credential into the
     /// anonymous view, instead of refusing it.
     ///
@@ -708,6 +725,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             session_validator: self.session_validator,
             reject_upgrade_on_auth_failure: self.reject_upgrade_on_auth_failure,
             allowed_origins: self.allowed_origins,
+            connection_quotas: self.connection_quotas,
             upgrade: self.upgrade,
             registry: self.registry,
         })

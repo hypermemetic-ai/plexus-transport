@@ -41,13 +41,183 @@
 //! [`UpgradeOptions::protected_resource`] serves RFC 9728 metadata at
 //! `/.well-known/oauth-protected-resource` on this port, ahead of every
 //! check, and adds `resource_metadata="…"` to each session 401.
+//!
+//! ## A sign-in that ends closes its socket (AUTH-11)
+//!
+//! Each connection has its own stop handle ([`Connection`], in every
+//! request's extensions). When the upgrade signs a caller in, a watcher
+//! asks the validator ([`SessionValidator::alive`]) every
+//! [`LIVENESS_EVERY`] while the socket is open, and closes it once the
+//! session is signed out, revoked or expired — rather than leaving it to
+//! the next call (which the hub's gate refuses anyway).
+//!
+//! [`SessionValidator::alive`]: plexus_core::plexus::SessionValidator::alive
 
 use anyhow::Result;
-use jsonrpsee::server::{Server, ServerHandle};
+use futures::FutureExt;
+use jsonrpsee::server::{serve_with_graceful_shutdown, stop_channel, Server, ServerHandle};
 use jsonrpsee::RpcModule;
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::net::TcpListener;
+use tower::Service;
 
 use crate::config::WebSocketConfig;
+
+/// AUTH-11: how often an open, signed-in socket asks whether its sign-in
+/// still stands.
+pub const LIVENESS_EVERY: Duration = Duration::from_secs(1);
+
+/// One accepted TCP connection, in the extensions of every request it
+/// carries (and so of the WebSocket it upgrades to, for as long as that
+/// lives): who is at the other end, and how to close it.
+#[derive(Debug)]
+pub struct Connection {
+    peer: SocketAddr,
+    handle: ServerHandle,
+}
+
+impl Connection {
+    /// The peer's address, as accepted (no proxy headers).
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+
+    /// Close this connection (its WebSocket, after in-flight calls).
+    pub fn close(&self) {
+        let _ = self.handle.stop();
+    }
+
+    /// Whether it has been closed.
+    pub fn is_closed(&self) -> bool {
+        self.handle.is_stopped()
+    }
+}
+
+impl Drop for Connection {
+    /// Gone from every request: the connection is over; release its stop
+    /// handle's watchers.
+    fn drop(&mut self) {
+        let _ = self.handle.stop();
+    }
+}
+
+/// AUTH-12: the open sockets, counted against [`ConnectionQuotas`].
+///
+/// [`ConnectionQuotas`]: crate::config::ConnectionQuotas
+#[derive(Debug)]
+pub(crate) struct Quotas {
+    limits: crate::config::ConnectionQuotas,
+    open: std::sync::Mutex<Open>,
+    /// Whether a socket can be anyone (a session validator is configured).
+    identities: bool,
+}
+
+#[derive(Debug, Default)]
+struct Open {
+    per_ip: std::collections::HashMap<std::net::IpAddr, u32>,
+    per_principal: std::collections::HashMap<String, u32>,
+    anonymous: u32,
+    anonymous_per_ip: std::collections::HashMap<std::net::IpAddr, u32>,
+}
+
+/// One socket's place in the quotas, given back when the socket ends (it
+/// rides in the socket's request extensions, which the WebSocket keeps for
+/// its life).
+#[derive(Debug)]
+pub(crate) struct QuotaPermit {
+    quotas: Arc<Quotas>,
+    ip: std::net::IpAddr,
+    /// `Some(principal)` signed in, `None` anonymous, and not counted as
+    /// either without a validator.
+    who: Option<Option<String>>,
+}
+
+impl Quotas {
+    pub(crate) fn new(limits: crate::config::ConnectionQuotas, identities: bool) -> Arc<Self> {
+        Arc::new(Self { limits, open: Default::default(), identities })
+    }
+
+    /// A place for a socket from `ip`, signed in as `principal` (or
+    /// anonymous); `Err`: which quota is full.
+    pub(crate) fn admit(self: &Arc<Self>, ip: std::net::IpAddr, principal: Option<String>) -> Result<QuotaPermit, String> {
+        let l = &self.limits;
+        let mut open = self.open.lock().unwrap_or_else(|p| p.into_inner());
+        if open.per_ip.get(&ip).copied().unwrap_or(0) >= l.max_per_ip {
+            return Err(format!("too many connections from {ip} (at most {})", l.max_per_ip));
+        }
+        let who = self.identities.then(|| principal);
+        match &who {
+            Some(Some(p)) => {
+                if open.per_principal.get(p).copied().unwrap_or(0) >= l.max_per_principal {
+                    return Err(format!("too many connections as {p} (at most {})", l.max_per_principal));
+                }
+                *open.per_principal.entry(p.clone()).or_default() += 1;
+            }
+            Some(None) => {
+                if open.anonymous >= l.max_anonymous {
+                    return Err(format!("too many anonymous connections (at most {}): sign in", l.max_anonymous));
+                }
+                if open.anonymous_per_ip.get(&ip).copied().unwrap_or(0) >= l.max_anonymous_per_ip {
+                    return Err(format!("too many anonymous connections from {ip} (at most {}): sign in", l.max_anonymous_per_ip));
+                }
+                open.anonymous += 1;
+                *open.anonymous_per_ip.entry(ip).or_default() += 1;
+            }
+            None => {}
+        }
+        *open.per_ip.entry(ip).or_default() += 1;
+        Ok(QuotaPermit { quotas: self.clone(), ip, who })
+    }
+}
+
+impl Drop for QuotaPermit {
+    fn drop(&mut self) {
+        fn down<K: std::hash::Hash + Eq>(m: &mut std::collections::HashMap<K, u32>, k: K) {
+            if let Some(n) = m.get_mut(&k) {
+                *n -= 1;
+                if *n == 0 {
+                    m.remove(&k);
+                }
+            }
+        }
+        let mut open = self.quotas.open.lock().unwrap_or_else(|p| p.into_inner());
+        down(&mut open.per_ip, self.ip);
+        match self.who.take() {
+            Some(Some(p)) => down(&mut open.per_principal, p),
+            Some(None) => {
+                open.anonymous -= 1;
+                down(&mut open.anonymous_per_ip, self.ip);
+            }
+            None => {}
+        }
+    }
+}
+
+/// AUTH-11: watch a signed-in socket; close it once its sign-in no longer
+/// stands. Holds the connection weakly: when the socket ends on its own,
+/// the watch ends at its next tick.
+fn watch_liveness(
+    conn: std::sync::Weak<Connection>,
+    validator: Arc<dyn plexus_core::plexus::SessionValidator>,
+    ctx: plexus_core::plexus::AuthContext,
+) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(LIVENESS_EVERY).await;
+            let Some(conn) = conn.upgrade() else { return };
+            if conn.is_closed() {
+                return;
+            }
+            if let Err(why) = validator.alive(&ctx) {
+                tracing::info!(user_id = %ctx.user_id, peer = %conn.peer, reason = %why, "closing socket: its sign-in ended");
+                conn.close();
+                return;
+            }
+        }
+    });
+}
 
 /// Serve RPC module over WebSocket
 ///
@@ -119,40 +289,78 @@ pub async fn serve_websocket_with(
 ) -> Result<(ServerHandle, std::net::SocketAddr)> {
     tracing::info!("Starting WebSocket transport at ws://{}", config.addr);
 
-    let has_api_key = config.api_key.is_some();
-    let has_session = session_validator.is_some();
-    let has_origins = !config.allowed_origins.is_empty();
-    let has_metadata = options.protected_resource.is_some();
+    // The middleware is always in: with nothing configured it passes every
+    // request through, as the bare server did.
+    let api_key = config.api_key.clone();
+    let api_key_header = config.api_key_header.clone();
+    let allowed_origins = auth::normalized_origins(&config.allowed_origins);
+    let policy: Arc<auth::Policy> = (&options).into();
+    // AUTH-12: per-IP, per-principal and anonymous quotas, and jsonrpsee's
+    // own ceiling set explicitly rather than its default 100.
+    let quotas = Quotas::new(config.quotas.clone(), session_validator.is_some());
+    let middleware = tower::ServiceBuilder::new().layer_fn(move |service| CombinedAuthMiddleware {
+        service,
+        api_key: api_key.clone(),
+        api_key_header: api_key_header.clone(),
+        session_validator: session_validator.clone(),
+        reject_on_session_failure: options.reject_on_session_failure,
+        allowed_origins: allowed_origins.clone(),
+        policy: policy.clone(),
+        quotas: Some(quotas.clone()),
+    });
+    let svc_builder = Server::builder()
+        .set_http_middleware(middleware)
+        .to_service_builder()
+        .max_connections(config.quotas.max_connections);
+    let methods = jsonrpsee::Methods::from(module);
 
-    if has_api_key || has_session || has_origins || has_metadata {
-        let api_key = config.api_key.clone();
-        let api_key_header = config.api_key_header.clone();
-        let allowed_origins = auth::normalized_origins(&config.allowed_origins);
-        let policy: Arc<auth::Policy> = (&options).into();
-        let middleware = tower::ServiceBuilder::new().layer_fn(move |service| {
-            CombinedAuthMiddleware {
-                service,
-                api_key: api_key.clone(),
-                api_key_header: api_key_header.clone(),
-                session_validator: session_validator.clone(),
-                reject_on_session_failure: options.reject_on_session_failure,
-                allowed_origins: allowed_origins.clone(),
-                policy: policy.clone(),
-            }
-        });
-        let server = Server::builder()
-            .set_http_middleware(middleware)
-            .build(config.addr)
-            .await?;
-        let local_addr = server.local_addr()?;
-        let handle = server.start(module);
-        return Ok((handle, local_addr));
-    }
+    let listener = TcpListener::bind(config.addr).await?;
+    let local_addr = listener.local_addr()?;
+    let (stop_handle, server_handle) = stop_channel();
 
-    let server = Server::builder().build(config.addr).await?;
-    let local_addr = server.local_addr()?;
-    let handle = server.start(module);
-    Ok((handle, local_addr))
+    // AUTH-11: jsonrpsee's low-level accept loop, so each connection gets
+    // its own stop handle (a socket can be closed alone) and its peer
+    // address rides into the middleware.
+    tokio::spawn(async move {
+        loop {
+            let (sock, peer) = tokio::select! {
+                res = listener.accept() => match res {
+                    Ok(x) => x,
+                    Err(e) => {
+                        tracing::error!("websocket accept: {e}");
+                        continue;
+                    }
+                },
+                _ = stop_handle.clone().shutdown() => break,
+            };
+            let (conn_stop, conn_handle) = stop_channel();
+            // The server's stop closes every connection.
+            let server_stop = stop_handle.clone();
+            let forward = conn_handle.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = server_stop.shutdown() => { let _ = forward.stop(); }
+                    _ = forward.clone().stopped() => {}
+                }
+            });
+            let conn = Arc::new(Connection { peer, handle: conn_handle });
+            let svc_builder = svc_builder.clone();
+            let methods = methods.clone();
+            let conn_stop_for_serve = conn_stop.clone();
+            let svc = tower::service_fn(move |mut req: http::Request<hyper::body::Incoming>| {
+                req.extensions_mut().insert(conn.clone());
+                let mut svc = svc_builder.clone().build(methods.clone(), conn_stop.clone());
+                async move { svc.call(req).await.map_err(anyhow::Error::from_boxed) }.boxed()
+            });
+            tokio::spawn(async move {
+                if let Err(e) = serve_with_graceful_shutdown(sock, svc, conn_stop_for_serve.shutdown()).await {
+                    tracing::debug!("websocket connection closed: {e}");
+                }
+            });
+        }
+    });
+
+    Ok((server_handle, local_addr))
 }
 
 // ---------------------------------------------------------------------------
@@ -208,6 +416,42 @@ pub(crate) mod auth {
         pub(super) allowed_origins: Arc<Vec<String>>,
         /// AUTH-6: the anonymous view, credential cookies, RFC 9728.
         pub(super) policy: Arc<Policy>,
+        /// AUTH-12: the connection quotas; `None` counts nothing (the
+        /// middleware driven alone, without the accept loop).
+        pub(super) quotas: Option<Arc<super::Quotas>>,
+    }
+
+    /// AUTH-12: a WebSocket upgrade takes its place in the quotas — as
+    /// `principal`, or anonymous — and keeps it in its extensions for the
+    /// socket's life; `Err`: the 429 to answer. Anything but an upgrade,
+    /// or a request the accept loop did not stamp, takes none.
+    fn take_quota<B>(
+        quotas: &Option<Arc<super::Quotas>>,
+        request: &mut HttpRequest<B>,
+        principal: Option<String>,
+    ) -> Result<(), HttpResponse> {
+        let Some(quotas) = quotas else { return Ok(()) };
+        if !jsonrpsee::server::ws::is_upgrade_request(request) {
+            return Ok(());
+        }
+        let Some(ip) = request.extensions().get::<Arc<super::Connection>>().map(|c| c.peer().ip()) else {
+            return Ok(());
+        };
+        match quotas.admit(ip, principal) {
+            Ok(permit) => {
+                request.extensions_mut().insert(Arc::new(permit));
+                Ok(())
+            }
+            Err(why) => {
+                tracing::warn!(%ip, reason = %why, "WS upgrade refused: connection quota");
+                Err(http::Response::builder()
+                    .status(http::StatusCode::TOO_MANY_REQUESTS)
+                    .header(http::header::RETRY_AFTER, "5")
+                    .header(http::header::CONTENT_TYPE, "text/plain")
+                    .body(jsonrpsee::server::HttpBody::from(format!("Too many connections: {why}")))
+                    .expect("static response is valid"))
+            }
+        }
     }
 
     /// AUTH-6: [`super::UpgradeOptions`], prepared once.
@@ -478,6 +722,7 @@ pub(crate) mod auth {
                 let presented = policy.presents_credential(request.headers());
 
                 let mut service = service;
+                let quotas = self.quotas.clone();
                 return Box::pin(async move {
                     let mut auth_ctx: Option<plexus_core::plexus::AuthContext> = None;
 
@@ -505,6 +750,18 @@ pub(crate) mod auth {
                                 user_id = %ctx.user_id,
                                 "WS upgrade: SessionValidator produced AuthContext"
                             );
+                            // AUTH-12: within its principal's quota.
+                            let principal = ctx.principal().map(|p| p.to_string()).unwrap_or_else(|| ctx.user_id.clone());
+                            if let Err(refused) = take_quota(&quotas, &mut request, Some(principal)) {
+                                return Ok(refused);
+                            }
+                            // AUTH-11: a socket signed in is watched, and
+                            // closed once its sign-in ends.
+                            if jsonrpsee::server::ws::is_upgrade_request(&request) {
+                                if let Some(conn) = request.extensions().get::<Arc<super::Connection>>() {
+                                    super::watch_liveness(Arc::downgrade(conn), validator.clone(), ctx.clone());
+                                }
+                            }
                             request.extensions_mut().insert(Arc::new(ctx));
                             service.call(request).await.map_err(Into::into)
                         }
@@ -528,6 +785,10 @@ pub(crate) mod auth {
                                 uri = %request.uri(),
                                 "WS upgrade: no credential presented; admitted anonymous"
                             );
+                            // AUTH-12: within the anonymous quotas.
+                            if let Err(refused) = take_quota(&quotas, &mut request, None) {
+                                return Ok(refused);
+                            }
                             service.call(request).await.map_err(Into::into)
                         }
                         None if reject_on_failure => {
@@ -562,6 +823,10 @@ pub(crate) mod auth {
                                      proceeding without auth"
                                 );
                             }
+                            // AUTH-12: within the anonymous quotas.
+                            if let Err(refused) = take_quota(&quotas, &mut request, None) {
+                                return Ok(refused);
+                            }
                             service.call(request).await.map_err(Into::into)
                         }
                     }
@@ -569,7 +834,11 @@ pub(crate) mod auth {
             }
 
             // No SessionValidator → either api_key gate already passed (or
-            // nothing was configured). Pass through.
+            // nothing was configured). Pass through — within the per-IP
+            // quota (AUTH-12; no socket is anyone here).
+            if let Err(refused) = take_quota(&self.quotas, &mut request, None) {
+                return Box::pin(async move { Ok(refused) });
+            }
             let mut service = service;
             Box::pin(async move { service.call(request).await.map_err(Into::into) })
         }
@@ -604,6 +873,7 @@ pub mod testing {
             reject_on_session_failure,
             allowed_origins: Arc::new(Vec::new()),
             policy: Default::default(),
+            quotas: None,
         }
     }
 
@@ -623,6 +893,7 @@ pub mod testing {
             reject_on_session_failure: options.reject_on_session_failure,
             allowed_origins: super::auth::normalized_origins(allowed_origins),
             policy: options.into(),
+            quotas: None,
         }
     }
 
@@ -641,6 +912,7 @@ pub mod testing {
             reject_on_session_failure,
             allowed_origins: super::auth::normalized_origins(allowed_origins),
             policy: Default::default(),
+            quotas: None,
         }
     }
 
