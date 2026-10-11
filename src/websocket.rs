@@ -327,12 +327,20 @@ pub async fn serve_websocket_with(
                 res = listener.accept() => match res {
                     Ok(x) => x,
                     Err(e) => {
+                        // Out of descriptors and the like: pause rather
+                        // than spin on the same error.
                         tracing::error!("websocket accept: {e}");
+                        tokio::time::sleep(Duration::from_millis(50)).await;
                         continue;
                     }
                 },
                 _ = stop_handle.clone().shutdown() => break,
             };
+            // As jsonrpsee's own server does: without it every small reply
+            // waits on Nagle and the peer's delayed ACK (~40 ms a call).
+            if let Err(e) = sock.set_nodelay(true) {
+                tracing::debug!("websocket set_nodelay: {e}");
+            }
             let (conn_stop, conn_handle) = stop_channel();
             // The server's stop closes every connection.
             let server_stop = stop_handle.clone();
