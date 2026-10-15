@@ -41,6 +41,7 @@ pub mod request;
 #[cfg(feature = "mcp-gateway")]
 pub mod combined;
 pub mod config;
+pub mod host;
 pub mod protected_resource;
 pub mod registry;
 pub mod server;

@@ -86,6 +86,8 @@ pub struct TransportServer<A: Activation> {
     reject_upgrade_on_auth_failure: bool,
     /// IDENTITY-20: the origins a browser page may open the socket from.
     allowed_origins: Vec<String>,
+    /// ACCESS-25: the `Host` values the WebSocket answers to.
+    allowed_hosts: Vec<String>,
     /// AUTH-12: the WebSocket's connection quotas, when not the default.
     connection_quotas: Option<ConnectionQuotas>,
     /// AUTH-6: the anonymous view, credential cookies, RFC 9728 metadata.
@@ -153,6 +155,11 @@ impl<A: Activation> TransportServer<A> {
             // already names one.
             if ws_config.allowed_origins.is_empty() {
                 ws_config.allowed_origins = self.allowed_origins.clone();
+            }
+            // ACCESS-25: the builder's host list, unless the WS config
+            // already names one.
+            if ws_config.allowed_hosts.is_empty() {
+                ws_config.allowed_hosts = self.allowed_hosts.clone();
             }
             // AUTH-12: the builder's quotas, when set.
             if let Some(q) = self.connection_quotas.clone() {
@@ -370,6 +377,8 @@ pub struct TransportServerBuilder<A: Activation> {
     reject_upgrade_on_auth_failure: bool,
     /// IDENTITY-20: set by `.with_allowed_origins()`.
     allowed_origins: Vec<String>,
+    /// ACCESS-25: set by `.with_allowed_hosts()`.
+    allowed_hosts: Vec<String>,
     /// AUTH-12: set by `.with_connection_quotas()`.
     connection_quotas: Option<ConnectionQuotas>,
     /// AUTH-6: set by `.anonymous_view()`, `.credential_cookies()`,
@@ -394,6 +403,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             allow_missing_auth: false,
             reject_upgrade_on_auth_failure: false,
             allowed_origins: Vec::new(),
+            allowed_hosts: Vec::new(),
             connection_quotas: None,
             upgrade: UpgradeOptions::default(),
             registry: RegistryOptions::default(),
@@ -601,6 +611,23 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
+    /// ACCESS-25: the `Host` values the WebSocket answers to, e.g.
+    /// [`crate::host::loopback_hosts`]`(4455)` — a page that rebinds its
+    /// own name to this address (DNS rebinding) is refused 421 before
+    /// anything else is read, the RFC 9728 metadata included. Entries are
+    /// `host:port`, or `host` for a default port; they compare
+    /// case-insensitively and exactly. Empty (the default): no check. The
+    /// REST bridge's list is [`crate::config::RestHttpConfig::with_allowed_hosts`],
+    /// since its port differs.
+    pub fn with_allowed_hosts<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_hosts = hosts.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// AUTH-12: the WebSocket port's connection quotas — in all, per IP,
     /// per signed-in principal, and for anonymous sockets (see
     /// [`ConnectionQuotas`]). Default: [`ConnectionQuotas::default`].
@@ -725,6 +752,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             session_validator: self.session_validator,
             reject_upgrade_on_auth_failure: self.reject_upgrade_on_auth_failure,
             allowed_origins: self.allowed_origins,
+            allowed_hosts: self.allowed_hosts,
             connection_quotas: self.connection_quotas,
             upgrade: self.upgrade,
             registry: self.registry,

@@ -53,6 +53,20 @@ async fn auth_middleware(
     next.run(request).await
 }
 
+/// ACCESS-25: a request naming a host not on the list is refused 421
+/// before anything routes it (DNS rebinding). An empty list passes all.
+async fn host_middleware(
+    axum::extract::State(hosts): axum::extract::State<Arc<Vec<String>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if let Some(host) = crate::host::refused(&hosts, &request) {
+        tracing::warn!(host = %host, uri = %request.uri(), "REST HTTP refused: host not allowed");
+        return (StatusCode::MISDIRECTED_REQUEST, crate::host::REFUSAL).into_response();
+    }
+    next.run(request).await
+}
+
 /// Middleware to log all incoming HTTP requests
 async fn log_request_middleware(request: Request, next: Next) -> Response {
     let method = request.method().clone();
@@ -174,7 +188,9 @@ pub async fn serve_rest_http<A: Activation>(
         .route("/debug", any(debug_handler))
         .fallback(fallback_handler)
         .layer(middleware::from_fn(log_request_middleware))
-        .layer(middleware::from_fn_with_state(api_key.clone(), auth_middleware));
+        .layer(middleware::from_fn_with_state(api_key.clone(), auth_middleware))
+        // ACCESS-25: outermost — the host is checked before the key.
+        .layer(middleware::from_fn_with_state(crate::host::normalized(&config.allowed_hosts), host_middleware));
 
     // Start server
     let listener = tokio::net::TcpListener::bind(config.addr).await?;

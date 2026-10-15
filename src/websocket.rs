@@ -294,6 +294,7 @@ pub async fn serve_websocket_with(
     let api_key = config.api_key.clone();
     let api_key_header = config.api_key_header.clone();
     let allowed_origins = auth::normalized_origins(&config.allowed_origins);
+    let allowed_hosts = crate::host::normalized(&config.allowed_hosts);
     let policy: Arc<auth::Policy> = (&options).into();
     // AUTH-12: per-IP, per-principal and anonymous quotas, and jsonrpsee's
     // own ceiling set explicitly rather than its default 100.
@@ -305,6 +306,7 @@ pub async fn serve_websocket_with(
         session_validator: session_validator.clone(),
         reject_on_session_failure: options.reject_on_session_failure,
         allowed_origins: allowed_origins.clone(),
+        allowed_hosts: allowed_hosts.clone(),
         policy: policy.clone(),
         quotas: Some(quotas.clone()),
     });
@@ -422,6 +424,8 @@ pub(crate) mod auth {
         pub(super) reject_on_session_failure: bool,
         /// IDENTITY-20: normalized allowed origins; empty checks nothing.
         pub(super) allowed_origins: Arc<Vec<String>>,
+        /// ACCESS-25: normalized allowed `Host` values; empty checks nothing.
+        pub(super) allowed_hosts: Arc<Vec<String>>,
         /// AUTH-6: the anonymous view, credential cookies, RFC 9728.
         pub(super) policy: Arc<Policy>,
         /// AUTH-12: the connection quotas; `None` counts nothing (the
@@ -557,6 +561,15 @@ pub(crate) mod auth {
         (!allowed.iter().any(|a| *a == normalized)).then(|| origin.to_string())
     }
 
+    /// ACCESS-25: the refusal of a host not on the list.
+    fn misdirected() -> HttpResponse {
+        http::Response::builder()
+            .status(http::StatusCode::MISDIRECTED_REQUEST)
+            .header(http::header::CONTENT_TYPE, "text/plain")
+            .body(jsonrpsee::server::HttpBody::from(crate::host::REFUSAL))
+            .expect("static response is valid")
+    }
+
     fn forbidden(body: &'static str) -> HttpResponse {
         http::Response::builder()
             .status(http::StatusCode::FORBIDDEN)
@@ -609,6 +622,14 @@ pub(crate) mod auth {
 
         fn call(&mut self, mut request: HttpRequest<B>) -> Self::Future {
             let service = self.service.clone();
+
+            // ── ACCESS-25: the host, before anything is answered ──────────
+            // A page that rebinds its own name to this address names its
+            // own host: it gets nothing, not even the metadata.
+            if let Some(host) = crate::host::refused(&self.allowed_hosts, &request) {
+                tracing::warn!(host = %host, uri = %request.uri(), "WS request refused: host not allowed");
+                return Box::pin(async move { Ok(misdirected()) });
+            }
 
             // ── AUTH-6: RFC 9728 metadata — public, before anything else ───
             if let Some(resp) = self.policy.metadata_response(&request) {
@@ -880,6 +901,7 @@ pub mod testing {
             session_validator,
             reject_on_session_failure,
             allowed_origins: Arc::new(Vec::new()),
+            allowed_hosts: Arc::new(Vec::new()),
             policy: Default::default(),
             quotas: None,
         }
@@ -900,6 +922,7 @@ pub mod testing {
             session_validator,
             reject_on_session_failure: options.reject_on_session_failure,
             allowed_origins: super::auth::normalized_origins(allowed_origins),
+            allowed_hosts: Arc::new(Vec::new()),
             policy: options.into(),
             quotas: None,
         }
@@ -919,6 +942,7 @@ pub mod testing {
             session_validator,
             reject_on_session_failure,
             allowed_origins: super::auth::normalized_origins(allowed_origins),
+            allowed_hosts: Arc::new(Vec::new()),
             policy: Default::default(),
             quotas: None,
         }

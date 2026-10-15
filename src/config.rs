@@ -62,6 +62,10 @@ pub struct WebSocketConfig {
     /// anything else — `null` included — is refused 403 before any
     /// credential is read; one with no `Origin` (a CLI, a server) proceeds.
     pub allowed_origins: Vec<String>,
+    /// ACCESS-25: the `Host` values the upgrade answers to (see
+    /// [`crate::host`]). Empty (the default) checks nothing; otherwise any
+    /// other host is refused 421 before anything else is read.
+    pub allowed_hosts: Vec<String>,
     /// AUTH-12: how many sockets may be open, in all and per caller.
     pub quotas: ConnectionQuotas,
 }
@@ -106,8 +110,20 @@ impl WebSocketConfig {
             api_key: None,
             api_key_header: http::HeaderName::from_static("x-plexus-api-key"),
             allowed_origins: Vec::new(),
+            allowed_hosts: Vec::new(),
             quotas: ConnectionQuotas::default(),
         }
+    }
+
+    /// ACCESS-25: the `Host` values this listener answers to; any other is
+    /// refused 421. [`crate::host::loopback_hosts`] gives a loopback port's.
+    pub fn with_allowed_hosts<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_hosts = hosts.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Override the header name carrying the api_key.
@@ -202,6 +218,10 @@ pub struct RestHttpConfig {
     pub addr: SocketAddr,
     pub server_name: String,
     pub server_version: String,
+    /// ACCESS-25: the `Host` values the bridge answers to (see
+    /// [`crate::host`]). Empty (the default) checks nothing; otherwise any
+    /// other host is refused 421 before routing.
+    pub allowed_hosts: Vec<String>,
 }
 
 impl RestHttpConfig {
@@ -212,7 +232,19 @@ impl RestHttpConfig {
                 .expect("Valid socket address"),
             server_name: "plexus-rest".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
+            allowed_hosts: Vec::new(),
         }
+    }
+
+    /// ACCESS-25: the `Host` values this listener answers to; any other is
+    /// refused 421. [`crate::host::loopback_hosts`] gives a loopback port's.
+    pub fn with_allowed_hosts<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_hosts = hosts.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Override the server name
