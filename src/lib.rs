@@ -43,6 +43,7 @@ pub mod combined;
 pub mod config;
 pub mod host;
 pub mod protected_resource;
+pub mod proxy;
 pub mod registry;
 pub mod server;
 pub mod stdio;
@@ -68,6 +69,7 @@ pub use config::RestHttpConfig;
 pub use registry::{RegistryRegistration, DEFAULT_REGISTRY_URL, NO_REGISTRY_ENV, REGISTRY_URL_ENV};
 pub use server::{RegistryOptions, TransportServer, TransportServerBuilder};
 pub use protected_resource::ProtectedResource;
+pub use proxy::{init_trusted_proxies, ForwardedClient, IpNet, TrustedProxies};
 pub use websocket::UpgradeOptions;
 pub use request::{ValidOrigin, init_allowed_origins};
 

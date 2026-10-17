@@ -250,6 +250,13 @@ Enable MCP HTTP transport with default configuration.
 #### `.with_mcp_http_config(config: McpHttpConfig) -> Self`
 Enable MCP HTTP transport with custom configuration.
 
+#### `.bind(addr: impl Into<IpAddr>) -> Self`
+TRANSPORT-7: the IP every listener binds (default `127.0.0.1`), e.g.
+`0.0.0.0` in a container behind a proxy. Ports stay as given.
+
+#### `.trusted_proxies(nets: impl IntoIterator<Item = IpNet>) -> Self` / `.with_trusted_proxies(TrustedProxies) -> Self`
+TRANSPORT-7: the proxies in front. See "Behind a proxy" below.
+
 #### `.build() -> Result<TransportServer<A>>`
 Build the configured transport server.
 
@@ -260,6 +267,32 @@ Start all configured transports and block until shutdown.
 
 - If stdio is configured: blocks on stdin
 - Otherwise: starts WebSocket/MCP servers and waits for completion
+
+## Behind a proxy
+
+TRANSPORT-7. Behind an edge every visitor's TCP peer is the edge, so the
+connection quotas (AUTH-12) would count every visitor as one. Name the edge:
+
+```rust
+TransportServer::builder(hub, converter)
+    .with_websocket(4455)
+    .bind([0, 0, 0, 0])
+    .with_trusted_proxies(TrustedProxies::parse(["172.30.0.2/32"])?) // or ["none"]
+```
+
+- `X-Forwarded-For` / `X-Forwarded-Proto` are believed **only** from a
+  trusted proxy; from any other peer they are ignored (and logged once).
+- The client is the rightmost `X-Forwarded-For` hop that is not itself a
+  trusted proxy — a client cannot prepend its way out of its quota.
+- The connection quotas, per IP and anonymous per IP, count that client.
+  Every request carries its `ForwardedClient { ip, peer, via_proxy, secure }`
+  in its extensions (so every call's `ext`).
+- Secure is the trusted proxy's `X-Forwarded-Proto: https|wss`. With no proxy
+  in front, a loopback peer is secure; behind a proxy, loopback proves
+  nothing.
+- `ClientIp` and `SecureTransport` read the same set (`init_trusted_proxies`,
+  which `serve()` calls); `init_trust_proxy_headers` (any peer) is
+  deprecated.
 
 ## Examples
 

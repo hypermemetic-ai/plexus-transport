@@ -12,6 +12,7 @@ pub mod origin;
 pub mod raw;
 pub mod transport;
 
+#[allow(deprecated)]
 pub use client_ip::{ClientIp, init_trust_proxy_headers};
 pub use derive::PlexusRequest;
 pub use origin::{ValidOrigin, init_allowed_origins};

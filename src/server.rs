@@ -6,6 +6,7 @@ use jsonrpsee::server::ServerHandle;
 use jsonrpsee::RpcModule;
 use serde_json::Value;
 use std::future::Future;
+use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
@@ -18,6 +19,7 @@ use crate::mcp::server::serve_mcp_http;
 use crate::registry::{self, RegistryRegistration};
 use crate::stdio::serve_stdio;
 use crate::protected_resource::ProtectedResource;
+use crate::proxy::{IpNet, TrustedProxies};
 use crate::websocket::{serve_websocket_with, UpgradeOptions};
 
 /// A function that routes a namespaced method call (e.g., "loopback.permit") to the
@@ -90,6 +92,8 @@ pub struct TransportServer<A: Activation> {
     allowed_hosts: Vec<String>,
     /// AUTH-12: the WebSocket's connection quotas, when not the default.
     connection_quotas: Option<ConnectionQuotas>,
+    /// TRANSPORT-7: the proxies in front, when named.
+    trusted_proxies: Option<TrustedProxies>,
     /// AUTH-6: the anonymous view, credential cookies, RFC 9728 metadata.
     upgrade: UpgradeOptions,
     /// Z2H-6: boot-time registry self-registration configuration.
@@ -134,6 +138,12 @@ impl<A: Activation> TransportServer<A> {
             None
         };
 
+        // TRANSPORT-7: ClientIp and SecureTransport believe the same
+        // proxies the upgrade does.
+        if let Some(p) = self.trusted_proxies.clone() {
+            crate::proxy::init_trusted_proxies(p);
+        }
+
         // Start stdio transport (blocking)
         if let Some(stdio_config) = self.config.stdio {
             let module = module.expect("RPC module should be created for stdio");
@@ -164,6 +174,10 @@ impl<A: Activation> TransportServer<A> {
             // AUTH-12: the builder's quotas, when set.
             if let Some(q) = self.connection_quotas.clone() {
                 ws_config.quotas = q;
+            }
+            // TRANSPORT-7: the builder's proxies, when named.
+            if let Some(p) = self.trusted_proxies.clone() {
+                ws_config.trusted_proxies = p;
             }
             let module = module.expect("RPC module should be created for WebSocket");
             let upgrade = UpgradeOptions {
@@ -381,6 +395,10 @@ pub struct TransportServerBuilder<A: Activation> {
     allowed_hosts: Vec<String>,
     /// AUTH-12: set by `.with_connection_quotas()`.
     connection_quotas: Option<ConnectionQuotas>,
+    /// TRANSPORT-7: set by `.trusted_proxies()` / `.with_trusted_proxies()`.
+    trusted_proxies: Option<TrustedProxies>,
+    /// TRANSPORT-7: set by `.bind()`.
+    bind: Option<IpAddr>,
     /// AUTH-6: set by `.anonymous_view()`, `.credential_cookies()`,
     /// `.with_protected_resource()`.
     upgrade: UpgradeOptions,
@@ -405,6 +423,8 @@ impl<A: Activation> TransportServerBuilder<A> {
             allowed_origins: Vec::new(),
             allowed_hosts: Vec::new(),
             connection_quotas: None,
+            trusted_proxies: None,
+            bind: None,
             upgrade: UpgradeOptions::default(),
             registry: RegistryOptions::default(),
         }
@@ -636,6 +656,39 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
+    /// TRANSPORT-7: the address every listener of this builder binds —
+    /// the WebSocket, the REST bridge and MCP HTTP keep their ports and take
+    /// this IP (`0.0.0.0` / `::` in a container behind a proxy). Default:
+    /// `127.0.0.1`. The registry is then told this address, unless it is
+    /// unspecified or loopback (`127.0.0.1`) or
+    /// [`Self::with_registry_host`] says otherwise.
+    pub fn bind(mut self, addr: impl Into<IpAddr>) -> Self {
+        self.bind = Some(addr.into());
+        self
+    }
+
+    /// TRANSPORT-7: the proxies in front of the WebSocket, as networks
+    /// (`172.30.0.2/32`). `X-Forwarded-For` / `X-Forwarded-Proto` are
+    /// believed only from these peers — the client is the rightmost
+    /// forwarded hop that is not itself one — and never from any other:
+    /// the connection quotas count that client, every request carries its
+    /// [`ForwardedClient`](crate::proxy::ForwardedClient), and
+    /// [`ClientIp`](crate::request::ClientIp) /
+    /// [`SecureTransport`](crate::request::SecureTransport) read the same
+    /// set. Behind a proxy, loopback is not assumed secure. See
+    /// [`crate::proxy`].
+    pub fn trusted_proxies<I: IntoIterator<Item = IpNet>>(self, nets: I) -> Self {
+        self.with_trusted_proxies(TrustedProxies::new(nets))
+    }
+
+    /// TRANSPORT-7: [`Self::trusted_proxies`] as a [`TrustedProxies`] —
+    /// e.g. [`TrustedProxies::parse`] of a `--trusted-proxy` flag, or
+    /// [`TrustedProxies::direct`] (`none`: no proxy in front).
+    pub fn with_trusted_proxies(mut self, proxies: TrustedProxies) -> Self {
+        self.trusted_proxies = Some(proxies);
+        self
+    }
+
     /// AUTH-6: admit an upgrade that presents no credential into the
     /// anonymous view, instead of refusing it.
     ///
@@ -743,9 +796,28 @@ impl<A: Activation> TransportServerBuilder<A> {
             }
         }
 
+        // TRANSPORT-7: one bind address for every listener.
+        let mut config = self.config;
+        let mut registry = self.registry;
+        if let Some(ip) = self.bind {
+            if let Some(ws) = config.websocket.as_mut() {
+                ws.addr.set_ip(ip);
+            }
+            if let Some(mcp) = config.mcp_http.as_mut() {
+                mcp.addr.set_ip(ip);
+            }
+            #[cfg(feature = "http-gateway")]
+            if let Some(rest) = config.rest_http.as_mut() {
+                rest.addr.set_ip(ip);
+            }
+            if registry.host.is_none() && !ip.is_unspecified() && !ip.is_loopback() {
+                registry.host = Some(ip.to_string());
+            }
+        }
+
         Ok(TransportServer {
             activation: self.activation,
-            config: self.config,
+            config,
             rpc_converter: self.rpc_converter,
             flat_schemas: self.flat_schemas,
             route_fn: self.route_fn,
@@ -754,8 +826,9 @@ impl<A: Activation> TransportServerBuilder<A> {
             allowed_origins: self.allowed_origins,
             allowed_hosts: self.allowed_hosts,
             connection_quotas: self.connection_quotas,
+            trusted_proxies: self.trusted_proxies,
             upgrade: self.upgrade,
-            registry: self.registry,
+            registry,
         })
     }
 }
