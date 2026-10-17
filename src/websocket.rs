@@ -52,6 +52,16 @@
 //! the next call (which the hub's gate refuses anyway).
 //!
 //! [`SessionValidator::alive`]: plexus_core::plexus::SessionValidator::alive
+//!
+//! ## Behind a proxy (TRANSPORT-7)
+//!
+//! [`WebSocketConfig::trusted_proxies`] names the proxies in front. Every
+//! request the accept loop carries is resolved to a
+//! [`ForwardedClient`](crate::proxy::ForwardedClient) — the address a
+//! trusted proxy forwarded (`X-Forwarded-For`, rightmost untrusted hop), or
+//! the peer; secure on the proxy's `X-Forwarded-Proto` — which rides in the
+//! request's extensions (so in every call's), and the connection quotas
+//! count by its address. A forwarded header from any other peer is ignored.
 
 use anyhow::Result;
 use futures::FutureExt;
@@ -79,7 +89,9 @@ pub struct Connection {
 }
 
 impl Connection {
-    /// The peer's address, as accepted (no proxy headers).
+    /// The peer's address, as accepted (no proxy headers; the client a
+    /// trusted proxy forwards is the request's
+    /// [`ForwardedClient`](crate::proxy::ForwardedClient)).
     pub fn peer(&self) -> SocketAddr {
         self.peer
     }
@@ -288,6 +300,9 @@ pub async fn serve_websocket_with(
     options: UpgradeOptions,
 ) -> Result<(ServerHandle, std::net::SocketAddr)> {
     tracing::info!("Starting WebSocket transport at ws://{}", config.addr);
+    if config.trusted_proxies.behind_proxy() {
+        tracing::info!(proxies = ?config.trusted_proxies.nets, "WebSocket: forwarded headers believed from these proxies only");
+    }
 
     // The middleware is always in: with nothing configured it passes every
     // request through, as the bare server did.
@@ -299,6 +314,8 @@ pub async fn serve_websocket_with(
     // AUTH-12: per-IP, per-principal and anonymous quotas, and jsonrpsee's
     // own ceiling set explicitly rather than its default 100.
     let quotas = Quotas::new(config.quotas.clone(), session_validator.is_some());
+    // TRANSPORT-7: the proxies whose forwarded headers are believed.
+    let proxies = Arc::new(config.trusted_proxies.clone());
     let middleware = tower::ServiceBuilder::new().layer_fn(move |service| CombinedAuthMiddleware {
         service,
         api_key: api_key.clone(),
@@ -309,6 +326,7 @@ pub async fn serve_websocket_with(
         allowed_hosts: allowed_hosts.clone(),
         policy: policy.clone(),
         quotas: Some(quotas.clone()),
+        proxies: proxies.clone(),
     });
     let svc_builder = Server::builder()
         .set_http_middleware(middleware)
@@ -431,6 +449,8 @@ pub(crate) mod auth {
         /// AUTH-12: the connection quotas; `None` counts nothing (the
         /// middleware driven alone, without the accept loop).
         pub(super) quotas: Option<Arc<super::Quotas>>,
+        /// TRANSPORT-7: the proxies whose `X-Forwarded-*` are believed.
+        pub(super) proxies: Arc<crate::proxy::TrustedProxies>,
     }
 
     /// AUTH-12: a WebSocket upgrade takes its place in the quotas — as
@@ -446,7 +466,9 @@ pub(crate) mod auth {
         if !jsonrpsee::server::ws::is_upgrade_request(request) {
             return Ok(());
         }
-        let Some(ip) = request.extensions().get::<Arc<super::Connection>>().map(|c| c.peer().ip()) else {
+        // TRANSPORT-7: the client a trusted proxy forwarded, else the peer.
+        let forwarded = request.extensions().get::<crate::proxy::ForwardedClient>().map(|c| c.ip);
+        let Some(ip) = forwarded.or_else(|| request.extensions().get::<Arc<super::Connection>>().map(|c| c.peer().ip())) else {
             return Ok(());
         };
         match quotas.admit(ip, principal) {
@@ -622,6 +644,14 @@ pub(crate) mod auth {
 
         fn call(&mut self, mut request: HttpRequest<B>) -> Self::Future {
             let service = self.service.clone();
+
+            // ── TRANSPORT-7: who this comes from, behind the proxies ──────
+            // Resolved once, from the accepted peer: what every later step
+            // (the quotas) and the application read.
+            if let Some(peer) = request.extensions().get::<Arc<super::Connection>>().map(|c| c.peer().ip()) {
+                let client = self.proxies.resolve(peer, request.headers());
+                request.extensions_mut().insert(client);
+            }
 
             // ── ACCESS-25: the host, before anything is answered ──────────
             // A page that rebinds its own name to this address names its
@@ -904,6 +934,7 @@ pub mod testing {
             allowed_hosts: Arc::new(Vec::new()),
             policy: Default::default(),
             quotas: None,
+            proxies: Default::default(),
         }
     }
 
@@ -925,6 +956,7 @@ pub mod testing {
             allowed_hosts: Arc::new(Vec::new()),
             policy: options.into(),
             quotas: None,
+            proxies: Default::default(),
         }
     }
 
@@ -945,6 +977,7 @@ pub mod testing {
             allowed_hosts: Arc::new(Vec::new()),
             policy: Default::default(),
             quotas: None,
+            proxies: Default::default(),
         }
     }
 

@@ -68,12 +68,18 @@ pub struct WebSocketConfig {
     pub allowed_hosts: Vec<String>,
     /// AUTH-12: how many sockets may be open, in all and per caller.
     pub quotas: ConnectionQuotas,
+    /// TRANSPORT-7: the proxies in front, whose `X-Forwarded-For` /
+    /// `X-Forwarded-Proto` are believed — so the quotas count the client
+    /// they forward, not the proxy (see [`crate::proxy`]). Default: none;
+    /// no forwarded header is believed.
+    pub trusted_proxies: crate::proxy::TrustedProxies,
 }
 
 /// AUTH-12: connection quotas on the WebSocket port, so no one caller —
 /// least of all an anonymous one — can take every connection. A socket
 /// counts against [`Self::max_connections`] and its IP's
-/// [`Self::max_per_ip`]; then, under a session validator, against its
+/// [`Self::max_per_ip`] — the client's, when a trusted proxy forwards it
+/// (TRANSPORT-7, [`WebSocketConfig::trusted_proxies`]), else the peer's; then, under a session validator, against its
 /// principal's [`Self::max_per_principal`] if the upgrade signed someone
 /// in, else against [`Self::max_anonymous`] and its IP's
 /// [`Self::max_anonymous_per_ip`]. (Without a validator no socket is anyone,
@@ -112,7 +118,21 @@ impl WebSocketConfig {
             allowed_origins: Vec::new(),
             allowed_hosts: Vec::new(),
             quotas: ConnectionQuotas::default(),
+            trusted_proxies: Default::default(),
         }
+    }
+
+    /// TRANSPORT-7: listen on `addr` (e.g. `0.0.0.0:4455` in a container
+    /// behind a proxy) rather than `127.0.0.1:<port>`.
+    pub fn with_addr(mut self, addr: SocketAddr) -> Self {
+        self.addr = addr;
+        self
+    }
+
+    /// TRANSPORT-7: the proxies in front (see [`Self::trusted_proxies`]).
+    pub fn with_trusted_proxies(mut self, proxies: crate::proxy::TrustedProxies) -> Self {
+        self.trusted_proxies = proxies;
+        self
     }
 
     /// ACCESS-25: the `Host` values this listener answers to; any other is
