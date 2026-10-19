@@ -1,6 +1,6 @@
 [package]
 name = "plexus-transport"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
@@ -11,7 +11,7 @@ include = ["src/**", "README.md", "Cargo.toml"]
 
 [dependencies]
 # Core dependencies
-plexus-core = { path = "../plexus-core", version = "0.6" }
+plexus-core = { path = "../plexus-core", version = "0.6.1" }
 tokio = { version = "1.53", features = ["full"] }
 futures = "0.3"
 async-stream = "0.3"
@@ -67,7 +67,7 @@ http-body-util = "0.1"
 # depending on the same crate under two names, so tests import PlexusRequest
 # through the alias too: `use schemars::PlexusRequest;`.)
 schemars = { path = "../plexus-macros", package = "plexus-macros", features = ["schemars-compat"] }
-plexus-core = { path = "../plexus-core", version = "0.6" }
+plexus-core = { path = "../plexus-core", version = "0.6.1" }
 
 [features]
 default = []
