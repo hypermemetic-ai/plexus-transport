@@ -1,5 +1,5 @@
-//! TRANSPORT-16: the bridge mounted in-process — the hub in memory, as the
-//! caller the credential names.
+//! TRANSPORT-16: the bridge mounted in-process — the service in memory, as
+//! the caller the credential names.
 //!
 //! The same `plexus_transport_mcp::McpBridge` a sidecar runs, over a
 //! [`HubTransport`] instead of a socket: a `Bearer` the configured
@@ -14,19 +14,19 @@ use std::sync::Arc;
 use plexus_core::plexus::{DynamicHub, HubTransport, SessionValidator};
 use plexus_transport_mcp::upstream::{BoxFuture, Credential, DynTransport, Upstream, UpstreamError};
 
-/// The hub in this binary, reached as the caller a credential names.
-pub struct HubUpstream {
+/// The service in this binary, reached as the caller a credential names.
+pub struct ServiceUpstream {
     hub: Arc<DynamicHub>,
     validator: Option<Arc<dyn SessionValidator>>,
 }
 
-impl std::fmt::Debug for HubUpstream {
+impl std::fmt::Debug for ServiceUpstream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HubUpstream").field("hub", &self.hub.runtime_namespace()).field("validator", &self.validator.is_some()).finish()
+        f.debug_struct("ServiceUpstream").field("service", &self.hub.runtime_namespace()).field("validator", &self.validator.is_some()).finish()
     }
 }
 
-impl HubUpstream {
+impl ServiceUpstream {
     /// `validator`: the one the WebSocket's upgrade uses, so a Bearer names
     /// the same caller on both. `None`: every Bearer is refused; only the
     /// anonymous caller gets in.
@@ -35,8 +35,8 @@ impl HubUpstream {
     }
 }
 
-impl Upstream for HubUpstream {
-    fn hub(&self) -> &str {
+impl Upstream for ServiceUpstream {
+    fn service(&self) -> &str {
         self.hub.runtime_namespace()
     }
 

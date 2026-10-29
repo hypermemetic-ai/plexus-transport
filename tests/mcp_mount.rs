@@ -1,5 +1,5 @@
 //! TRANSPORT-16: the bridge mounted in-process — `with_mcp(McpConfig)` over
-//! the hub, driven by an rmcp 3.x client; the same bridge the sidecar runs.
+//! the service, driven by an rmcp 3.x client; the same bridge the sidecar runs.
 #![cfg(feature = "mcp")]
 
 use std::net::SocketAddr;
@@ -45,7 +45,7 @@ async fn the_mounted_bridge_lists_the_hubs_tools_and_calls_them() {
     );
     let client = ().serve(transport).await.expect("initialize");
     let names: Vec<String> = client.peer().list_all_tools().await.unwrap().into_iter().map(|t| t.name.to_string()).collect();
-    assert!(names.iter().any(|n| n.starts_with("echo.")), "the hub's activations are the tools: {names:?}");
+    assert!(names.iter().any(|n| n.starts_with("echo.")), "the service's activations are the tools: {names:?}");
 
     let echo = names.iter().find(|n| *n == "echo.echo").expect("echo.echo");
     let r = client

@@ -281,8 +281,8 @@ impl<A: Activation> TransportServer<A> {
         #[cfg(not(feature = "http-gateway"))]
         let rest_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> = None;
 
-        // TRANSPORT-16: the bridge mounted over the hub, as the caller the
-        // WebSocket's validator names.
+        // TRANSPORT-16: the bridge mounted over the service, as the caller
+        // the WebSocket's validator names.
         #[cfg(feature = "mcp")]
         let mounted_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> = match self.mcp.take() {
             Some(mount) => {
@@ -451,8 +451,8 @@ pub struct TransportServerBuilder<A: Activation> {
 
 #[cfg(feature = "mcp")]
 impl TransportServerBuilder<plexus_core::plexus::DynamicHub> {
-    /// TRANSPORT-16: mount the MCP bridge over this hub. The same bridge a
-    /// sidecar runs (`plexus-transport-mcp`), over the hub in memory: every
+    /// TRANSPORT-16: mount the MCP bridge over this service. The same bridge
+    /// a sidecar runs (`plexus-transport-mcp`), over the service in memory: every
     /// `tools/call` is `route_with_ctx` as the caller the session validator
     /// names from the request's `Bearer` (the WebSocket's own validator,
     /// [`Self::with_session_validator`]); no credential is the anonymous
@@ -465,7 +465,7 @@ impl TransportServerBuilder<plexus_core::plexus::DynamicHub> {
         self.mcp = Some(McpMount {
             config,
             make: Box::new(move |validator, config| {
-                let bridge = plexus_transport_mcp::McpBridge::new(crate::mcp::HubUpstream::new(hub, validator), config);
+                let bridge = plexus_transport_mcp::McpBridge::new(crate::mcp::ServiceUpstream::new(hub, validator), config);
                 plexus_transport_mcp::router(bridge)
             }),
         });

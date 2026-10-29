@@ -77,7 +77,7 @@ pub use request::{ValidOrigin, init_allowed_origins};
 #[cfg(feature = "mcp")]
 pub use plexus_transport_mcp::{self, McpConfig};
 #[cfg(feature = "mcp")]
-pub use mcp::HubUpstream;
+pub use mcp::ServiceUpstream;
 
 // Re-export MCP bridge for advanced usage
 #[cfg(feature = "sqlite-sessions")]
