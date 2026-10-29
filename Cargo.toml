@@ -57,6 +57,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [dev-dependencies]
+# BIDIR-8: the duplex gate's test builds a gate in plexus-auth-core's terms.
+plexus-auth-core = { path = "../plexus-auth-core" }
 # TRANSPORT-16: an rmcp 3.x client for the mounted bridge's test; aliased,
 # since `rmcp` above is the old bridge's 0.12 until TRANSPORT-9.
 rmcp3 = { package = "rmcp", version = "3.8", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }

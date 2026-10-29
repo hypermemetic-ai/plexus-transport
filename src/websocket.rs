@@ -86,6 +86,8 @@ pub const LIVENESS_EVERY: Duration = Duration::from_secs(1);
 pub struct Connection {
     peer: SocketAddr,
     handle: ServerHandle,
+    /// BIDIR-8: the calls open on it ([`ConnectionCalls`](crate::ConnectionCalls)).
+    calls: crate::calls::ConnectionCalls,
 }
 
 impl Connection {
@@ -94,6 +96,12 @@ impl Connection {
     /// [`ForwardedClient`](crate::proxy::ForwardedClient)).
     pub fn peer(&self) -> SocketAddr {
         self.peer
+    }
+
+    /// BIDIR-8: the calls open on this connection, at the quotas'
+    /// `max_calls_per_connection` — a duplex call is one of them.
+    pub fn calls(&self) -> &crate::calls::ConnectionCalls {
+        &self.calls
     }
 
     /// Close this connection (its WebSocket, after in-flight calls).
@@ -333,6 +341,8 @@ pub async fn serve_websocket_with(
         .to_service_builder()
         .max_connections(config.quotas.max_connections);
     let methods = jsonrpsee::Methods::from(module);
+    // BIDIR-8: each connection's call count.
+    let max_calls = config.quotas.max_calls_per_connection;
 
     let listener = TcpListener::bind(config.addr).await?;
     let local_addr = listener.local_addr()?;
@@ -371,7 +381,7 @@ pub async fn serve_websocket_with(
                     _ = forward.clone().stopped() => {}
                 }
             });
-            let conn = Arc::new(Connection { peer, handle: conn_handle });
+            let conn = Arc::new(Connection { peer, handle: conn_handle, calls: crate::calls::ConnectionCalls::new(max_calls) });
             let svc_builder = svc_builder.clone();
             let methods = methods.clone();
             let conn_stop_for_serve = conn_stop.clone();

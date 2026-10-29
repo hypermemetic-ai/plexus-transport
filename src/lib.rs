@@ -38,6 +38,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod request;
 
+/// BIDIR-8: the calls open on one connection, counted here.
+pub mod calls;
 #[cfg(feature = "mcp-gateway")]
 pub mod combined;
 pub mod config;
@@ -56,6 +58,7 @@ pub mod mcp;
 pub mod http;
 
 // Re-export main API
+pub use calls::{ConnectionCalls, TooManyCalls, CALLS_PER_CONNECTION};
 #[cfg(feature = "mcp-gateway")]
 pub use combined::serve_combined;
 pub use config::{

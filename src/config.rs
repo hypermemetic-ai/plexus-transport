@@ -99,11 +99,22 @@ pub struct ConnectionQuotas {
     pub max_anonymous: u32,
     /// Anonymous sockets from one IP address.
     pub max_anonymous_per_ip: u32,
+    /// BIDIR-8: calls open on one connection at once — a stream-out call
+    /// and a duplex call each one ([`ConnectionCalls`](crate::ConnectionCalls),
+    /// which every [`Connection`](crate::websocket::Connection) carries).
+    pub max_calls_per_connection: usize,
 }
 
 impl Default for ConnectionQuotas {
     fn default() -> Self {
-        Self { max_connections: 1024, max_per_ip: 256, max_per_principal: 64, max_anonymous: 128, max_anonymous_per_ip: 32 }
+        Self {
+            max_connections: 1024,
+            max_per_ip: 256,
+            max_per_principal: 64,
+            max_anonymous: 128,
+            max_anonymous_per_ip: 32,
+            max_calls_per_connection: crate::calls::CALLS_PER_CONNECTION,
+        }
     }
 }
 
