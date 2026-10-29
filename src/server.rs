@@ -52,6 +52,15 @@ pub struct RegistryOptions {
     pub host: Option<String>,
 }
 
+/// TRANSPORT-16: the bridge mounted in-process, built once the validator
+/// is known (at `build`), served at `McpConfig.listen` until TRANSPORT-10
+/// puts it on the WebSocket's own router.
+#[cfg(feature = "mcp")]
+pub(crate) struct McpMount {
+    config: plexus_transport_mcp::McpConfig,
+    make: Box<dyn FnOnce(Option<Arc<dyn SessionValidator>>, plexus_transport_mcp::McpConfig) -> axum::Router + Send>,
+}
+
 /// Function type for converting Arc<Activation> to RpcModule
 ///
 /// This allows each activation type to provide its own conversion logic,
@@ -98,6 +107,9 @@ pub struct TransportServer<A: Activation> {
     upgrade: UpgradeOptions,
     /// Z2H-6: boot-time registry self-registration configuration.
     registry: RegistryOptions,
+    /// TRANSPORT-16: the mounted bridge, when `with_mcp` was called.
+    #[cfg(feature = "mcp")]
+    mcp: Option<McpMount>,
 }
 
 impl<A: Activation> TransportServer<A> {
@@ -269,8 +281,26 @@ impl<A: Activation> TransportServer<A> {
         #[cfg(not(feature = "http-gateway"))]
         let rest_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> = None;
 
+        // TRANSPORT-16: the bridge mounted over the hub, as the caller the
+        // WebSocket's validator names.
+        #[cfg(feature = "mcp")]
+        let mounted_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> = match self.mcp.take() {
+            Some(mount) => {
+                let listen = mount.config.listen.ok_or_else(|| {
+                    anyhow::anyhow!("with_mcp: McpConfig.listen is required — the mounted bridge has its own listener until TRANSPORT-10 puts /mcp on the WebSocket's router")
+                })?;
+                let router = (mount.make)(self.session_validator.clone(), mount.config.clone());
+                let listener = tokio::net::TcpListener::bind(listen).await?;
+                tracing::info!("Starting MCP at http://{}{}", listener.local_addr()?, mount.config.path);
+                Some(tokio::spawn(async move { axum::serve(listener, router).await }))
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "mcp"))]
+        let mounted_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> = None;
+
         // Wait for any server to complete
-        if ws_handle.is_none() && mcp_handle.is_none() && rest_handle.is_none() {
+        if ws_handle.is_none() && mcp_handle.is_none() && rest_handle.is_none() && mounted_handle.is_none() {
             tracing::warn!("No transports configured, nothing to serve");
             return Ok(());
         }
@@ -307,6 +337,16 @@ impl<A: Activation> TransportServer<A> {
                     }
                 }
             }, if rest_handle.is_some() => {}
+
+            _ = async {
+                if let Some(mounted) = mounted_handle {
+                    match mounted.await {
+                        Ok(Ok(())) => tracing::info!("MCP (mounted) stopped"),
+                        Ok(Err(e)) => tracing::error!("MCP (mounted) error: {}", e),
+                        Err(e) => tracing::error!("MCP (mounted) task failed: {}", e),
+                    }
+                }
+            }, if mounted_handle.is_some() => {}
 
             _ = wait_shutdown_signal(), if registry_reg.is_some() => {
                 tracing::info!("shutdown signal received — stopping transports");
@@ -404,6 +444,33 @@ pub struct TransportServerBuilder<A: Activation> {
     upgrade: UpgradeOptions,
     /// Z2H-6: registry self-registration overrides.
     registry: RegistryOptions,
+    /// TRANSPORT-16: set by `.with_mcp()`.
+    #[cfg(feature = "mcp")]
+    mcp: Option<McpMount>,
+}
+
+#[cfg(feature = "mcp")]
+impl TransportServerBuilder<plexus_core::plexus::DynamicHub> {
+    /// TRANSPORT-16: mount the MCP bridge over this hub. The same bridge a
+    /// sidecar runs (`plexus-transport-mcp`), over the hub in memory: every
+    /// `tools/call` is `route_with_ctx` as the caller the session validator
+    /// names from the request's `Bearer` (the WebSocket's own validator,
+    /// [`Self::with_session_validator`]); no credential is the anonymous
+    /// caller; `tools/list` is that caller's view. Served at
+    /// `config.listen` (required; `bind` applies to it) until TRANSPORT-10
+    /// puts `config.path` on the WebSocket's router. Replaces
+    /// `with_mcp_http`, which TRANSPORT-9 removes.
+    pub fn with_mcp(mut self, config: plexus_transport_mcp::McpConfig) -> Self {
+        let hub = self.activation.clone();
+        self.mcp = Some(McpMount {
+            config,
+            make: Box::new(move |validator, config| {
+                let bridge = plexus_transport_mcp::McpBridge::new(crate::mcp::HubUpstream::new(hub, validator), config);
+                plexus_transport_mcp::router(bridge)
+            }),
+        });
+        self
+    }
 }
 
 impl<A: Activation> TransportServerBuilder<A> {
@@ -427,6 +494,8 @@ impl<A: Activation> TransportServerBuilder<A> {
             bind: None,
             upgrade: UpgradeOptions::default(),
             registry: RegistryOptions::default(),
+            #[cfg(feature = "mcp")]
+            mcp: None,
         }
     }
 
@@ -814,6 +883,14 @@ impl<A: Activation> TransportServerBuilder<A> {
                 registry.host = Some(ip.to_string());
             }
         }
+        // TRANSPORT-16: the mounted bridge takes the bind address too.
+        #[cfg(feature = "mcp")]
+        let mcp = self.mcp.map(|mut m| {
+            if let (Some(ip), Some(listen)) = (self.bind, m.config.listen.as_mut()) {
+                listen.set_ip(ip);
+            }
+            m
+        });
 
         Ok(TransportServer {
             activation: self.activation,
@@ -829,6 +906,8 @@ impl<A: Activation> TransportServerBuilder<A> {
             trusted_proxies: self.trusted_proxies,
             upgrade: self.upgrade,
             registry,
+            #[cfg(feature = "mcp")]
+            mcp,
         })
     }
 }

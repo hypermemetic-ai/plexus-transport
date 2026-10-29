@@ -73,6 +73,12 @@ pub use proxy::{init_trusted_proxies, ForwardedClient, IpNet, TrustedProxies};
 pub use websocket::UpgradeOptions;
 pub use request::{ValidOrigin, init_allowed_origins};
 
+// TRANSPORT-16: the mounted bridge's configuration, and the crate it is.
+#[cfg(feature = "mcp")]
+pub use plexus_transport_mcp::{self, McpConfig};
+#[cfg(feature = "mcp")]
+pub use mcp::HubUpstream;
+
 // Re-export MCP bridge for advanced usage
 #[cfg(feature = "sqlite-sessions")]
 pub use mcp::{bridge::ActivationMcpBridge, session::SqliteSessionManager};

@@ -33,6 +33,10 @@ http-body = "1"
 # unconditionally, so bumping here (latest is 3.x) would compile two rmcp
 # stacks into every mcp build.
 rmcp = { version = "0.12", features = ["server", "transport-streamable-http-server"], optional = true }
+# TRANSPORT-16: the bridge as a client of the RPC, mounted in-process over
+# HubTransport (`TransportServerBuilder::with_mcp`). TRANSPORT-9 removes the
+# old bridge above and its rmcp 0.12 in favour of this one.
+plexus-transport-mcp = { path = "../plexus-transport-mcp", version = "0.1", default-features = false, optional = true }
 
 # HTTP server
 axum = "0.8.9"
@@ -53,6 +57,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [dev-dependencies]
+# TRANSPORT-16: an rmcp 3.x client for the mounted bridge's test; aliased,
+# since `rmcp` above is the old bridge's 0.12 until TRANSPORT-9.
+rmcp3 = { package = "rmcp", version = "3.8", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
+reqwest = { version = "0.13", default-features = false }
 async-stream = "0.3"
 async-trait = "0.1"
 uuid = { version = "1.6", features = ["v4"] }
@@ -73,7 +81,7 @@ plexus-core = { path = "../plexus-core", version = "0.6.1" }
 default = []
 # MCP transport (rmcp-based). Default-OFF as of 0.5.0: REST/WebSocket-only
 # consumers no longer pull in the rmcp stack. Enable with `--features mcp`.
-mcp = ["dep:rmcp"]
+mcp = ["dep:rmcp", "dep:plexus-transport-mcp"]
 mcp-gateway = ["mcp"]
 http-gateway = []
 sqlite-sessions = ["mcp", "sqlx", "tokio-stream"]
