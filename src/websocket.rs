@@ -298,6 +298,9 @@ pub struct UpgradeOptions {
     /// AUTH-6: RFC 9728 metadata, served at its well-known path on this
     /// port and named in every session 401's `WWW-Authenticate`.
     pub protected_resource: Option<crate::protected_resource::ProtectedResource>,
+    /// BIDIR-3 (spike): the live duplex calls `{ns}.input` / `{ns}.end`
+    /// notifications are handed to, by the RPC middleware.
+    pub duplex: Option<Arc<crate::duplex_spike::DuplexRegistry>>,
 }
 
 /// [`serve_websocket`] with the full [`UpgradeOptions`] (AUTH-6).
@@ -336,8 +339,11 @@ pub async fn serve_websocket_with(
         quotas: Some(quotas.clone()),
         proxies: proxies.clone(),
     });
+    let duplex = jsonrpsee::server::middleware::rpc::RpcServiceBuilder::new()
+        .layer(crate::duplex_spike::DuplexLayer(options.duplex.clone()));
     let svc_builder = Server::builder()
         .set_http_middleware(middleware)
+        .set_rpc_middleware(duplex)
         .to_service_builder()
         .max_connections(config.quotas.max_connections);
     let methods = jsonrpsee::Methods::from(module);
