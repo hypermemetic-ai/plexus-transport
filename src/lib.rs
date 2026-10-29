@@ -53,6 +53,9 @@ pub mod websocket;
 /// BIDIR-3: a spike, never merged.
 #[doc(hidden)]
 pub mod duplex_spike;
+/// LOCAL-3: a spike, never merged.
+#[doc(hidden)]
+pub mod symmetric_spike;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;

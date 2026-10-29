@@ -271,6 +271,27 @@ pub async fn serve_websocket(
     .await
 }
 
+/// LOCAL-3 (spike): jsonrpsee's random subscription ids, or 1, 2, 3, ….
+#[derive(Debug, Clone)]
+struct SpikeIds {
+    seq: Option<Arc<std::sync::atomic::AtomicU64>>,
+}
+
+impl SpikeIds {
+    fn new(sequential: bool) -> Self {
+        Self { seq: sequential.then(|| Arc::new(std::sync::atomic::AtomicU64::new(1))) }
+    }
+}
+
+impl jsonrpsee::server::IdProvider for SpikeIds {
+    fn next_id(&self) -> jsonrpsee::types::SubscriptionId<'static> {
+        match &self.seq {
+            Some(n) => jsonrpsee::types::SubscriptionId::Num(n.fetch_add(1, std::sync::atomic::Ordering::Relaxed)),
+            None => jsonrpsee::server::RandomIntegerIdProvider.next_id(),
+        }
+    }
+}
+
 /// AUTH-6: how the upgrade treats a caller's credential, beyond the
 /// [`WebSocketConfig`]. `Default` is today's behavior: no strict mode, no
 /// anonymous view, no protected-resource metadata.
@@ -301,6 +322,12 @@ pub struct UpgradeOptions {
     /// BIDIR-3 (spike): the live duplex calls `{ns}.input` / `{ns}.end`
     /// notifications are handed to, by the RPC middleware.
     pub duplex: Option<Arc<crate::duplex_spike::DuplexRegistry>>,
+    /// LOCAL-3 (spike): take offers — every connection gets a frame hook
+    /// and a [`PeerConn`](crate::symmetric_spike::PeerConn) in its extensions.
+    pub peers: Option<Arc<crate::symmetric_spike::Peers>>,
+    /// LOCAL-3 (spike): subscription ids 1, 2, 3, … (jsonrpsee's random
+    /// ids otherwise) — to show both sides minting the same ids at once.
+    pub sequential_ids: bool,
 }
 
 /// [`serve_websocket`] with the full [`UpgradeOptions`] (AUTH-6).
@@ -344,12 +371,14 @@ pub async fn serve_websocket_with(
     let svc_builder = Server::builder()
         .set_http_middleware(middleware)
         .set_rpc_middleware(duplex)
+        .set_config(jsonrpsee::server::ServerConfig::builder().set_id_provider(SpikeIds::new(options.sequential_ids)).build())
         .to_service_builder()
         .max_connections(config.quotas.max_connections);
     let methods = jsonrpsee::Methods::from(module);
     // BIDIR-8: each connection's call count.
     let max_calls = config.quotas.max_calls_per_connection;
 
+    let peers = options.peers.clone();
     let listener = TcpListener::bind(config.addr).await?;
     let local_addr = listener.local_addr()?;
     let (stop_handle, server_handle) = stop_channel();
@@ -391,8 +420,13 @@ pub async fn serve_websocket_with(
             let svc_builder = svc_builder.clone();
             let methods = methods.clone();
             let conn_stop_for_serve = conn_stop.clone();
+            let peer = peers.as_ref().map(|p| p.accept());
             let svc = tower::service_fn(move |mut req: http::Request<hyper::body::Incoming>| {
                 req.extensions_mut().insert(conn.clone());
+                if let Some((hook, peer)) = &peer {
+                    req.extensions_mut().insert(hook.clone());
+                    req.extensions_mut().insert(peer.clone());
+                }
                 let mut svc = svc_builder.clone().build(methods.clone(), conn_stop.clone());
                 async move { svc.call(req).await.map_err(anyhow::Error::from_boxed) }.boxed()
             });

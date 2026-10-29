@@ -1,0 +1,33 @@
+# LOCAL-3 (spike, never merged): a connection is symmetric — the tests, as a
+# crate of their own so a service built with plexus-macros' activations, the
+# plexus-transport server and plexus-client's WsTransport meet over a real
+# socket. `cargo test` here (CARGO_TARGET_DIR=~/.cache/cargo-target/plexus-transport).
+[package]
+name = "local3-symmetric-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
+plexus-core = { path = "../../../plexus-core" }
+plexus-macros = { path = "../../../plexus-macros" }
+plexus-client = { path = "../../../plexus-macros/plexus-client", features = ["ws-native"] }
+plexus-transport = { path = "../.." }
+plexus-auth-core = { path = "../../../plexus-auth-core" }
+jsonrpsee = { version = "0.26", features = ["server"] }
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.30"
+futures = "0.3"
+async-stream = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = { version = "1.1", features = ["derive", "uuid1"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[patch.crates-io]
+jsonrpsee-server = { path = "../../vendor/jsonrpsee-server" }
