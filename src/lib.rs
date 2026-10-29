@@ -48,6 +48,9 @@ pub mod registry;
 pub mod server;
 pub mod stdio;
 pub mod websocket;
+/// BIDIR-3: a spike, never merged.
+#[doc(hidden)]
+pub mod duplex_spike;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;
