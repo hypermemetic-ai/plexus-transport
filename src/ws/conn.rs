@@ -38,7 +38,6 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use futures::stream::FuturesUnordered;
 use futures::{SinkExt, StreamExt};
 use http::Extensions;
 use hyper::upgrade::Upgraded;
@@ -236,8 +235,15 @@ struct Loop {
     /// so neither starves the other).
     own_first: bool,
     hook: Option<Arc<dyn ConnectionHook>>,
-    /// Subscriptions whose acceptance is awaited (their callbacks' futures).
-    accepting: FuturesUnordered<BoxFuture<'static, MethodResponse>>,
+    /// Subscriptions whose acceptance is awaited (their callbacks' futures),
+    /// in arrival order, each polled with the socket's own waker — at most
+    /// 1,024 (a subscription's permit is taken first), and short-lived: a
+    /// callback answers as soon as its task runs. Not a `FuturesUnordered`:
+    /// having polled every future it holds, that wakes its parent
+    /// (futures-util 0.3.34, `futures_unordered/mod.rs:556`), so every call
+    /// made this task yield once and wake an idle worker for it (tokio's
+    /// `yield_now`: 4.8 % of the server's samples under `call.one_item`).
+    accepting: Vec<BoxFuture<'static, MethodResponse>>,
     /// Plain async calls and batches running on tasks of their own.
     running: Arc<AtomicUsize>,
     dropped: Arc<Dropped>,
@@ -272,6 +278,27 @@ impl Loop {
                 n.notify(ok);
             }
         }
+    }
+
+    /// Each acceptance that has resolved, answered in arrival order (a
+    /// subscription's id is already out through its sink; a refusal is
+    /// answered here). `true`: one did.
+    fn poll_accepting(&mut self, cx: &mut Context<'_>) -> bool {
+        if self.accepting.is_empty() {
+            return false;
+        }
+        let mut moved = false;
+        let mut accepting = std::mem::take(&mut self.accepting);
+        accepting.retain_mut(|f| match f.as_mut().poll(cx) {
+            Poll::Ready(rp) => {
+                self.respond(rp);
+                moved = true;
+                false
+            }
+            Poll::Pending => true,
+        });
+        self.accepting = accepting;
+        moved
     }
 
     /// `-32007` for each message the guard dropped over the cap.
@@ -490,8 +517,7 @@ impl Loop {
         let mut reads = 0;
         loop {
             let mut moved = false;
-            while let Poll::Ready(Some(rp)) = self.accepting.poll_next_unpin(cx) {
-                self.respond(rp);
+            if self.poll_accepting(cx) {
                 moved = true;
             }
             // Frames in, while the answers are not backed up.
@@ -616,7 +642,7 @@ pub(crate) async fn run(
         own_open: true,
         own_first: false,
         hook,
-        accepting: FuturesUnordered::new(),
+        accepting: Vec::new(),
         running: Arc::new(AtomicUsize::new(0)),
         dropped,
         answered_drops: 0,
