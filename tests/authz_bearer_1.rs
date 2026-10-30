@@ -132,7 +132,7 @@ struct CaptureService {
 }
 
 impl Service<http::Request<Empty<Bytes>>> for CaptureService {
-    type Response = http::Response<jsonrpsee::server::HttpBody>;
+    type Response = http::Response<plexus_transport::websocket::HttpBody>;
     type Error = Infallible;
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
@@ -155,7 +155,7 @@ impl Service<http::Request<Empty<Bytes>>> for CaptureService {
             *cap.inner.lock().unwrap() = Some(ctx);
             Ok(http::Response::builder()
                 .status(http::StatusCode::OK)
-                .body(jsonrpsee::server::HttpBody::from("ok"))
+                .body(plexus_transport::websocket::HttpBody::from("ok"))
                 .unwrap())
         })
     }

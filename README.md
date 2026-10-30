@@ -1,10 +1,10 @@
-# hub-transport
+# plexus-transport
 
 Transport implementations for Plexus RPC. Provides WebSocket, stdio, and HTTP/SSE backends for hosting any `Activation` (from `plexus-core`).
 
 ## Overview
 
-`hub-transport` provides transport layer implementations for Plexus RPC servers. It extracts the transport infrastructure from Substrate into a reusable library, allowing you to host **any** activation—single plugins, DynamicHub routers, or nested hubs—with WebSocket, stdio, and MCP HTTP transports using a clean builder API.
+`plexus-transport` provides transport layer implementations for Plexus RPC servers. It extracts the transport infrastructure from Substrate into a reusable library, allowing you to host **any** activation—single plugins, DynamicHub routers, or nested services—with WebSocket, stdio, and MCP HTTP transports using a clean builder API.
 
 **What is Plexus RPC?** Plexus RPC is a protocol for building services with runtime schema introspection, where code IS schema. Zero drift, instant streaming.
 
@@ -171,7 +171,8 @@ Generic MCP protocol handler that bridges `tools/call` requests to `Activation::
 ### Transport Modules
 
 **`stdio`** - Line-delimited JSON-RPC over stdin/stdout (MCP-compatible)
-**`websocket`** - JSON-RPC WebSocket server
+**`websocket`** - the WebSocket server: the accept loop and the upgrade's checks
+**`ws`** - the WebSocket connection loop, the transport's own (PERF-20)
 **`mcp`** - MCP HTTP with SSE streaming and session management
 
 ### RPC Conversion Pattern
@@ -267,6 +268,40 @@ Start all configured transports and block until shutdown.
 
 - If stdio is configured: blocks on stdin
 - Otherwise: starts WebSocket/MCP servers and waits for completion
+
+## The WebSocket connection loop
+
+PERF-20. A Plexus WebSocket is the transport's own (`src/ws/`): the upgrade
+is answered after the checks (Host 421, the RFC 9728 metadata, Origin 403,
+the key 401, the session 401, the quotas 429); the framing under it is
+tokio-tungstenite's; jsonrpsee-core's method table (`Methods`, which every
+service registers into) is driven from it, and jsonrpsee-server is not on the
+path.
+
+- **One reader per socket** takes every frame in arrival order — no task per
+  frame — and routes it by its shape: a call to the method table (a
+  subscription is its own task, so calls on one socket overlap), an answer to
+  no request of this side's dropped (never `-32600`).
+- **One writer per socket** takes every frame ready when it wakes, up to its
+  budget (64 KiB), and flushes once — a call's frames, or a stream's ready
+  items, share one `send` — then yields to other sockets. The queue is
+  bounded (1,024 frames): a reader that does not read holds its socket's
+  calls back, never the server's memory.
+- **A hook** (`UpgradeOptions::hooks`, `Hooks::new`) sees each inbound frame
+  before dispatch and may take it; `Connection::writer()` writes this side's
+  own requests on an accepted socket (BIDIR-12). `Connection::encoding()` is
+  fixed at the upgrade (JSON; PERF-9 adds msgpack).
+- **The limits** (`UpgradeOptions::limits`, `SocketLimits`;
+  `TransportServerBuilder::with_socket_limits`): a message over 10 MiB is
+  refused `-32007` with the socket kept, fragments assembled under the same
+  cap; a ping every 30 s and a silent peer closed at 70 s; an idle limit
+  (none by default; a service sets it) closes a socket with no call open,
+  one that never called included (RPC-5); a request's headers within 10 s,
+  and sockets not yet upgraded bounded per IP (RPC-4).
+- **A request that is not an upgrade** is `426 Upgrade Required`: there is no
+  JSON-RPC over plain HTTP on the WebSocket port.
+- **Logs** name no header and no frame, at any level (ACCESS-62): the
+  framing's `log` records are capped at debug once a socket is served.
 
 ## Behind a proxy
 

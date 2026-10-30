@@ -62,40 +62,76 @@
 //! the peer; secure on the proxy's `X-Forwarded-Proto` — which rides in the
 //! request's extensions (so in every call's), and the connection quotas
 //! count by its address. A forwarded header from any other peer is ignored.
+//!
+//! ## The socket is the transport's own (PERF-20)
+//!
+//! The accept loop, the checks above and their order are this module's; the
+//! upgrade, the socket and its loop — one reader, one writer, one flush a
+//! wakeup — are [`crate::ws`]'s, over tokio-tungstenite, with jsonrpsee-core's
+//! method table driven from it. jsonrpsee-server is off the path: a request
+//! that is not an upgrade is `426 Upgrade Required`. RPC-4's bounds hold
+//! before the upgrade: a header timeout, and the sockets not yet upgraded
+//! bounded per IP at the accept loop ([`SocketLimits`]).
 
 use anyhow::Result;
-use futures::FutureExt;
-use jsonrpsee::server::{serve_with_graceful_shutdown, stop_channel, Server, ServerHandle};
 use jsonrpsee::RpcModule;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tower::Service;
 
 use crate::config::WebSocketConfig;
+use crate::ws::{ConnectionWriter, Encoding, Hooks, Negotiated, SocketLimits};
+pub use crate::ws::{HttpBody, ServerHandle};
 
 /// AUTH-11: how often an open, signed-in socket asks whether its sign-in
 /// still stands.
 pub const LIVENESS_EVERY: Duration = Duration::from_secs(1);
 
 /// One accepted TCP connection, in the extensions of every request it
-/// carries (and so of the WebSocket it upgrades to, for as long as that
-/// lives): who is at the other end, and how to close it.
+/// carries (and so of the WebSocket it upgrades to, and of every call on
+/// it, for as long as that lives): who is at the other end, how to close it,
+/// and — once upgraded — what it speaks and how this side writes on it.
 #[derive(Debug)]
 pub struct Connection {
     peer: SocketAddr,
-    handle: ServerHandle,
+    /// PERF-20: its id, the method table's `ConnectionId`.
+    id: u64,
+    /// Set once it is to close (asked) or has ended.
+    closed: tokio::sync::watch::Sender<bool>,
     /// BIDIR-8: the calls open on it ([`ConnectionCalls`](crate::ConnectionCalls)).
     calls: crate::calls::ConnectionCalls,
+    /// PERF-20: what the upgrade settled, and this side's writer.
+    upgraded: OnceLock<(Negotiated, ConnectionWriter)>,
+    /// RPC-4: its place among its IP's sockets not yet upgraded, given back
+    /// at the upgrade.
+    pending: Mutex<Option<PendingPlace>>,
 }
 
 impl Connection {
+    pub(crate) fn new(peer: SocketAddr, max_calls: usize, pending: Option<PendingPlace>) -> Self {
+        Self {
+            peer,
+            id: crate::ws::next_connection_id(),
+            closed: tokio::sync::watch::channel(false).0,
+            calls: crate::calls::ConnectionCalls::new(max_calls),
+            upgraded: OnceLock::new(),
+            pending: Mutex::new(pending),
+        }
+    }
+
     /// The peer's address, as accepted (no proxy headers; the client a
     /// trusted proxy forwards is the request's
     /// [`ForwardedClient`](crate::proxy::ForwardedClient)).
     pub fn peer(&self) -> SocketAddr {
         self.peer
+    }
+
+    /// PERF-20: this connection's id — the `ConnectionId` every call on it
+    /// carries in its extensions.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// BIDIR-8: the calls open on this connection, at the quotas'
@@ -104,22 +140,94 @@ impl Connection {
         &self.calls
     }
 
-    /// Close this connection (its WebSocket, after in-flight calls).
+    /// Close this connection: its WebSocket is sent a close, its calls end.
     pub fn close(&self) {
-        let _ = self.handle.stop();
+        self.closed.send_replace(true);
     }
 
-    /// Whether it has been closed.
+    /// Whether it has been closed (asked to, or over).
     pub fn is_closed(&self) -> bool {
-        self.handle.is_stopped()
+        *self.closed.borrow()
+    }
+
+    /// Resolves once it is closed (asked to, or over).
+    pub async fn closed(&self) {
+        let mut rx = self.closed.subscribe();
+        let _ = rx.wait_for(|closed| *closed).await;
+    }
+
+    /// PERF-20 → PERF-9: the encoding every frame on it is in, fixed at its
+    /// upgrade (`None` before).
+    pub fn encoding(&self) -> Option<Encoding> {
+        self.upgraded.get().map(|(n, _)| n.encoding)
+    }
+
+    /// PERF-20: what its upgrade settled (`None` before).
+    pub fn negotiated(&self) -> Option<Negotiated> {
+        self.upgraded.get().map(|(n, _)| *n)
+    }
+
+    /// PERF-20 → BIDIR-12: the handle this side writes its own frames
+    /// through — a request on a socket it accepted (`None` before the
+    /// upgrade).
+    pub fn writer(&self) -> Option<ConnectionWriter> {
+        self.upgraded.get().map(|(_, w)| w.clone())
+    }
+
+    /// The upgrade is done: what it settled, the writer, and the
+    /// not-yet-upgraded place given back.
+    pub(crate) fn upgraded(&self, negotiated: Negotiated, writer: ConnectionWriter) {
+        let _ = self.upgraded.set((negotiated, writer));
+        self.pending.lock().unwrap_or_else(|p| p.into_inner()).take();
+    }
+
+    /// The socket's loop is over.
+    pub(crate) fn ended(&self) {
+        self.closed.send_replace(true);
     }
 }
 
-impl Drop for Connection {
-    /// Gone from every request: the connection is over; release its stop
-    /// handle's watchers.
+/// RPC-4: the sockets accepted from each client IP and not yet upgraded.
+#[derive(Debug)]
+pub(crate) struct Pending {
+    max: u32,
+    per_ip: Mutex<HashMap<IpAddr, u32>>,
+}
+
+/// One socket's place among its IP's not yet upgraded; given back when
+/// dropped (at the upgrade, or when the connection ends without one).
+#[derive(Debug)]
+pub(crate) struct PendingPlace {
+    pending: Arc<Pending>,
+    ip: IpAddr,
+}
+
+impl Pending {
+    pub(crate) fn new(max: u32) -> Arc<Self> {
+        Arc::new(Self { max, per_ip: Mutex::new(HashMap::new()) })
+    }
+
+    /// A place for a socket from `ip`, or `None`: its IP is at the bound.
+    pub(crate) fn take(self: &Arc<Self>, ip: IpAddr) -> Option<PendingPlace> {
+        let mut m = self.per_ip.lock().unwrap_or_else(|p| p.into_inner());
+        let n = m.entry(ip).or_default();
+        if *n >= self.max {
+            return None;
+        }
+        *n += 1;
+        Some(PendingPlace { pending: self.clone(), ip })
+    }
+}
+
+impl Drop for PendingPlace {
     fn drop(&mut self) {
-        let _ = self.handle.stop();
+        let mut m = self.pending.per_ip.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = m.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.ip);
+            }
+        }
     }
 }
 
@@ -272,8 +380,9 @@ pub async fn serve_websocket(
 }
 
 /// AUTH-6: how the upgrade treats a caller's credential, beyond the
-/// [`WebSocketConfig`]. `Default` is today's behavior: no strict mode, no
-/// anonymous view, no protected-resource metadata.
+/// [`WebSocketConfig`]; PERF-20: the socket's limits and its hook.
+/// `Default` is today's behavior: no strict mode, no anonymous view, no
+/// protected-resource metadata, today's limits (or their gaps'), no hook.
 #[derive(Debug, Clone, Default)]
 pub struct UpgradeOptions {
     /// RED-9: with a `SessionValidator`, refuse (401) an upgrade that yields
@@ -281,7 +390,7 @@ pub struct UpgradeOptions {
     /// only a presented credential is refused.
     pub reject_on_session_failure: bool,
     /// AUTH-6: with a `SessionValidator`, an upgrade that presents NO
-    /// credential is admitted without an `AuthContext` (the hub's gate shows
+    /// credential is admitted without an `AuthContext` (the service's gate shows
     /// it the anonymous view), and one that presents a credential the
     /// validator rejects is refused 401. What counts as presented: an
     /// `Authorization` header (any scheme), or a cookie named in
@@ -298,9 +407,16 @@ pub struct UpgradeOptions {
     /// AUTH-6: RFC 9728 metadata, served at its well-known path on this
     /// port and named in every session 401's `WWW-Authenticate`.
     pub protected_resource: Option<crate::protected_resource::ProtectedResource>,
+    /// PERF-20: the socket's numbers — message cap, ping and idle (RPC-5),
+    /// header timeout and the sockets not yet upgraded per IP (RPC-4), the
+    /// writer's queue and budget.
+    pub limits: SocketLimits,
+    /// PERF-20 → BIDIR-12: each upgraded connection's hook over its inbound
+    /// frames.
+    pub hooks: Option<Hooks>,
 }
 
-/// [`serve_websocket`] with the full [`UpgradeOptions`] (AUTH-6).
+/// [`serve_websocket`] with the full [`UpgradeOptions`] (AUTH-6, PERF-20).
 pub async fn serve_websocket_with(
     module: RpcModule<()>,
     config: WebSocketConfig,
@@ -311,47 +427,49 @@ pub async fn serve_websocket_with(
     if config.trusted_proxies.behind_proxy() {
         tracing::info!(proxies = ?config.trusted_proxies.nets, "WebSocket: forwarded headers believed from these proxies only");
     }
+    crate::ws::cap_frame_logs();
 
     // The middleware is always in: with nothing configured it passes every
-    // request through, as the bare server did.
+    // request through to the upgrade.
     let api_key = config.api_key.clone();
     let api_key_header = config.api_key_header.clone();
     let allowed_origins = auth::normalized_origins(&config.allowed_origins);
     let allowed_hosts = crate::host::normalized(&config.allowed_hosts);
     let policy: Arc<auth::Policy> = (&options).into();
-    // AUTH-12: per-IP, per-principal and anonymous quotas, and jsonrpsee's
-    // own ceiling set explicitly rather than its default 100.
+    // AUTH-12: per-IP, per-principal and anonymous quotas, and the total.
     let quotas = Quotas::new(config.quotas.clone(), session_validator.is_some());
     // TRANSPORT-7: the proxies whose forwarded headers are believed.
     let proxies = Arc::new(config.trusted_proxies.clone());
-    let middleware = tower::ServiceBuilder::new().layer_fn(move |service| CombinedAuthMiddleware {
-        service,
-        api_key: api_key.clone(),
-        api_key_header: api_key_header.clone(),
-        session_validator: session_validator.clone(),
-        reject_on_session_failure: options.reject_on_session_failure,
-        allowed_origins: allowed_origins.clone(),
-        allowed_hosts: allowed_hosts.clone(),
-        policy: policy.clone(),
-        quotas: Some(quotas.clone()),
-        proxies: proxies.clone(),
-    });
-    let svc_builder = Server::builder()
-        .set_http_middleware(middleware)
-        .to_service_builder()
-        .max_connections(config.quotas.max_connections);
     let methods = jsonrpsee::Methods::from(module);
     // BIDIR-8: each connection's call count.
     let max_calls = config.quotas.max_calls_per_connection;
+    let limits = options.limits.clone();
+    let shared = crate::ws::Shared::new(methods, limits.clone(), options.hooks.clone(), config.quotas.max_connections);
+    // RPC-4: the sockets not yet upgraded, per IP — the quotas' per-IP
+    // ceiling unless the limits name another.
+    let pending = Pending::new(limits.max_pending_per_ip.unwrap_or(config.quotas.max_per_ip));
 
     let listener = TcpListener::bind(config.addr).await?;
     let local_addr = listener.local_addr()?;
-    let (stop_handle, server_handle) = stop_channel();
+    let (stop, server_handle) = crate::ws::stop_channel();
+    let middleware = CombinedAuthMiddleware {
+        service: crate::ws::Upgrade { shared, stop: stop.clone() },
+        api_key,
+        api_key_header,
+        session_validator,
+        reject_on_session_failure: options.reject_on_session_failure,
+        allowed_origins,
+        allowed_hosts,
+        policy,
+        quotas: Some(quotas),
+        proxies,
+    };
 
-    // AUTH-11: jsonrpsee's low-level accept loop, so each connection gets
-    // its own stop handle (a socket can be closed alone) and its peer
-    // address rides into the middleware.
+    // AUTH-11: the accept loop is ours, so each connection has its own close
+    // and its peer address rides into the checks.
     tokio::spawn(async move {
+        let shutdown = stop.clone().shutdown();
+        tokio::pin!(shutdown);
         loop {
             let (sock, peer) = tokio::select! {
                 res = listener.accept() => match res {
@@ -364,37 +482,21 @@ pub async fn serve_websocket_with(
                         continue;
                     }
                 },
-                _ = stop_handle.clone().shutdown() => break,
+                _ = &mut shutdown => break,
             };
-            // As jsonrpsee's own server does: without it every small reply
-            // waits on Nagle and the peer's delayed ACK (~40 ms a call).
+            // Without it every small reply waits on Nagle and the peer's
+            // delayed ACK (~40 ms a call).
             if let Err(e) = sock.set_nodelay(true) {
                 tracing::debug!("websocket set_nodelay: {e}");
             }
-            let (conn_stop, conn_handle) = stop_channel();
-            // The server's stop closes every connection.
-            let server_stop = stop_handle.clone();
-            let forward = conn_handle.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = server_stop.shutdown() => { let _ = forward.stop(); }
-                    _ = forward.clone().stopped() => {}
-                }
-            });
-            let conn = Arc::new(Connection { peer, handle: conn_handle, calls: crate::calls::ConnectionCalls::new(max_calls) });
-            let svc_builder = svc_builder.clone();
-            let methods = methods.clone();
-            let conn_stop_for_serve = conn_stop.clone();
-            let svc = tower::service_fn(move |mut req: http::Request<hyper::body::Incoming>| {
-                req.extensions_mut().insert(conn.clone());
-                let mut svc = svc_builder.clone().build(methods.clone(), conn_stop.clone());
-                async move { svc.call(req).await.map_err(anyhow::Error::from_boxed) }.boxed()
-            });
-            tokio::spawn(async move {
-                if let Err(e) = serve_with_graceful_shutdown(sock, svc, conn_stop_for_serve.shutdown()).await {
-                    tracing::debug!("websocket connection closed: {e}");
-                }
-            });
+            // RPC-4: past its IP's bound of sockets not yet upgraded, a new
+            // one is dropped here, before a byte of it is read.
+            let Some(place) = pending.take(peer.ip()) else {
+                tracing::debug!(%peer, "WebSocket: dropped — its address holds too many sockets not yet upgraded");
+                continue;
+            };
+            let conn = Arc::new(Connection::new(peer, max_calls, Some(place)));
+            tokio::spawn(crate::ws::serve_http(sock, conn, middleware.clone(), stop.clone(), limits.header_timeout));
         }
     });
 
@@ -402,7 +504,7 @@ pub async fn serve_websocket_with(
 }
 
 // ---------------------------------------------------------------------------
-// Combined auth middleware for jsonrpsee's HTTP upgrade path
+// Combined auth middleware for the WebSocket's HTTP upgrade path
 // AUTHZ-BEARER-1: separates the static api_key admission gate (configurable
 // header, default X-Plexus-API-Key) from the SessionValidator path which
 // consumes Cookie and/or Authorization: Bearer.
@@ -420,7 +522,7 @@ pub(crate) mod auth {
 
     type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
     type HttpRequest<B> = http::Request<B>;
-    type HttpResponse = http::Response<jsonrpsee::server::HttpBody>;
+    type HttpResponse = http::Response<crate::ws::HttpBody>;
 
     /// Tower middleware layer for AUTHZ-BEARER-1 WS upgrade authentication.
     ///
@@ -473,7 +575,7 @@ pub(crate) mod auth {
         principal: Option<String>,
     ) -> Result<(), HttpResponse> {
         let Some(quotas) = quotas else { return Ok(()) };
-        if !jsonrpsee::server::ws::is_upgrade_request(request) {
+        if !crate::ws::is_upgrade_request(request) {
             return Ok(());
         }
         // TRANSPORT-7: the client a trusted proxy forwarded, else the peer.
@@ -492,7 +594,7 @@ pub(crate) mod auth {
                     .status(http::StatusCode::TOO_MANY_REQUESTS)
                     .header(http::header::RETRY_AFTER, "5")
                     .header(http::header::CONTENT_TYPE, "text/plain")
-                    .body(jsonrpsee::server::HttpBody::from(format!("Too many connections: {why}")))
+                    .body(crate::ws::HttpBody::from(format!("Too many connections: {why}")))
                     .expect("static response is valid"))
             }
         }
@@ -549,7 +651,7 @@ pub(crate) mod auth {
                     .header(http::header::CONTENT_TYPE, "application/json")
                     .header(http::header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                     .header(http::header::CACHE_CONTROL, "max-age=3600")
-                    .body(jsonrpsee::server::HttpBody::from(m.body.clone()))
+                    .body(crate::ws::HttpBody::from(m.body.clone()))
                     .expect("static response is valid"),
             )
         }
@@ -598,7 +700,7 @@ pub(crate) mod auth {
         http::Response::builder()
             .status(http::StatusCode::MISDIRECTED_REQUEST)
             .header(http::header::CONTENT_TYPE, "text/plain")
-            .body(jsonrpsee::server::HttpBody::from(crate::host::REFUSAL))
+            .body(crate::ws::HttpBody::from(crate::host::REFUSAL))
             .expect("static response is valid")
     }
 
@@ -606,7 +708,7 @@ pub(crate) mod auth {
         http::Response::builder()
             .status(http::StatusCode::FORBIDDEN)
             .header(http::header::CONTENT_TYPE, "text/plain")
-            .body(jsonrpsee::server::HttpBody::from(body))
+            .body(crate::ws::HttpBody::from(body))
             .expect("static response is valid")
     }
 
@@ -623,7 +725,7 @@ pub(crate) mod auth {
             .status(http::StatusCode::UNAUTHORIZED)
             .header(http::header::WWW_AUTHENTICATE, challenge)
             .header(http::header::CONTENT_TYPE, "text/plain")
-            .body(jsonrpsee::server::HttpBody::from(body))
+            .body(crate::ws::HttpBody::from(body))
             .expect("static response is valid")
     }
 
@@ -736,7 +838,7 @@ pub(crate) mod auth {
                                 target: "plexus_transport::auth_compat_shim",
                                 configured_header = %self.api_key_header,
                                 auth_compat_shim_fires_total = 1u64,
-                                "deprecated: Bearer-as-api-key compatibility shim fired; \
+                                "deprecated: the api-key-in-Authorization compatibility shim fired; \
                                  migrate to {} header",
                                 self.api_key_header,
                             );
@@ -805,7 +907,7 @@ pub(crate) mod auth {
                             auth_ctx = validator.validate(bearer).await;
                             if auth_ctx.is_some() {
                                 tracing::debug!(
-                                    "WS upgrade: SessionValidator accepted Bearer token"
+                                    "WS upgrade: SessionValidator accepted the Authorization credential"
                                 );
                             }
                         }
@@ -826,7 +928,7 @@ pub(crate) mod auth {
                             }
                             // AUTH-11: a socket signed in is watched, and
                             // closed once its sign-in ends.
-                            if jsonrpsee::server::ws::is_upgrade_request(&request) {
+                            if crate::ws::is_upgrade_request(&request) {
                                 if let Some(conn) = request.extensions().get::<Arc<super::Connection>>() {
                                     super::watch_liveness(Arc::downgrade(conn), validator.clone(), ctx.clone());
                                 }

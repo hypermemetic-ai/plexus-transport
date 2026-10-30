@@ -20,13 +20,24 @@ thiserror = "2.0"
 tracing = "0.1"
 
 # JSON-RPC and WebSocket
+# server-core: jsonrpsee-core's method table (RpcModule, Methods), which
+# plexus-core, the macro's server half and every service register into, and
+# which PERF-20's loop drives — jsonrpsee-server is not in it.
 # ws-client: Z2H-6 boot-time registry self-registration (src/registry.rs)
-jsonrpsee = { version = "0.26", features = ["server", "ws-client"] }
+jsonrpsee = { version = "0.26", features = ["server-core", "ws-client"] }
+# PERF-20: the socket's framing (RFC 6455) is tokio-tungstenite's, at the
+# version plexus-client brings in; the loop over it is ours (src/ws/).
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 # AUTH-11: the WebSocket accept loop is hand-rolled (per-connection stop
-# handles and peer addresses), so hyper is always in.
+# handles and peer addresses), so hyper is always in; PERF-20: its HTTP/1.1
+# server, with a header timeout (RPC-4), answers the upgrade.
 hyper = { version = "1.11", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
 bytes = "1"
 http-body = "1"
+# ACCESS-62: the framing's `log` records are capped at debug (src/ws/mod.rs).
+log = "0.4"
 
 # MCP protocol (feature "mcp", default-OFF as of 0.5.0).
 # Held at 0.12 deliberately: plexus-core 0.6 depends on rmcp 0.12

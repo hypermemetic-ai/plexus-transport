@@ -50,6 +50,8 @@ pub mod registry;
 pub mod server;
 pub mod stdio;
 pub mod websocket;
+/// PERF-20: the WebSocket connection loop, plexus-transport's own.
+pub mod ws;
 
 #[cfg(feature = "mcp")]
 pub mod mcp;
@@ -74,6 +76,9 @@ pub use server::{RegistryOptions, TransportServer, TransportServerBuilder};
 pub use protected_resource::ProtectedResource;
 pub use proxy::{init_trusted_proxies, ForwardedClient, IpNet, TrustedProxies};
 pub use websocket::UpgradeOptions;
+// PERF-20: the socket's loop — its handle, its limits, the hook and the
+// writer (BIDIR-12), the encoding fixed at the upgrade (PERF-9).
+pub use ws::{ConnectionHook, ConnectionWriter, Encoding, Hooks, Outbound, ServerHandle, SocketLimits};
 pub use request::{ValidOrigin, init_allowed_origins};
 
 // TRANSPORT-16: the mounted bridge's configuration, and the crate it is.

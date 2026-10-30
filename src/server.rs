@@ -2,7 +2,7 @@
 
 use anyhow::Result;
 use plexus_core::plexus::{Activation, PlexusError, PlexusStream, PluginSchema, SessionValidator};
-use jsonrpsee::server::ServerHandle;
+use crate::ws::ServerHandle;
 use jsonrpsee::RpcModule;
 use serde_json::Value;
 use std::future::Future;
@@ -806,6 +806,22 @@ impl<A: Activation> TransportServerBuilder<A> {
     /// `resource_metadata="<that URL>"` in its `WWW-Authenticate`.
     pub fn with_protected_resource(mut self, resource: ProtectedResource) -> Self {
         self.upgrade.protected_resource = Some(resource);
+        self
+    }
+
+    /// PERF-20: the WebSocket's limits — the message cap, ping and idle
+    /// (RPC-5), the header timeout and the sockets not yet upgraded per IP
+    /// (RPC-4), the writer's queue and budget. Unset: today's values, or
+    /// their gaps' ([`crate::ws::SocketLimits`]).
+    pub fn with_socket_limits(mut self, limits: crate::ws::SocketLimits) -> Self {
+        self.upgrade.limits = limits;
+        self
+    }
+
+    /// PERF-20 → BIDIR-12: a hook over each upgraded connection's inbound
+    /// frames, made per connection by `hooks`.
+    pub fn with_hooks(mut self, hooks: crate::ws::Hooks) -> Self {
+        self.upgrade.hooks = Some(hooks);
         self
     }
 

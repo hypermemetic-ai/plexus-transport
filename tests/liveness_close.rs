@@ -42,7 +42,7 @@ impl SessionValidator for Sessions {
     }
 }
 
-async fn server(sessions: Arc<Sessions>) -> (jsonrpsee::server::ServerHandle, u16) {
+async fn server(sessions: Arc<Sessions>) -> (plexus_transport::ServerHandle, u16) {
     let mut module = RpcModule::new(());
     module.register_method("ping", |_, _, _| "pong").unwrap();
     let config = WebSocketConfig::new(0);
