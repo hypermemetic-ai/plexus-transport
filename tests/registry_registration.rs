@@ -13,7 +13,6 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use jsonrpsee::server::Server;
 use jsonrpsee::RpcModule;
 use plexus_core::plexus::DynamicHub;
 use plexus_transport::registry::{self, RegistryRegistration};
@@ -42,12 +41,13 @@ fn done_item() -> Value {
     json!({"type": "done", "metadata": meta()})
 }
 
-/// Start a fake registry hub on an OS-assigned port. Mirrors the wire
-/// surface synapse + plexus-transport actually speak: a namespace-free
-/// `_info` subscription and a `registry-hub.call` subscription routing
+/// Start a fake registry service on an OS-assigned port, served by
+/// plexus-transport's own WebSocket (PERF-20). Mirrors the wire surface
+/// synapse + plexus-transport actually speak: a namespace-free `_info`
+/// subscription and a `registry-hub.call` subscription routing
 /// `registry.*` methods.
-async fn start_fake_registry(recorded: Recorded) -> (SocketAddr, jsonrpsee::server::ServerHandle) {
-    let mut module = RpcModule::new(recorded);
+async fn start_fake_registry(recorded: Recorded) -> (SocketAddr, plexus_transport::ServerHandle) {
+    let mut module = RpcModule::new(());
 
     module
         .register_subscription("_info", "result", "_info_unsub", |_p, pending, _ctx, _ext| {
@@ -69,8 +69,8 @@ async fn start_fake_registry(recorded: Recorded) -> (SocketAddr, jsonrpsee::serv
             "registry-hub.call",
             "result",
             "registry-hub.call_unsub",
-            |params, pending, ctx, _ext| {
-                let recorded: Recorded = (*ctx).clone();
+            move |params, pending, _ctx, _ext| {
+                let recorded = recorded.clone();
                 Box::pin(async move {
                     let call: Value = params.parse()?;
                     let sink = pending.accept().await?;
@@ -102,12 +102,9 @@ async fn start_fake_registry(recorded: Recorded) -> (SocketAddr, jsonrpsee::serv
         )
         .unwrap();
 
-    let server = Server::builder()
-        .build("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+    let (handle, addr) = plexus_transport::websocket::serve_websocket(module, plexus_transport::WebSocketConfig::new(0), None, false)
         .await
         .unwrap();
-    let addr = server.local_addr().unwrap();
-    let handle = server.start(module);
     (addr, handle)
 }
 

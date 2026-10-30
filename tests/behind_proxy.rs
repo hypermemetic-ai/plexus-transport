@@ -32,7 +32,7 @@ impl SessionValidator for Names {
 const SMALL: ConnectionQuotas =
     ConnectionQuotas { max_connections: 100, max_per_ip: 5, max_per_principal: 50, max_anonymous: 50, max_anonymous_per_ip: 2, max_calls_per_connection: 256 };
 
-async fn server(trusted: &[&str]) -> (jsonrpsee::server::ServerHandle, u16) {
+async fn server(trusted: &[&str]) -> (plexus_transport::ServerHandle, u16) {
     let mut module = RpcModule::new(());
     // What the application sees of its caller: the upgrade's ForwardedClient.
     module

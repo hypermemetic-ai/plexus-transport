@@ -71,6 +71,9 @@ async fn the_websocket_answers_only_its_hosts() {
     assert_eq!(raw(port, "/", None, UPGRADE).await.0, 421, "no host at all");
     assert_eq!(raw(port, "/", Some(&format!("localhost:{port}")), UPGRADE).await.0, 101);
     assert_eq!(raw(port, "/", Some(&format!("127.0.0.1:{port}")), UPGRADE).await.0, 101);
+    // PERF-20: past the host check, a request that is not an upgrade is 426
+    // (jsonrpsee-server's plain-HTTP JSON-RPC on this port is gone).
+    assert_eq!(raw(port, "/", Some(&format!("127.0.0.1:{port}")), "").await.0, 426, "plain HTTP, the right host");
 
     let c = WsClientBuilder::default().build(format!("ws://127.0.0.1:{port}")).await.unwrap();
     let pong: String = c.request("ping", rpc_params![]).await.unwrap();

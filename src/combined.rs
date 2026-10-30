@@ -2,12 +2,12 @@
 //!
 //! Routes incoming connections by path:
 //! - `/mcp/*`  → rmcp `StreamableHttpService` (MCP Streamable HTTP)
-//! - everything else → jsonrpsee `TowerService` (WebSocket JSON-RPC + HTTP batch)
+//! - `/rest/*` → the REST bridge (feature `http-gateway`)
+//! - everything else → the WebSocket (PERF-20: plexus-transport's own loop,
+//!   [`crate::ws`]); a request there that is not an upgrade is `426` —
+//!   jsonrpsee-server's plain-HTTP JSON-RPC catch-all is gone.
 //!
 //! Both transports share one `TcpListener` bound to the configured address.
-//! WebSocket upgrades work because jsonrpsee's `TowerService` is served via
-//! `serve_with_graceful_shutdown`, which uses `hyper_util`'s
-//! `serve_connection_with_upgrades` under the hood.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -15,10 +15,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use axum::{body::Body as AxumBody, Router};
 use hyper::body::Incoming;
-use jsonrpsee::{
-    RpcModule,
-    server::{Server, ServerHandle, serve_with_graceful_shutdown, stop_channel},
-};
+use jsonrpsee::RpcModule;
 use plexus_core::plexus::{Activation, PluginSchema};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService,
@@ -26,7 +23,9 @@ use rmcp::transport::streamable_http_server::{
 };
 use futures::FutureExt;
 use tokio::net::TcpListener;
-use tower::{Service, ServiceExt};
+use tower::ServiceExt;
+
+use crate::ws::ServerHandle;
 
 use axum::extract::State;
 use axum::middleware::{self as axum_middleware, Next as AxumNext};
@@ -37,7 +36,7 @@ use crate::mcp::bridge::{ActivationMcpBridge, RouteFn};
 /// Serve WebSocket JSON-RPC and MCP HTTP on the **same** port.
 ///
 /// - `GET /` (with `Upgrade: websocket`) and all other non-`/mcp` paths →
-///   jsonrpsee WebSocket + HTTP JSON-RPC
+///   the WebSocket (anything there but an upgrade is `426`)
 /// - `POST /mcp`, `GET /mcp` → rmcp Streamable HTTP (MCP 2025-03-26)
 ///
 /// The returned `ServerHandle` can be awaited via `handle.stopped()` and
@@ -130,9 +129,7 @@ where
     let rest_router_opt: Option<Router> = None;
 
     // Axum router — intercepts /mcp and optionally /rest; all other requests fall through to
-    // jsonrpsee via the else branch in the per-connection service_fn.
-    // Auth middleware is applied here so that WebSocket upgrades (handled by
-    // jsonrpsee below) are also protected by the check inside serve_websocket.
+    // the WebSocket upgrade via the else branch in the per-connection service.
     let mut mcp_router: Router = Router::new()
         .nest_service("/mcp", mcp_service);
 
@@ -147,9 +144,16 @@ where
     ));
 
     // ── JSON-RPC / WebSocket side ────────────────────────────────────────────
-    let (stop_handle, server_handle) = stop_channel();
-    let svc_builder = Server::builder().to_service_builder();
-    let methods = jsonrpsee::Methods::from(module);
+    crate::ws::cap_frame_logs();
+    let (stop_handle, server_handle) = crate::ws::stop_channel();
+    let limits = crate::ws::SocketLimits::default();
+    let shared = crate::ws::Shared::new(
+        jsonrpsee::Methods::from(module),
+        limits.clone(),
+        None,
+        crate::ConnectionQuotas::default().max_connections,
+    );
+    let upgrade = crate::ws::Upgrade { shared, stop: stop_handle.clone() };
 
     // ── Shared TCP listener ──────────────────────────────────────────────────
     let listener = TcpListener::bind(addr).await?;
@@ -160,94 +164,69 @@ where
         tracing::info!("Starting REST HTTP transport at http://{}/rest", addr);
     }
 
-    let stop = stop_handle.clone();
     // Pre-compute the expected Authorization header value for WebSocket path checks.
     let ws_auth_header: Option<String> = api_key.map(|k| format!("Bearer {}", k));
 
     tokio::spawn(async move {
+        let shutdown = stop_handle.clone().shutdown();
+        tokio::pin!(shutdown);
         loop {
-            let (sock, _peer) = tokio::select! {
+            let (sock, peer) = tokio::select! {
                 res = listener.accept() => match res {
                     Ok(x) => x,
-                    Err(e) => { tracing::error!("combined accept: {}", e); continue; }
+                    Err(e) => {
+                        tracing::error!("combined accept: {}", e);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                        continue;
+                    }
                 },
-                _ = stop.clone().shutdown() => break,
+                _ = &mut shutdown => break,
             };
+            if let Err(e) = sock.set_nodelay(true) {
+                tracing::debug!("combined set_nodelay: {e}");
+            }
+            let conn = Arc::new(crate::websocket::Connection::new(peer, crate::CALLS_PER_CONNECTION, None));
+            let (mcp, upgrade, ws_auth) = (mcp_router.clone(), upgrade.clone(), ws_auth_header.clone());
 
-            let svc_b = svc_builder.clone();
-            let m = methods.clone();
-            let stop2 = stop.clone();
-            let mcp = mcp_router.clone();
-            let ws_auth = ws_auth_header.clone();
-
-            tokio::spawn(async move {
-                // Clone stop2 before moving into the closure, for the shutdown future.
-                let stop_for_serve = stop2.clone();
-
-                // Per-connection service — routes each request by path.
-                let svc = tower::service_fn(move |req: http::Request<Incoming>| {
-                    let mcp = mcp.clone();
-                    let svc_b = svc_b.clone();
-                    let m = m.clone();
-                    let stop2 = stop2.clone();
-                    let ws_auth = ws_auth.clone();
-
-                    async move {
-                        if req.uri().path().starts_with("/mcp") || req.uri().path().starts_with("/rest") {
-                            // Axum expects Request<AxumBody>; wrap Incoming.
-                            let (parts, body) = req.into_parts();
-                            let axum_req =
-                                http::Request::from_parts(parts, AxumBody::new(body));
-
-                            // Router<()> returns Response<AxumBody> with Infallible error.
-                            mcp.oneshot(axum_req)
-                                .await
-                                .map_err(|e| anyhow::anyhow!("{e}"))
-                        } else {
-                            // For non-MCP requests (WebSocket upgrades and JSON-RPC HTTP):
-                            // validate the auth header before handing off to jsonrpsee.
-                            if let Some(ref expected) = ws_auth {
-                                let ok = req
-                                    .headers()
-                                    .get(http::header::AUTHORIZATION)
-                                    .and_then(|v| v.to_str().ok())
-                                    .map(|v| v == expected)
-                                    .unwrap_or(false);
-
-                                if !ok {
-                                    tracing::warn!(
-                                        "WebSocket auth rejected: missing or invalid Authorization header (uri={})",
-                                        req.uri()
-                                    );
-                                    let resp = http::Response::builder()
-                                        .status(http::StatusCode::UNAUTHORIZED)
-                                        .header(http::header::WWW_AUTHENTICATE, "Bearer realm=\"plexus\"")
-                                        .header(http::header::CONTENT_TYPE, "text/plain")
-                                        .body(AxumBody::from("Unauthorized"))
-                                        .expect("static response is valid");
-                                    return Ok(resp);
-                                }
-                            }
-
-                            // TowerService is generic over RequestBody; pass Incoming directly.
-                            let mut rpc_svc = svc_b.build(m, stop2);
-
-                            rpc_svc
-                                .call(req)
-                                .await
-                                .map(|resp: http::Response<_>| resp.map(AxumBody::new))
-                                .map_err(anyhow::Error::from_boxed)
+            // Per-connection service — routes each request by path.
+            let svc = tower::service_fn(move |req: http::Request<Incoming>| {
+                let (mcp, upgrade, ws_auth) = (mcp.clone(), upgrade.clone(), ws_auth.clone());
+                async move {
+                    if req.uri().path().starts_with("/mcp") || req.uri().path().starts_with("/rest") {
+                        // Axum expects Request<AxumBody>; wrap Incoming.
+                        let (parts, body) = req.into_parts();
+                        let axum_req = http::Request::from_parts(parts, AxumBody::new(body));
+                        // Router<()> returns Response<AxumBody> with Infallible error.
+                        return mcp.oneshot(axum_req).await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) });
+                    }
+                    // Everything else is the WebSocket: the auth header
+                    // checked first, then the upgrade (or 426).
+                    if let Some(ref expected) = ws_auth {
+                        let ok = req
+                            .headers()
+                            .get(http::header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .map(|v| v == expected)
+                            .unwrap_or(false);
+                        if !ok {
+                            tracing::warn!(
+                                "WebSocket auth rejected: missing or invalid Authorization header (uri={})",
+                                req.uri()
+                            );
+                            let resp = http::Response::builder()
+                                .status(http::StatusCode::UNAUTHORIZED)
+                                .header(http::header::WWW_AUTHENTICATE, "Bearer realm=\"plexus\"")
+                                .header(http::header::CONTENT_TYPE, "text/plain")
+                                .body(AxumBody::from("Unauthorized"))
+                                .expect("static response is valid");
+                            return Ok(resp);
                         }
                     }
-                    .boxed()
-                });
-
-                if let Err(e) =
-                    serve_with_graceful_shutdown(sock, svc, stop_for_serve.shutdown()).await
-                {
-                    tracing::debug!("combined connection closed: {}", e);
+                    Ok(upgrade.upgrade(req).map(AxumBody::new))
                 }
+                .boxed()
             });
+            tokio::spawn(crate::ws::serve_http(sock, conn, svc, stop_handle.clone(), limits.header_timeout));
         }
     });
 

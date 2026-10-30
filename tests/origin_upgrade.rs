@@ -45,7 +45,7 @@ struct Inner {
 }
 
 impl Service<http::Request<Empty<Bytes>>> for Inner {
-    type Response = http::Response<jsonrpsee::server::HttpBody>;
+    type Response = http::Response<plexus_transport::websocket::HttpBody>;
     type Error = Infallible;
     type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -55,7 +55,7 @@ impl Service<http::Request<Empty<Bytes>>> for Inner {
 
     fn call(&mut self, _: http::Request<Empty<Bytes>>) -> Self::Future {
         self.reached.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok(http::Response::builder().status(200).body(jsonrpsee::server::HttpBody::from("ok")).unwrap()) })
+        Box::pin(async { Ok(http::Response::builder().status(200).body(plexus_transport::websocket::HttpBody::from("ok")).unwrap()) })
     }
 }
 

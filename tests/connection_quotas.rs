@@ -31,7 +31,7 @@ impl SessionValidator for Names {
 const SMALL: ConnectionQuotas =
     ConnectionQuotas { max_connections: 100, max_per_ip: 7, max_per_principal: 2, max_anonymous: 4, max_anonymous_per_ip: 3, max_calls_per_connection: 256 };
 
-async fn server(validator: Option<Arc<dyn SessionValidator>>) -> (jsonrpsee::server::ServerHandle, u16) {
+async fn server(validator: Option<Arc<dyn SessionValidator>>) -> (plexus_transport::ServerHandle, u16) {
     let mut module = RpcModule::new(());
     module.register_method("ping", |_, _, _| "pong").unwrap();
     let mut config = WebSocketConfig::new(0);
