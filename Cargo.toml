@@ -69,6 +69,12 @@ uuid = { version = "1.6", features = ["v4"] }
 tower = "0.5"
 # AUTHZ-BEARER-1 integration tests: empty HTTP body + BodyExt::collect.
 http-body-util = "0.1"
+# PERF-20: the socket-edge tests' client (frames written by hand when a test
+# needs what a well-behaved client never sends), and ACCESS-62's trace
+# capture (fmt, with the `log` bridge, so the WebSocket library's own
+# records are caught too).
+tokio-tungstenite = "0.30"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # plexus-macros aliased as "schemars" (schemars-compat feature) so that
 # #[derive(schemars::JsonSchema)] in tests resolves to the no-op derive,
 # preventing duplicate impl JsonSchema conflicts with PlexusRequest's
