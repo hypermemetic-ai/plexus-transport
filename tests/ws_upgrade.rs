@@ -125,3 +125,29 @@ async fn past_max_connections_the_upgrade_is_429() {
     let mut ws = connect(port).await;
     assert_eq!(request(&mut ws, 1, "ping", serde_json::json!([])).await["result"], "pong");
 }
+
+/// RPC-4 behind a proxy (TRANSPORT-7): a trusted proxy's address carries
+/// every client's sockets before their headers name the client, so it is
+/// held to the total (`max_connections`), not to the per-IP ceiling that its
+/// forwarded clients are each held to. Another address keeps the per-IP one.
+#[tokio::test]
+async fn a_trusted_proxy_is_held_to_the_total_not_to_the_per_ip_ceiling() {
+    let quotas = ConnectionQuotas { max_per_ip: 2, max_connections: 50, ..ConnectionQuotas::default() };
+    let proxies = plexus_transport::TrustedProxies::parse(["127.0.0.1"]).unwrap();
+    let config = WebSocketConfig { quotas, ..WebSocketConfig::new(0) }.with_trusted_proxies(proxies);
+    let port = serve_with(module(), config, UpgradeOptions::default()).await;
+    let mut socks = Vec::new();
+    for _ in 0..10 {
+        let mut s = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n").as_bytes()).await.unwrap();
+        socks.push(s);
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut held = 0;
+    for s in socks.iter_mut() {
+        if !closed_within(s, Duration::from_millis(20)).await {
+            held += 1;
+        }
+    }
+    assert_eq!(held, 10, "a trusted proxy's sockets not yet upgraded are held to the total (50), not to 2");
+}

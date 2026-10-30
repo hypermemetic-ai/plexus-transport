@@ -70,7 +70,9 @@ pub struct SocketLimits {
     pub header_timeout: Duration,
     /// Sockets accepted from one client IP and not yet upgraded; past it, a
     /// new one is dropped at the accept loop (RPC-4). `None` (the default):
-    /// the connection quotas' `max_per_ip`.
+    /// the connection quotas' `max_per_ip`. A trusted proxy's address
+    /// carries every client's sockets before their headers name the client,
+    /// so it is held to the quotas' `max_connections` instead.
     pub max_pending_per_ip: Option<u32>,
     /// Frames queued for a socket's writer before its calls wait. Default
     /// 1,024 (jsonrpsee's `message_buffer_capacity`).

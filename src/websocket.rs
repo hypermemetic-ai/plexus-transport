@@ -192,10 +192,9 @@ impl Connection {
     }
 }
 
-/// RPC-4: the sockets accepted from each client IP and not yet upgraded.
-#[derive(Debug)]
+/// RPC-4: the sockets accepted from each address and not yet upgraded.
+#[derive(Debug, Default)]
 pub(crate) struct Pending {
-    max: u32,
     per_ip: Mutex<HashMap<IpAddr, u32>>,
 }
 
@@ -208,15 +207,11 @@ pub(crate) struct PendingPlace {
 }
 
 impl Pending {
-    pub(crate) fn new(max: u32) -> Arc<Self> {
-        Arc::new(Self { max, per_ip: Mutex::new(HashMap::new()) })
-    }
-
-    /// A place for a socket from `ip`, or `None`: its IP is at the bound.
-    pub(crate) fn take(self: &Arc<Self>, ip: IpAddr) -> Option<PendingPlace> {
+    /// A place for a socket from `ip`, or `None`: the address holds `max`.
+    pub(crate) fn take(self: &Arc<Self>, ip: IpAddr, max: u32) -> Option<PendingPlace> {
         let mut m = self.per_ip.lock().unwrap_or_else(|p| p.into_inner());
         let n = m.entry(ip).or_default();
-        if *n >= self.max {
+        if *n >= max {
             return None;
         }
         *n += 1;
@@ -450,9 +445,14 @@ pub async fn serve_websocket_with(
     let max_calls = config.quotas.max_calls_per_connection;
     let limits = options.limits.clone();
     let shared = crate::ws::Shared::new(methods, limits.clone(), options.hooks.clone(), config.quotas.max_connections);
-    // RPC-4: the sockets not yet upgraded, per IP — the quotas' per-IP
-    // ceiling unless the limits name another.
-    let pending = Pending::new(limits.max_pending_per_ip.unwrap_or(config.quotas.max_per_ip));
+    // RPC-4: the sockets not yet upgraded, per address — the quotas' per-IP
+    // ceiling unless the limits name another. A trusted proxy's address
+    // carries every client's sockets before their headers name the client,
+    // so it is held to the total instead (TRANSPORT-7).
+    let pending = Arc::new(Pending::default());
+    let per_ip = limits.max_pending_per_ip.unwrap_or(config.quotas.max_per_ip);
+    let per_proxy = config.quotas.max_connections.max(per_ip);
+    let proxies_seen = proxies.clone();
 
     let listener = TcpListener::bind(config.addr).await?;
     let local_addr = listener.local_addr()?;
@@ -496,7 +496,8 @@ pub async fn serve_websocket_with(
             }
             // RPC-4: past its IP's bound of sockets not yet upgraded, a new
             // one is dropped here, before a byte of it is read.
-            let Some(place) = pending.take(peer.ip()) else {
+            let bound = if proxies_seen.contains(&peer.ip()) { per_proxy } else { per_ip };
+            let Some(place) = pending.take(peer.ip(), bound) else {
                 tracing::debug!(%peer, "WebSocket: dropped — its address holds too many sockets not yet upgraded");
                 continue;
             };
