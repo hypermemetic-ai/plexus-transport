@@ -46,3 +46,19 @@ test = [
 ]
 image = "rust:latest"
 timeout_secs = 900
+
+# PERF-6: plexus-bench's `check --ci` — every PERF scenario's in-process form,
+# its instruction count (iai-callgrind under valgrind, in plexus-bench's
+# container where the host has none) and allocations against plexus-bench's
+# goldens/ci, red on a 10 % increase. plexus-bench is the sibling checkout
+# (../plexus-bench); it measures the siblings beside it.
+[[ci.runners]]
+type = "local"
+build = [
+    "../plexus-bench/scripts/ci-check.sh",
+    "--build",
+]
+test = [
+    "../plexus-bench/scripts/ci-check.sh",
+]
+timeout_secs = 2400
