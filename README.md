@@ -278,14 +278,16 @@ tokio-tungstenite's; jsonrpsee-core's method table (`Methods`, which every
 service registers into) is driven from it, and jsonrpsee-server is not on the
 path.
 
-- **One reader per socket** takes every frame in arrival order — no task per
-  frame — and routes it by its shape: a call to the method table (a
-  subscription is its own task, so calls on one socket overlap), an answer to
-  no request of this side's dropped (never `-32600`).
-- **One writer per socket** takes every frame ready when it wakes, up to its
+- **One task per socket** reads and writes it; a call is a task of its own
+  (jsonrpsee-core's subscription task), so calls on one socket overlap, and a
+  call's frames and the wakes they cause land on the socket's one task.
+- **Its reader** takes every frame in arrival order — no task per frame — and
+  routes it by its shape: a call to the method table, an answer to no
+  request of this side's dropped (never `-32600`).
+- **Its writer** takes every frame ready when the task wakes, up to its
   budget (64 KiB), and flushes once — a call's frames, or a stream's ready
   items, share one `send` — then yields to other sockets. The queue is
-  bounded (1,024 frames): a reader that does not read holds its socket's
+  bounded (1,024 frames): a peer that does not read holds its socket's
   calls back, never the server's memory.
 - **A hook** (`UpgradeOptions::hooks`, `Hooks::new`) sees each inbound frame
   before dispatch and may take it; `Connection::writer()` writes this side's

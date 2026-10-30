@@ -10,11 +10,12 @@
 //!
 //! | when | then |
 //! | -- | -- |
-//! | frames arrive | one reader per socket takes them in arrival order and routes each by its shape (spec/14 rule 2); no task is spawned per frame |
+//! | a socket is upgraded | one task serves it, reading and writing: a call's frames and the wakes they cause land on it, never on another task (a call is its own task, jsonrpsee-core's) |
+//! | frames arrive | the socket's reader takes them in arrival order and routes each by its shape (spec/14 rule 2); no task is spawned per frame |
 //! | a call frame (`method` and `id`) | the method table's callback runs it with the upgrade's extensions (the connection, its `AuthContext`, its `ConnectionId`); a subscription is its own task (jsonrpsee-core's), so calls on one socket overlap |
 //! | each inbound frame, before dispatch | the connection's [`ConnectionHook`] sees it and may take it (BIDIR-12) |
 //! | a frame that answers no request of this side's | dropped, never answered `-32600` (LOCAL-7) |
-//! | frames are ready to write | the writer takes every ready frame, up to its budget (64 KiB), writes them and flushes once, then yields |
+//! | frames are ready to write | the socket's writer takes every ready frame, up to its budget (64 KiB), writes them and flushes once, then yields |
 //! | a reader is slow | the socket's queue is bounded (1,024 frames); a full queue holds that socket's calls back |
 //! | a message is over the cap (10 MiB) | refused `-32007` with `id: null`, the socket kept; fragments are assembled under the same cap |
 //! | a peer goes silent, or never calls | pinged on an interval and closed past the ping timeout; under an idle limit, closed with no call open past it (RPC-5) |
@@ -32,7 +33,6 @@ mod conn;
 mod guard;
 mod http;
 mod stop;
-mod writer;
 
 use std::sync::Arc;
 use std::time::Duration;

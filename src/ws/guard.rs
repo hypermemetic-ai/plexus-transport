@@ -9,8 +9,8 @@
 //! - holds a fragmented message's frames until its last one, so a message
 //!   that grows past the cap is dropped whole, never half-seen;
 //! - drops a message past the cap — its frames, as they stream in, without
-//!   keeping them — and counts it in [`Dropped`], which the reader answers
-//!   `-32007` (`id: null`, spec/01).
+//!   keeping them — and counts it in [`Dropped`], which the socket's loop
+//!   answers `-32007` (`id: null`, spec/01).
 //!
 //! Everything else — masking, opcodes, UTF-8, control frames, a stray
 //! continuation (passed on, refused there) — stays tungstenite's. Writes
@@ -24,14 +24,12 @@ use std::task::{ready, Context, Poll};
 
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::Notify;
 
-/// The messages a socket's guard dropped over the cap, and a wake for the
-/// reader that answers them.
+/// The messages a socket's guard dropped over the cap: its loop answers each
+/// `-32007` after every read (the guard runs inside that read).
 #[derive(Debug, Default)]
 pub(crate) struct Dropped {
     count: AtomicU64,
-    wake: Notify,
 }
 
 impl Dropped {
@@ -39,13 +37,8 @@ impl Dropped {
         self.count.load(Ordering::Acquire)
     }
 
-    pub(crate) async fn notified(&self) {
-        self.wake.notified().await
-    }
-
     fn one(&self) {
         self.count.fetch_add(1, Ordering::AcqRel);
-        self.wake.notify_one();
     }
 }
 

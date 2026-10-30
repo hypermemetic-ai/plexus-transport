@@ -156,6 +156,11 @@ impl Connection {
         let _ = rx.wait_for(|closed| *closed).await;
     }
 
+    /// Its close, watched (`true` once closed) — for a loop that holds it.
+    pub(crate) fn closed_watch(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.closed.subscribe()
+    }
+
     /// PERF-20 → PERF-9: the encoding every frame on it is in, fixed at its
     /// upgrade (`None` before).
     pub fn encoding(&self) -> Option<Encoding> {
