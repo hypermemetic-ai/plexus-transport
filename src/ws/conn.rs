@@ -579,8 +579,9 @@ pub(crate) async fn run(
     let config = WebSocketConfig::default()
         .max_message_size(Some(limits.max_message_size))
         .max_frame_size(Some(limits.max_message_size))
-        // Each read clears what it may fill; small for the calls' small frames.
-        .read_buffer_size(4096)
+        // tungstenite zero-fills what a read may fill before each read: small,
+        // for the calls' small frames (a large message is read in more steps).
+        .read_buffer_size(512)
         // Above the budget, so the budget's frames meet one write.
         .write_buffer_size((limits.write_budget * 2).max(128 * 1024));
     let ws: Socket = WebSocketStream::from_raw_socket(guard, Role::Server, Some(config)).await;
