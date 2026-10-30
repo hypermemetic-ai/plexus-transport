@@ -344,7 +344,17 @@ pub async fn serve_websocket_with(
     // BIDIR-8: each connection's call count.
     let max_calls = config.quotas.max_calls_per_connection;
 
-    let listener = TcpListener::bind(config.addr).await?;
+    // PERF-17 (spike, never merged) E4: PERF17_REUSEPORT=1 binds with
+    // SO_REUSEPORT, so a runtime per core can each accept on the same port.
+    let listener = if std::env::var("PERF17_REUSEPORT").map(|v| v == "1").unwrap_or(false) {
+        let sock = if config.addr.is_ipv4() { tokio::net::TcpSocket::new_v4()? } else { tokio::net::TcpSocket::new_v6()? };
+        sock.set_reuseaddr(true)?;
+        sock.set_reuseport(true)?;
+        sock.bind(config.addr)?;
+        sock.listen(1024)?
+    } else {
+        TcpListener::bind(config.addr).await?
+    };
     let local_addr = listener.local_addr()?;
     let (stop_handle, server_handle) = stop_channel();
 

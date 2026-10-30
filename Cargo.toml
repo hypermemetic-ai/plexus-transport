@@ -92,3 +92,6 @@ sqlite-sessions = ["mcp", "sqlx", "tokio-stream"]
 # flush per wakeup behind PERF17_WS_COALESCE=N (unset: 0.26.1's flush per message).
 [patch.crates-io]
 jsonrpsee-server = { path = "vendor/jsonrpsee-server" }
+# PERF-17 E4: jsonrpsee-core 0.26.1 vendored beside it — a call's frame and its
+# subscription polled once inline before any spawn, behind PERF17_INLINE=1.
+jsonrpsee-core = { path = "vendor/jsonrpsee-core" }

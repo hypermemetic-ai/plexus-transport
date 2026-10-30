@@ -173,7 +173,7 @@ where
 		let sink = sink.clone();
 		let extensions = extensions.clone();
 
-		tokio::spawn(async move {
+		let frame_task = async move {
 			let first_non_whitespace = data.iter().enumerate().take(128).find(|(_, byte)| !byte.is_ascii_whitespace());
 
 			let (idx, is_single) = match first_non_whitespace {
@@ -209,7 +209,17 @@ where
 					n.notify(is_success);
 				}
 			}
-		});
+		};
+		// PERF-17 E4: polled once inline on the connection's task, spawned only if pending.
+		if jsonrpsee_core::server::perf17_inline() {
+			let mut task = Box::pin(frame_task);
+			let first = std::future::poll_fn(|cx| std::task::Poll::Ready(task.as_mut().poll(cx))).await;
+			if first.is_pending() {
+				tokio::spawn(task);
+			}
+		} else {
+			tokio::spawn(frame_task);
+		}
 	};
 
 	// Drive all running methods to completion.
