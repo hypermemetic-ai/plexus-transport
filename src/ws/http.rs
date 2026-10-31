@@ -19,7 +19,8 @@ use jsonrpsee::Methods;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 
-use super::{Hooks, Negotiated, SocketLimits, StopHandle};
+use super::{Encodings, Hooks, Negotiated, SocketLimits, StopHandle};
+use plexus_core::plexus::encoding::{protocol_tokens, Pick};
 use crate::websocket::Connection;
 
 /// Every HTTP answer the WebSocket port gives (the 101, the 426, the
@@ -33,6 +34,8 @@ pub(crate) struct Shared {
     pub(crate) methods: Methods,
     pub(crate) limits: SocketLimits,
     pub(crate) hooks: Option<Hooks>,
+    /// PERF-9: what the service offers (spec/13).
+    pub(crate) encodings: Encodings,
     /// AUTH-12's total (`max_connections`): a place per upgraded socket.
     connections: Arc<Semaphore>,
     max_connections: u32,
@@ -41,11 +44,12 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    pub(crate) fn new(methods: Methods, limits: SocketLimits, hooks: Option<Hooks>, max_connections: u32) -> Arc<Self> {
+    pub(crate) fn new(methods: Methods, limits: SocketLimits, hooks: Option<Hooks>, encodings: Encodings, max_connections: u32) -> Arc<Self> {
         Arc::new(Self {
             methods,
             limits,
             hooks,
+            encodings,
             connections: Arc::new(Semaphore::new(max_connections as usize)),
             max_connections,
             ids: Arc::new(jsonrpsee::core::id_providers::RandomIntegerIdProvider),
@@ -121,26 +125,40 @@ impl Upgrade {
             r.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
             return r;
         };
-        // PERF-9 reads `Sec-WebSocket-Protocol` here, and PERF-8 the batch
-        // offer: what the socket speaks is settled at the upgrade.
-        let negotiated = Negotiated::default();
+        // PERF-9 (spec/13): the client names the encodings it speaks, in its
+        // order; the service picks the first it offers. (PERF-8 reads the
+        // batch offer here too.)
+        let tokens = protocol_tokens(req.headers().get_all(header::SEC_WEBSOCKET_PROTOCOL).iter().map(|v| v.as_bytes()));
+        let (negotiated, protocol) = match self.shared.encodings.pick(tokens.iter().map(String::as_str)) {
+            Pick::Picked { encoding, protocol } => (Some(Negotiated { encoding }), protocol.map(String::from)),
+            Pick::Refused { protocol } => (None, protocol),
+        };
         let on_upgrade = hyper::upgrade::on(&mut req);
         let mut ext = req.extensions().clone();
         ext.insert(jsonrpsee::ConnectionId(conn.id() as usize));
         let (shared, stop) = (self.shared.clone(), self.stop.clone());
         tokio::spawn(async move {
-            match on_upgrade.await {
-                Ok(upgraded) => super::conn::run(TokioIo::new(upgraded), conn, ext, negotiated, shared, stop, place).await,
-                Err(e) => tracing::debug!(peer = %conn.peer(), "WS upgrade did not complete: {e}"),
+            match (on_upgrade.await, negotiated) {
+                (Ok(upgraded), Some(negotiated)) => super::conn::run(TokioIo::new(upgraded), conn, ext, negotiated, shared, stop, place).await,
+                (Ok(upgraded), None) => {
+                    tracing::debug!(peer = %conn.peer(), offered = %shared.encodings, "WS upgrade: no encoding the client named is offered");
+                    super::conn::refuse(TokioIo::new(upgraded), &shared.encodings, place).await;
+                    conn.ended();
+                }
+                (Err(e), _) => tracing::debug!(peer = %conn.peer(), "WS upgrade did not complete: {e}"),
             }
         });
-        Response::builder()
+        let mut ok = Response::builder()
             .status(StatusCode::SWITCHING_PROTOCOLS)
             .header(header::CONNECTION, "upgrade")
             .header(header::UPGRADE, "websocket")
-            .header(header::SEC_WEBSOCKET_ACCEPT, accept)
-            .body(HttpBody::default())
-            .expect("static response is valid")
+            .header(header::SEC_WEBSOCKET_ACCEPT, accept);
+        // The pick — or, refused, the first entry of the ask, so the client
+        // completes its handshake and reads the close (spec/13).
+        if let Some(p) = protocol.and_then(|p| HeaderValue::from_str(&p).ok()) {
+            ok = ok.header(header::SEC_WEBSOCKET_PROTOCOL, p);
+        }
+        ok.body(HttpBody::default()).expect("static response is valid")
     }
 }
 

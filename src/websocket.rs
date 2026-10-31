@@ -82,7 +82,7 @@ use std::time::Duration;
 use tokio::net::TcpListener;
 
 use crate::config::WebSocketConfig;
-use crate::ws::{ConnectionWriter, Encoding, Hooks, Negotiated, SocketLimits};
+use crate::ws::{ConnectionWriter, Encoding, Encodings, Hooks, Negotiated, SocketLimits};
 pub use crate::ws::{HttpBody, ServerHandle};
 
 /// AUTH-11: how often an open, signed-in socket asks whether its sign-in
@@ -414,6 +414,24 @@ pub struct UpgradeOptions {
     /// PERF-20 → BIDIR-12: each upgraded connection's hook over its inbound
     /// frames.
     pub hooks: Option<Hooks>,
+    /// PERF-9 (spec/13): the encodings the service offers — both, msgpack
+    /// and JSON, by default until TRANSPORT-21. A client names the ones it
+    /// speaks at the upgrade and gets the first of them offered; one that
+    /// names none gets JSON while it is offered (`--wire-encodings`).
+    pub encodings: Encodings,
+}
+
+impl UpgradeOptions {
+    /// PERF-9: offer these encodings, in this order (the order a refusal
+    /// lists them in): `UpgradeOptions::default().encodings([Encoding::Msgpack, Encoding::Json])`.
+    /// None at all is refused: the default (both) stays.
+    pub fn encodings<I: IntoIterator<Item = Encoding>>(mut self, encodings: I) -> Self {
+        match Encodings::new(encodings) {
+            Ok(e) => self.encodings = e,
+            Err(e) => tracing::warn!("UpgradeOptions::encodings: {e}; offering {}", self.encodings),
+        }
+        self
+    }
 }
 
 /// [`serve_websocket`] with the full [`UpgradeOptions`] (AUTH-6, PERF-20).
@@ -444,7 +462,8 @@ pub async fn serve_websocket_with(
     // BIDIR-8: each connection's call count.
     let max_calls = config.quotas.max_calls_per_connection;
     let limits = options.limits.clone();
-    let shared = crate::ws::Shared::new(methods, limits.clone(), options.hooks.clone(), config.quotas.max_connections);
+    let shared = crate::ws::Shared::new(methods, limits.clone(), options.hooks.clone(), options.encodings.clone(), config.quotas.max_connections);
+    tracing::info!(offered = %options.encodings, "WebSocket: the encodings offered (spec/13)");
     // RPC-4: the sockets not yet upgraded, per address — the quotas' per-IP
     // ceiling unless the limits name another. A trusted proxy's address
     // carries every client's sockets before their headers name the client,

@@ -172,12 +172,17 @@ impl WebSocketConfig {
 pub struct StdioConfig {
     /// Buffer size for subscription notifications
     pub subscription_buffer_size: usize,
+    /// PERF-9 (spec/13): the encodings offered to a client whose first line
+    /// names the ones it speaks — both by default. Without that line the
+    /// framing is one JSON line per frame, as before.
+    pub encodings: crate::ws::Encodings,
 }
 
 impl Default for StdioConfig {
     fn default() -> Self {
         Self {
             subscription_buffer_size: 1024,
+            encodings: crate::ws::Encodings::default(),
         }
     }
 }

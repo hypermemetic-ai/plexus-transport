@@ -23,11 +23,13 @@
 //! | either side closes | the close handshake is answered; every call served ends; the hook hears it |
 //! | a request that is not an upgrade | `426 Upgrade Required` |
 //! | anything is logged | no header, no frame (ACCESS-62) |
+//! | the client names encodings at the upgrade (PERF-9, spec/13) | the service picks the first it offers ([`Encodings`], both by default) and the `101` names it; under msgpack every frame both ways is one binary message, and a text message closes the socket 1003; nothing offered: the `101`, then close 4415 `offered: …` |
 //!
 //! [`SocketLimits`] holds the numbers; [`Hooks`] makes each connection's hook;
 //! [`Connection::writer`](crate::websocket::Connection::writer) is the handle
 //! this side writes its own requests through; [`Encoding`] is fixed at the
-//! upgrade (JSON until PERF-9).
+//! upgrade, from what the service offers ([`Encodings`]) and what the client
+//! names (PERF-9).
 
 mod conn;
 mod guard;
@@ -98,19 +100,18 @@ impl Default for SocketLimits {
     }
 }
 
-/// The encoding of every frame on a socket, fixed at its upgrade. JSON-RPC
-/// text is the only one until PERF-9 adds msgpack, read from the upgrade's
-/// `Sec-WebSocket-Protocol` where [`Negotiated`] is made.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum Encoding {
-    /// JSON-RPC 2.0 objects, one text message each (spec/01).
-    #[default]
-    Json,
-}
+/// The encoding of every frame on a socket, fixed at its upgrade (PERF-9,
+/// spec/13): JSON-RPC text (`plexus.json`) or msgpack maps in binary
+/// messages (`plexus.msgpack`). plexus-core's, so the pipe that encodes a
+/// call's items and the hop's client name the same one.
+pub use plexus_core::plexus::encoding::WireEncoding as Encoding;
+/// What a service offers: one encoding or both (both by default, until
+/// TRANSPORT-21). `"msgpack,json".parse()` reads `--wire-encodings`.
+pub use plexus_core::plexus::encoding::{Encodings, EncodingsError};
 
-/// What a socket's upgrade settled: its [`Encoding`] (PERF-9 reads the
-/// offer here) and, with PERF-8, whether the client takes batches.
+/// What a socket's upgrade settled: its [`Encoding`] (the first the client
+/// named that the service offers) and, with PERF-8, whether the client
+/// takes batches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct Negotiated {

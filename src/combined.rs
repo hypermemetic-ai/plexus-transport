@@ -151,6 +151,7 @@ where
         jsonrpsee::Methods::from(module),
         limits.clone(),
         None,
+        crate::ws::Encodings::default(),
         crate::ConnectionQuotas::default().max_connections,
     );
     let upgrade = crate::ws::Upgrade { shared, stop: stop_handle.clone() };

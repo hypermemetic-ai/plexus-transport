@@ -78,7 +78,7 @@ pub use proxy::{init_trusted_proxies, ForwardedClient, IpNet, TrustedProxies};
 pub use websocket::UpgradeOptions;
 // PERF-20: the socket's loop — its handle, its limits, the hook and the
 // writer (BIDIR-12), the encoding fixed at the upgrade (PERF-9).
-pub use ws::{ConnectionHook, ConnectionWriter, Encoding, Hooks, Outbound, ServerHandle, SocketLimits};
+pub use ws::{ConnectionHook, ConnectionWriter, Encoding, Encodings, EncodingsError, Hooks, Outbound, ServerHandle, SocketLimits};
 pub use request::{ValidOrigin, init_allowed_origins};
 
 // TRANSPORT-16: the mounted bridge's configuration, and the crate it is.

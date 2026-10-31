@@ -542,7 +542,8 @@ impl<A: Activation> TransportServerBuilder<A> {
 
     /// Enable stdio transport (MCP-compatible)
     pub fn with_stdio(mut self) -> Self {
-        self.config.stdio = Some(StdioConfig::default());
+        // PERF-9: the encodings the builder offers, on stdio too.
+        self.config.stdio = Some(StdioConfig { encodings: self.upgrade.encodings.clone(), ..StdioConfig::default() });
         self
     }
 
@@ -828,6 +829,18 @@ impl<A: Activation> TransportServerBuilder<A> {
     /// frames, made per connection by `hooks`.
     pub fn with_hooks(mut self, hooks: crate::ws::Hooks) -> Self {
         self.upgrade.hooks = Some(hooks);
+        self
+    }
+
+    /// PERF-9 (spec/13): the encodings this service offers, on its WebSocket
+    /// and on stdio — both, msgpack and JSON, unless set (TRANSPORT-21 flips
+    /// the generated default). A service's `--wire-encodings msgpack,json`
+    /// is `"msgpack,json".parse::<Encodings>()?`.
+    pub fn with_wire_encodings(mut self, encodings: crate::ws::Encodings) -> Self {
+        if let Some(stdio) = self.config.stdio.as_mut() {
+            stdio.encodings = encodings.clone();
+        }
+        self.upgrade.encodings = encodings;
         self
     }
 
