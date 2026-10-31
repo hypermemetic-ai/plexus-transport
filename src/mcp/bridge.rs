@@ -358,7 +358,7 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                     ..
                 } => {
                     // Buffer data for final result
-                    buffered_data.push(content.clone());
+                    buffered_data.push(content.to_value());
 
                     // Also stream via notifications for real-time consumers
                     let _ = ctx
