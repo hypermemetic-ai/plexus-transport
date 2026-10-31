@@ -110,9 +110,9 @@ impl Activation for TestActivation {
                     })?;
                 Ok(Box::pin(stream! {
                     yield PlexusStreamItem::Data {
-                        metadata: metadata(),
+                        metadata: metadata().into(),
                         content_type: "test".into(),
-                        content: json!({"echo": msg}),
+                        content: json!({"echo": msg}).into(),
                     };
                     yield PlexusStreamItem::Done { metadata: metadata() };
                 }))
@@ -122,24 +122,24 @@ impl Activation for TestActivation {
                 // time. A buffering (collect-at-close) implementation would
                 // never deliver these events to the client.
                 yield PlexusStreamItem::Data {
-                    metadata: metadata(),
+                    metadata: metadata().into(),
                     content_type: "test".into(),
-                    content: json!({"n": 1}),
+                    content: json!({"n": 1}).into(),
                 };
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 yield PlexusStreamItem::Data {
-                    metadata: metadata(),
+                    metadata: metadata().into(),
                     content_type: "test".into(),
-                    content: json!({"n": 2}),
+                    content: json!({"n": 2}).into(),
                 };
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 yield PlexusStreamItem::Done { metadata: metadata() };
             })),
             "stats" => Ok(Box::pin(stream! {
                 yield PlexusStreamItem::Data {
-                    metadata: metadata(),
+                    metadata: metadata().into(),
                     content_type: "test".into(),
-                    content: json!({"count": 42}),
+                    content: json!({"count": 42}).into(),
                 };
                 yield PlexusStreamItem::Done { metadata: metadata() };
             })),

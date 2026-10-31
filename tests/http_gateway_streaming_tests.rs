@@ -32,9 +32,9 @@ mod http_streaming_tests {
                         // Emit a few items then hang forever
                         for i in 0..5 {
                             yield PlexusStreamItem::Data {
-                                metadata: metadata(),
+                                metadata: metadata().into(),
                                 content_type: "test".into(),
-                                content: json!({"item": i}),
+                                content: json!({"item": i}).into(),
                             };
                             tokio::time::sleep(Duration::from_millis(50)).await;
                         }
@@ -50,12 +50,12 @@ mod http_streaming_tests {
             let large_data = vec![0u8; item_size_kb * 1024];
             for i in 0..item_count {
                 yield PlexusStreamItem::Data {
-                    metadata: metadata(),
+                    metadata: metadata().into(),
                     content_type: "test".into(),
                     content: json!({
                         "item": i,
                         "data": large_data.clone()
-                    }),
+                    }).into(),
                 };
             }
             yield PlexusStreamItem::Done { metadata: metadata() };
@@ -66,9 +66,9 @@ mod http_streaming_tests {
         Box::pin(stream! {
             for i in 0..item_count {
                 yield PlexusStreamItem::Data {
-                    metadata: metadata(),
+                    metadata: metadata().into(),
                     content_type: "test".into(),
-                    content: json!({"item": i}),
+                    content: json!({"item": i}).into(),
                 };
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
@@ -79,9 +79,9 @@ mod http_streaming_tests {
     fn create_normal_stream() -> PlexusStream {
         Box::pin(stream! {
             yield PlexusStreamItem::Data {
-                metadata: metadata(),
+                metadata: metadata().into(),
                 content_type: "test".into(),
-                content: json!({"result": "success"}),
+                content: json!({"result": "success"}).into(),
             };
             yield PlexusStreamItem::Done { metadata: metadata() };
         })

@@ -16,13 +16,19 @@
 //! on a full socket.
 //!
 //! **Writing.** When it wakes the loop takes every frame that is ready — the
-//! answers it made itself, the method table's queue (what every call's
-//! subscription writes), this side's own ([`ConnectionWriter`]) — up to the
-//! budget, hands them to the socket and flushes once: a call's three frames,
-//! or a stream's ready items, share one `send` (PERF-17's E2a). A queue is
-//! bounded (1,024 frames); while the socket cannot take more, its calls wait
-//! and nothing more is read. A subscription's frames and the wake they cause
-//! land on this one task, so a call costs no wake of another.
+//! answers it made itself, the method table's queue (each call's answer,
+//! and what a subscription writes through jsonrpsee's sink), the calls'
+//! frames (PERF-7: each item encoded once by plexus-core's pipe into a frame
+//! of its own, through the [`FrameSink`] every call's extensions carry),
+//! this side's own ([`ConnectionWriter`]) — up to the budget, hands them to
+//! the socket and flushes once: a call's three frames, or a stream's ready
+//! items, share one `send` (PERF-17's E2a). The queues are taken by turns,
+//! so none starves another; a call's first frame waits for the method
+//! table's queue as it stands, where its subscription's answer was put
+//! first. A queue is bounded (1,024 frames); while the socket cannot take
+//! more, its calls wait and nothing more is read. A subscription's frames
+//! and the wake they cause land on this one task, so a call costs no wake
+//! of another.
 //!
 //! **Liveness** (RPC-5): a ping on the interval; a peer from which nothing
 //! has come past the ping timeout is closed; under an idle limit a socket
@@ -47,11 +53,12 @@ use jsonrpsee::core::server::{BatchResponseBuilder, MethodCallback, MethodRespon
 use jsonrpsee::types::error::{reject_too_big_request, reject_too_many_subscriptions, ErrorCode};
 use jsonrpsee::types::{ErrorObject, Id, Notification, Params, Request};
 use jsonrpsee::ConnectionId;
+use plexus_core::plexus::wire::{FrameReceiver, FrameSink, WireEncoding, WireFrame};
 use serde_json::value::RawValue;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig};
-use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_tungstenite::WebSocketStream;
 
 use super::guard::{Dropped, Guard};
@@ -219,6 +226,25 @@ fn own(frame: Outbound) -> Message {
     }
 }
 
+/// A call's frame as the socket writes it: its bytes, as they are.
+fn framed(bytes: Bytes) -> Message {
+    // SAFETY: every byte of a frame is serde_json's output — the
+    // notification around the item, the item's own JSON — or JSON text
+    // checked when it was made (`Content::from_json`): UTF-8.
+    Message::Text(unsafe { Utf8Bytes::from_bytes_unchecked(bytes) })
+}
+
+/// The queues the writer takes from, by turns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Queue {
+    /// This side's own frames ([`ConnectionWriter`]).
+    Own,
+    /// The method table's: answers, and jsonrpsee's subscription sinks.
+    Table,
+    /// The calls' frames (plexus-core's pipe, PERF-7).
+    Frames,
+}
+
 /// One socket (see the module docs).
 struct Loop {
     ws: Socket,
@@ -231,9 +257,14 @@ struct Loop {
     table: mpsc::Receiver<Box<RawValue>>,
     own: mpsc::Receiver<Outbound>,
     own_open: bool,
-    /// `own` is taken from next, before the method table's queue (by turns,
-    /// so neither starves the other).
-    own_first: bool,
+    /// PERF-7: the calls' frames.
+    frames: FrameReceiver,
+    /// A call's first frame, waiting for the method table's queue as it
+    /// stood when the frame was taken (its subscription's answer is there).
+    fenced: Option<Bytes>,
+    /// The queue taken from first at the next turn (by turns, so none
+    /// starves another).
+    turn: usize,
     hook: Option<Arc<dyn ConnectionHook>>,
     /// Subscriptions whose acceptance is awaited (their callbacks' futures),
     /// in arrival order, each polled with the socket's own waker — at most
@@ -429,27 +460,55 @@ impl Loop {
         None
     }
 
-    /// The next frame to hand the socket: the loop's own answers first, then
-    /// this side's queue and the method table's, by turns.
+    /// The next frame to hand the socket: the loop's own answers first; a
+    /// call's first frame once the method table's queue holds nothing taken
+    /// before it; then this side's queue, the method table's and the calls'
+    /// frames, by turns.
     fn next_out(&mut self, cx: &mut Context<'_>) -> Option<Message> {
         if let Some(m) = self.out.pop_front() {
             return Some(m);
         }
-        for turn in 0..2 {
-            if (turn == 0) == self.own_first {
-                if self.own_open {
-                    match self.own.poll_recv(cx) {
-                        Poll::Ready(Some(f)) => {
-                            self.own_first = false;
-                            return Some(own(f));
-                        }
-                        Poll::Ready(None) => self.own_open = false,
-                        Poll::Pending => {}
-                    }
-                }
-            } else if let Poll::Ready(Some(m)) = self.table.poll_recv(cx) {
-                self.own_first = true;
+        if self.fenced.is_some() {
+            // A subscription's answer was queued on the method table before
+            // its first frame was sent; seen that frame, the answer is seen
+            // here too, so the table is emptied of what it holds first.
+            // `try_recv`, not `poll_recv`: tokio's cooperative budget can
+            // answer a poll `Pending` with a frame waiting.
+            if let Ok(m) = self.table.try_recv() {
                 return Some(text(m));
+            }
+            return self.fenced.take().map(framed);
+        }
+        const TURNS: [Queue; 3] = [Queue::Own, Queue::Table, Queue::Frames];
+        for i in 0..TURNS.len() {
+            let q = TURNS[(self.turn + i) % TURNS.len()];
+            let got = match q {
+                Queue::Own if self.own_open => match self.own.poll_recv(cx) {
+                    Poll::Ready(Some(f)) => Some(own(f)),
+                    Poll::Ready(None) => {
+                        self.own_open = false;
+                        None
+                    }
+                    Poll::Pending => None,
+                },
+                Queue::Own => None,
+                Queue::Table => match self.table.poll_recv(cx) {
+                    Poll::Ready(Some(m)) => Some(text(m)),
+                    _ => None,
+                },
+                Queue::Frames => match self.frames.poll_recv(cx) {
+                    Poll::Ready(Some(f)) if f.fenced() => {
+                        self.turn = (self.turn + i + 1) % TURNS.len();
+                        self.fenced = Some(f.into_bytes());
+                        return self.next_out(cx);
+                    }
+                    Poll::Ready(Some(f)) => Some(framed(WireFrame::into_bytes(f))),
+                    _ => None,
+                },
+            };
+            if let Some(m) = got {
+                self.turn = (self.turn + i + 1) % TURNS.len();
+                return Some(m);
             }
         }
         None
@@ -563,10 +622,11 @@ impl Loop {
     /// The socket ends: every call still writing learns it is gone, the close
     /// (or the reply to the peer's) goes out, and the peer's answer is read.
     async fn end(self, end: End) -> Option<Arc<dyn ConnectionHook>> {
-        let Loop { mut ws, mut table, mut own, accepting, tx, dispatch, ext, hook, .. } = self;
+        let Loop { mut ws, mut table, mut own, mut frames, accepting, tx, dispatch, ext, hook, .. } = self;
         table.close();
         own.close();
-        drop((table, own, accepting, tx, dispatch, ext));
+        frames.close();
+        drop((table, own, frames, accepting, tx, dispatch, ext));
         let _ = tokio::time::timeout(CLOSE_WAIT, async {
             match end {
                 End::Lost => {}
@@ -614,6 +674,14 @@ pub(crate) async fn run(
 
     let (tx, table) = mpsc::channel::<Box<RawValue>>(limits.queue);
     let (own_tx, own_rx) = mpsc::channel(limits.queue);
+    // PERF-7: the calls' frames, each item encoded once by plexus-core's pipe;
+    // every call finds the sink in its extensions.
+    let encoding = match negotiated.encoding {
+        super::Encoding::Json => WireEncoding::Json,
+    };
+    let (frame_sink, frames) = FrameSink::channel(limits.queue, encoding);
+    let mut ext = ext;
+    ext.insert(frame_sink);
     conn.upgraded(negotiated, ConnectionWriter { tx: own_tx });
     let hook = shared.hooks.as_ref().and_then(|h| h.make(&conn, &ext));
     let dispatch = Dispatch {
@@ -640,7 +708,9 @@ pub(crate) async fn run(
         table,
         own: own_rx,
         own_open: true,
-        own_first: false,
+        frames,
+        fenced: None,
+        turn: 0,
         hook,
         accepting: Vec::new(),
         running: Arc::new(AtomicUsize::new(0)),
