@@ -3,6 +3,15 @@
 All notable changes to plexus-transport are documented here. This file starts
 at 0.6.0; earlier changes are in the git history.
 
+## [Unreleased]
+
+### Fixed
+
+- A WebSocket frame whose 64-bit payload length has its top bit set is refused
+  at its header and the socket closes with `1002`, on any frame of a message
+  (RFC 6455 section 5.2). It was treated as a message over the cap: answered
+  `-32007` with the socket kept, and every later byte discarded as its payload.
+
 ## [0.6.0]
 
 Release with plexus-core 0.7.0.

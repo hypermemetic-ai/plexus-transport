@@ -61,7 +61,7 @@ use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Role, WebSocketConfig
 use tokio_tungstenite::tungstenite::{Message, Utf8Bytes};
 use tokio_tungstenite::WebSocketStream;
 
-use super::guard::{Dropped, Guard};
+use super::guard::{is_refused, Dropped, Guard};
 use super::http::Shared;
 use super::{ConnectionHook, ConnectionWriter, Negotiated, Outbound, StopHandle};
 use crate::websocket::Connection;
@@ -86,7 +86,7 @@ enum End {
     PeerClosed,
     /// The socket ended without a close, or failed.
     Lost,
-    /// The peer broke the protocol (tungstenite refused a frame).
+    /// The peer broke the protocol (tungstenite or the guard refused a frame).
     Protocol,
     /// The server is stopping.
     ServerStopped,
@@ -594,6 +594,7 @@ impl Loop {
                         tracing::debug!(conn = self.conn.id(), peer = %self.conn.peer(), "WebSocket read: {e}");
                         return Poll::Ready(match e {
                             E::Protocol(_) | E::Utf8(_) | E::Capacity(_) | E::AttackAttempt => End::Protocol,
+                            E::Io(e) if is_refused(&e) => End::Protocol,
                             _ => End::Lost,
                         });
                     }
