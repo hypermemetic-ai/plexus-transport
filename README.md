@@ -355,7 +355,7 @@ See `examples/` directory:
 // Duplicated across projects
 ```
 
-**After (with hub-transport):**
+**After (with plexus-transport):**
 ```rust
 // ~20 lines using builder API
 // Works with any Activation
@@ -366,13 +366,13 @@ See `examples/` directory:
 
 **Plexus RPC** is the protocol name. It's a protocol for building services with runtime schema introspection and instant streaming.
 
-**DynamicHub** (formerly called "Plexus") is a specific hub/router implementation in `hub-core` v0.3.0+ that dynamically registers activations. The old name `Plexus` remains as a deprecated alias.
+**DynamicHub** (formerly called "Plexus") is a specific hub/router implementation in `plexus-core` v0.3.0+ that dynamically registers activations. The old name `Plexus` remains as a deprecated alias.
 
-This library (`hub-transport`) is correctly generic over the `Activation` trait and works with any Plexus RPC activation type - whether it's a single plugin, a DynamicHub router, or a nested hub like Solar.
+This library (`plexus-transport`) is correctly generic over the `Activation` trait and works with any Plexus RPC activation type - whether it's a single plugin, a DynamicHub router, or a nested hub like Solar.
 
 ## License
 
-AGPL-3.0-only
+MIT
 
 ## Contributing
 
@@ -381,5 +381,5 @@ This library is part of the Plexus RPC ecosystem. See the main Substrate reposit
 ## Learn More
 
 - **Plexus RPC Protocol**: See the protocol specification and architecture docs in the main Substrate repository
-- **Reference Server**: [Substrate](https://github.com/controlflow/substrate) - A Plexus RPC server with conversation trees and LLM orchestration
-- **Core Library**: [plexus-core](https://github.com/controlflow/hub-core) - Core Plexus RPC library with Activation trait
+- **Reference Server**: [Substrate](https://github.com/hypermemetic-ai/plexus-substrate) - A Plexus RPC server with conversation trees and LLM orchestration
+- **Core Library**: [plexus-core](https://github.com/hypermemetic-ai/plexus-core) - Core Plexus RPC library with Activation trait

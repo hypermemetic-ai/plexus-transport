@@ -1,17 +1,17 @@
 [package]
 name = "plexus-transport"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
-license = "AGPL-3.0-only"
+license = "MIT"
 description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
 repository = "https://github.com/hypermemetic-ai/plexus-transport"
 # DIST-2: the published crate is the library — not the plans, design notes,
 # spikes or hooks that live beside it in the repository.
-include = ["src/**", "README.md", "Cargo.toml"]
+include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
 
 [dependencies]
 # Core dependencies
-plexus-core = { path = "../plexus-core", version = "0.6.1" }
+plexus-core = { path = "../plexus-core", version = "0.7.0" }
 tokio = { version = "1.53", features = ["full"] }
 futures = "0.3"
 async-stream = "0.3"
@@ -94,7 +94,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # depending on the same crate under two names, so tests import PlexusRequest
 # through the alias too: `use schemars::PlexusRequest;`.)
 schemars = { path = "../plexus-macros", package = "plexus-macros", features = ["schemars-compat"] }
-plexus-core = { path = "../plexus-core", version = "0.6.1" }
+plexus-core = { path = "../plexus-core", version = "0.7.0" }
 
 [features]
 default = []
