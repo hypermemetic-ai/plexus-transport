@@ -62,7 +62,7 @@ pub mod http;
 // Re-export main API
 pub use calls::{ConnectionCalls, TooManyCalls, CALLS_PER_CONNECTION};
 #[cfg(feature = "mcp-gateway")]
-pub use combined::serve_combined;
+pub use combined::{serve_combined, serve_combined_with_allowed_hosts};
 pub use config::{
     ConnectionQuotas, McpHttpConfig, SessionStorage, StdioConfig, TransportConfig, WebSocketConfig,
     DEFAULT_API_KEY_HEADER,

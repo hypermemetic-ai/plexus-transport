@@ -140,6 +140,20 @@ TransportServer::builder(activation, rpc_converter)
     .serve().await?;
 ```
 
+### Allowed Hosts
+
+`with_mcp_http` answers the loopback `Host` names, plus the listen address when
+it is neither loopback nor unspecified. Any other `Host` is refused 403, which
+stops DNS rebinding. A service behind a name, or bound to `0.0.0.0` for remote
+clients, names its hosts:
+
+```rust
+let mcp_config = McpHttpConfig::new(8889)
+    .with_allowed_hosts(["mcp.example.com"]);
+```
+
+`serve_combined_with_allowed_hosts` does the same for `serve_combined`.
+
 ### SQLite Session Persistence (Optional)
 
 ```rust
@@ -173,7 +187,7 @@ Generic MCP protocol handler that bridges `tools/call` requests to `Activation::
 **`stdio`** - Line-delimited JSON-RPC over stdin/stdout (MCP-compatible)
 **`websocket`** - the WebSocket server: the accept loop and the upgrade's checks
 **`ws`** - the WebSocket connection loop, the transport's own (PERF-20)
-**`mcp`** - MCP HTTP with SSE streaming and session management
+**`mcp`** - MCP HTTP with SSE streaming and session management. Only with the `mcp` feature, which is the only thing that brings in `rmcp`
 
 ### RPC Conversion Pattern
 

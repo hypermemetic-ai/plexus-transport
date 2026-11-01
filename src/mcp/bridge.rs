@@ -3,6 +3,11 @@
 //! This module implements the MCP protocol using the rmcp crate,
 //! bridging MCP tool calls to activation methods.
 
+// TRANSPORT-23: this bridge streams items as MCP logging notifications, which
+// rmcp 3.x deprecates (SEP-2577). The port keeps that behaviour;
+// plexus-transport-mcp's bridge does not use them.
+#![allow(deprecated)]
+
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -97,6 +102,17 @@ fn plexus_to_mcp_error(e: PlexusError) -> McpError {
             McpError::invalid_request(forbidden.to_string(), None)
         }
     }
+}
+
+/// A logging notification from `logger`.
+fn log_param(
+    level: LoggingLevel,
+    logger: &str,
+    data: serde_json::Value,
+) -> LoggingMessageNotificationParam {
+    let mut param = LoggingMessageNotificationParam::new(level, data);
+    param.logger = Some(logger.to_string());
+    param
 }
 
 // =============================================================================
@@ -199,33 +215,32 @@ impl<A: Activation> Clone for ActivationMcpBridge<A> {
 }
 
 impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         // Use activation's namespace and version for server identity
         // Allow override via config
-        let mut server_info = Implementation::from_build_env();
-        server_info.name = self
+        let name = self
             .server_name_override
             .clone()
             .unwrap_or_else(|| self.activation.namespace().to_string());
-        server_info.version = self
+        let version = self
             .server_version_override
             .clone()
             .unwrap_or_else(|| self.activation.version().to_string());
 
-        ServerInfo {
-            protocol_version: ProtocolVersion::LATEST,
-            capabilities: ServerCapabilities::builder()
+        let mut info = ServerConfig::new(
+            ServerCapabilities::builder()
                 .enable_tools()
                 .enable_logging()
                 .build(),
-            server_info,
-            instructions: Some(self.activation.description().to_string()),
-        }
+        );
+        info.server_info = Implementation::new(name, version);
+        info.instructions = Some(self.activation.description().to_string());
+        info
     }
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParam>,
+        _request: Option<PaginatedRequestParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         // Use pre-computed flat schemas if available (set for hub activations).
@@ -239,18 +254,14 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
         let tools = schemas_to_rmcp_tools(schemas);
         tracing::debug!("Listing {} tools", tools.len());
 
-        Ok(ListToolsResult {
-            tools,
-            next_cursor: None,
-            meta: None,
-        })
+        Ok(ListToolsResult::with_all_items(tools))
     }
 
     async fn call_tool(
         &self,
-        request: CallToolRequestParam,
+        request: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let method_name = &request.name;
         let mut arguments_map = request
             .arguments
@@ -340,15 +351,12 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                 } => {
                     // Only send progress if client provided token
                     if let Some(ref token) = progress_token {
-                        let _ = ctx
-                            .peer
-                            .notify_progress(ProgressNotificationParam {
-                                progress_token: token.clone(),
-                                progress: percentage.unwrap_or(0.0) as f64,
-                                total: None,
-                                message: Some(message.clone()),
-                            })
-                            .await;
+                        let mut progress = ProgressNotificationParam::new(
+                            token.clone(),
+                            percentage.unwrap_or(0.0) as f64,
+                        );
+                        progress.message = Some(message.clone());
+                        let _ = ctx.peer.notify_progress(progress).await;
                     }
                 }
 
@@ -363,15 +371,11 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                     // Also stream via notifications for real-time consumers
                     let _ = ctx
                         .peer
-                        .notify_logging_message(LoggingMessageNotificationParam {
-                            level: LoggingLevel::Info,
-                            logger: Some(logger.clone()),
-                            data: json!({
+                        .notify_logging_message(log_param(LoggingLevel::Info, &logger, json!({
                                 "type": "data",
                                 "content_type": content_type,
                                 "data": content,
-                            }),
-                        })
+                            })))
                         .await;
                 }
 
@@ -385,15 +389,11 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
 
                     let _ = ctx
                         .peer
-                        .notify_logging_message(LoggingMessageNotificationParam {
-                            level: LoggingLevel::Error,
-                            logger: Some(logger.clone()),
-                            data: json!({
+                        .notify_logging_message(log_param(LoggingLevel::Error, &logger, json!({
                                 "type": "error",
                                 "error": message,
                                 "recoverable": recoverable,
-                            }),
-                        })
+                            })))
                         .await;
 
                     if !recoverable {
@@ -414,16 +414,12 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                     // Client should respond via _plexus_respond tool
                     let _ = ctx
                         .peer
-                        .notify_logging_message(LoggingMessageNotificationParam {
-                            level: LoggingLevel::Info,
-                            logger: Some(logger.clone()),
-                            data: json!({
+                        .notify_logging_message(log_param(LoggingLevel::Info, &logger, json!({
                                 "type": "request",
                                 "request_id": request_id,
                                 "request_data": request_data,
                                 "timeout_ms": timeout_ms,
-                            }),
-                        })
+                            })))
                         .await;
                 }
             }
@@ -436,7 +432,7 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
             } else {
                 error_messages.join("\n")
             };
-            Ok(CallToolResult::error(vec![Content::text(error_content)]))
+            Ok(CallToolResult::error(vec![ContentBlock::text(error_content)]).into())
         } else {
             // Convert buffered data to content
             let text_content = if buffered_data.is_empty() {
@@ -461,9 +457,7 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                 }
             };
 
-            Ok(CallToolResult::success(vec![Content::text(
-                text_content,
-            )]))
+            Ok(CallToolResult::success(vec![ContentBlock::text(text_content)]).into())
         }
     }
 }

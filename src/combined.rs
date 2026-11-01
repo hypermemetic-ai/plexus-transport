@@ -37,7 +37,7 @@ use crate::mcp::bridge::{ActivationMcpBridge, RouteFn};
 ///
 /// - `GET /` (with `Upgrade: websocket`) and all other non-`/mcp` paths →
 ///   the WebSocket (anything there but an upgrade is `426`)
-/// - `POST /mcp`, `GET /mcp` → rmcp Streamable HTTP (MCP 2025-03-26)
+/// - `POST /mcp`, `GET /mcp` → rmcp Streamable HTTP
 ///
 /// The returned `ServerHandle` can be awaited via `handle.stopped()` and
 /// stopped via `handle.stop()`.
@@ -89,6 +89,27 @@ pub async fn serve_combined<A>(
 where
     A: Activation + Send + Sync + 'static,
 {
+    serve_combined_with_allowed_hosts(module, activation, flat_schemas, route_fn, addr, api_key, enable_rest, Vec::new()).await
+}
+
+/// [`serve_combined`], naming the `Host` values `/mcp` answers to. Empty: the
+/// loopback names, plus `addr`'s literal when it is neither loopback nor
+/// unspecified, so a server bound to `0.0.0.0` for remote clients names its
+/// hosts here. Any other `Host` is refused 403.
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_combined_with_allowed_hosts<A>(
+    module: RpcModule<()>,
+    activation: Arc<A>,
+    flat_schemas: Option<Vec<PluginSchema>>,
+    route_fn: Option<RouteFn>,
+    addr: SocketAddr,
+    api_key: Option<String>,
+    enable_rest: bool,
+    allowed_hosts: Vec<String>,
+) -> Result<ServerHandle>
+where
+    A: Activation + Send + Sync + 'static,
+{
     // ── MCP side ────────────────────────────────────────────────────────────
     let mut bridge = ActivationMcpBridge::with_server_info_and_schemas(
         activation.clone(),
@@ -105,7 +126,8 @@ where
     let mcp_service = StreamableHttpService::new(
         move || Ok(bridge_clone.clone()),
         session_manager.into(),
-        StreamableHttpServerConfig::default(),
+        StreamableHttpServerConfig::default()
+            .with_allowed_hosts(crate::mcp::server::effective_allowed_hosts(addr, &allowed_hosts)),
     );
 
     // ── REST side (optional) ───────────────────────────────────────────────────

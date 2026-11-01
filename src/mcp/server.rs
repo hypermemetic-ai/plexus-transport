@@ -12,6 +12,7 @@ use plexus_core::plexus::Activation;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 
@@ -140,7 +141,7 @@ async fn debug_handler() -> impl IntoResponse {
     let info = r#"{
   "server": "plexus-transport",
   "mcp_endpoint": "/mcp",
-  "mcp_protocol": "MCP Streamable HTTP (2025-03-26)",
+  "mcp_protocol": "MCP Streamable HTTP",
   "notes": [
     "MCP requires 'initialize' request before 'tools/list'",
     "Accept header must include 'application/json, text/event-stream'",
@@ -208,6 +209,17 @@ pub async fn serve_mcp_http<A: Activation>(
     serve_with_session_manager(bridge, LocalSessionManager::default(), config, api_key).await
 }
 
+/// ACCESS-25, the rule [`plexus_transport_mcp::McpConfig`] uses: the named
+/// hosts, or the loopback names plus `addr`'s literal when it is neither
+/// loopback nor unspecified. rmcp refuses any other `Host` with 403.
+pub(crate) fn effective_allowed_hosts(addr: SocketAddr, named: &[String]) -> Vec<String> {
+    plexus_transport_mcp::McpConfig {
+        allowed_hosts: named.to_vec(),
+        ..plexus_transport_mcp::McpConfig::listen(addr)
+    }
+    .effective_allowed_hosts()
+}
+
 /// Build the MCP axum app around a session manager and start the HTTP server.
 ///
 /// Generic over the rmcp `SessionManager` implementation so callers can pick
@@ -223,7 +235,8 @@ where
     A: Activation,
     M: rmcp::transport::streamable_http_server::session::SessionManager,
 {
-    let server_config = StreamableHttpServerConfig::default();
+    let server_config = StreamableHttpServerConfig::default()
+        .with_allowed_hosts(effective_allowed_hosts(config.addr, &config.allowed_hosts));
     let mcp_service = StreamableHttpService::new(
         move || Ok(bridge.clone()),
         session_manager.into(),
