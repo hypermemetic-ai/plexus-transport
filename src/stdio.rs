@@ -215,14 +215,19 @@ where
     Ok(())
 }
 
+/// The bytes one write gathers before it goes out.
+const WRITE_BUDGET: usize = 64 * 1024;
+
 /// The one writer: every frame ready when it wakes, each length-prefixed, in
-/// one write and one flush.
+/// one write and one flush, up to [`WRITE_BUDGET`] (a stream that outruns the
+/// writer must still be written).
 async fn write_frames<W: AsyncWrite + Unpin>(mut out: W, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
-    let mut buf = Vec::with_capacity(16 * 1024);
+    let mut buf = Vec::with_capacity(WRITE_BUDGET);
     while let Some(first) = rx.recv().await {
         buf.clear();
         stdio_frame(&first, &mut buf);
-        while let Ok(more) = rx.try_recv() {
+        while buf.len() < WRITE_BUDGET {
+            let Ok(more) = rx.try_recv() else { break };
             stdio_frame(&more, &mut buf);
         }
         if out.write_all(&buf).await.is_err() || out.flush().await.is_err() {
