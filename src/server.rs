@@ -460,6 +460,12 @@ impl TransportServerBuilder<plexus_core::plexus::DynamicHub> {
     /// `config.listen` (required; `bind` applies to it) until TRANSPORT-10
     /// puts `config.path` on the WebSocket's router. Replaces
     /// `with_mcp_http`, which TRANSPORT-9 removes.
+    ///
+    /// The mount does not read the static api_key. With
+    /// [`Self::with_api_key`] set, [`Self::build`] refuses a config that
+    /// admits anonymous callers: set `McpConfig.anonymous = false`. Without a
+    /// validator such a mount refuses every request, since a Bearer has
+    /// nothing to name it.
     pub fn with_mcp(mut self, config: plexus_transport_mcp::McpConfig) -> Self {
         let hub = self.activation.clone();
         self.mcp = Some(McpMount {
@@ -846,12 +852,27 @@ impl<A: Activation> TransportServerBuilder<A> {
     ///
     /// RED-4: fails with a clear error when the activation declares auth-gated
     /// methods but no auth middleware has been configured. Opt out via
-    /// [`Self::allow_missing_auth_middleware`].
+    /// [`Self::allow_missing_auth_middleware`]. Also fails when a static
+    /// api_key is set and the [`Self::with_mcp`] mount admits anonymous
+    /// callers, which that opt-out does not excuse.
     pub async fn build(self) -> Result<TransportServer<A>> {
         // RED-4: verify auth configuration before starting the server.
         let has_api_key = self.config.api_key.is_some();
         let has_session_validator = self.session_validator.is_some();
         let auth_configured = has_api_key || has_session_validator;
+
+        // The MCP mount has no key check of its own, so a key gates it only
+        // if it refuses callers with no credential. Not excused by
+        // `allow_missing_auth_middleware`: a key says a gate was wanted.
+        #[cfg(feature = "mcp")]
+        if has_api_key && self.mcp.as_ref().is_some_and(|m| m.config.admits_anonymous()) {
+            return Err(anyhow::anyhow!(
+                "with_mcp: `.with_api_key(...)` does not gate the MCP mount, and this \
+                 McpConfig admits anonymous callers, who would reach the hub without \
+                 the key. Set `McpConfig.anonymous = false` (or `oauth`), with \
+                 `.with_session_validator(...)` to admit Bearer callers."
+            ));
+        }
 
         if !auth_configured && !self.allow_missing_auth {
             let auth_gated = collect_auth_gated_methods(&*self.activation);

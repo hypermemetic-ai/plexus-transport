@@ -77,6 +77,16 @@ struct Header {
     size: usize,
 }
 
+impl Header {
+    /// The frame's bytes, header and payload. The length is the client's own
+    /// 64 bits: saturated, so a huge frame stays huge rather than wrapping
+    /// short and leaving its payload to be read as headers. Nothing sends
+    /// 2^64 bytes, and tungstenite refuses the frame first.
+    fn total(&self) -> u64 {
+        (self.size as u64).saturating_add(self.len)
+    }
+}
+
 /// `Some` once the whole header is in `b`.
 fn header(b: &[u8]) -> Option<Header> {
     if b.len() < 2 {
@@ -141,7 +151,7 @@ impl<S> Guard<S> {
         let control = h.opcode & 0x08 != 0;
         if control {
             // Ping, pong, close — and anything malformed, tungstenite's to refuse.
-            self.state = In::Pass(h.size as u64 + h.len);
+            self.state = In::Pass(h.total());
             return;
         }
         let over = |len: u64| len > self.cap;
@@ -157,16 +167,19 @@ impl<S> Guard<S> {
             // A continuation of a held message: held, or the whole message
             // dropped once it is past the cap.
             (0, Msg::Holding { len }) => {
-                if over(len + h.len) {
+                // Both lengths are the client's: a total that overflows is
+                // past any cap.
+                let total = len.checked_add(h.len).filter(|&t| !over(t));
+                let Some(total) = total else {
                     self.buf.advance(h.size);
                     self.hold.clear();
                     self.state = In::Skip(h.len);
                     self.msg = if h.fin { Msg::None } else { Msg::Skipping };
                     self.dropped.one();
-                } else {
-                    self.msg = Msg::Holding { len: len + h.len };
-                    self.hold_frame(h);
-                }
+                    return;
+                };
+                self.msg = Msg::Holding { len: total };
+                self.hold_frame(h);
             }
             // A new message while one is held: a protocol error. Release
             // what is held, so tungstenite sees the frames as sent and
@@ -175,13 +188,13 @@ impl<S> Guard<S> {
                 let held = self.hold.split();
                 self.ready.unsplit(held);
                 self.msg = Msg::None;
-                self.state = In::Pass(h.size as u64 + h.len);
+                self.state = In::Pass(h.total());
             }
             // A stray continuation, or a new message while one is being
             // dropped: passed on as it came (tungstenite refuses the first).
             (0, Msg::None) | (_, Msg::Skipping) => {
                 self.msg = Msg::None;
-                self.state = In::Pass(h.size as u64 + h.len);
+                self.state = In::Pass(h.total());
             }
             // A new message.
             (_, Msg::None) => {
@@ -193,7 +206,7 @@ impl<S> Guard<S> {
                     }
                     self.dropped.one();
                 } else if h.fin {
-                    self.state = In::Pass(h.size as u64 + h.len);
+                    self.state = In::Pass(h.total());
                 } else {
                     self.hold.clear();
                     self.msg = Msg::Holding { len: h.len };
@@ -438,5 +451,41 @@ mod tests {
         let stray = frame(0x0, true, b"x");
         let (out, dropped) = through(stray.clone(), 100, 16).await;
         assert_eq!((out, dropped), (stray, 0));
+    }
+
+    /// A masked frame's header alone, naming a 64-bit length (no payload).
+    fn long_header(op: u8, fin: bool, len: u64) -> Vec<u8> {
+        let mut f = vec![if fin { 0x80 } else { 0 } | op, 0x80 | 127];
+        f.extend_from_slice(&len.to_be_bytes());
+        f.extend_from_slice(&[7, 9, 11, 13]);
+        f
+    }
+
+    #[tokio::test]
+    async fn a_continuation_whose_length_wraps_the_message_total_is_over_the_cap() {
+        let first = frame(0x1, false, b"12345");
+        let input = [first, long_header(0x0, true, u64::MAX - 4)].concat();
+        let (out, dropped) = through(input, 100, 16).await;
+        assert!(out.is_empty(), "nothing of the message is handed on");
+        assert_eq!(dropped, 1);
+    }
+
+    #[tokio::test]
+    async fn a_header_and_length_that_wrap_are_passed_on_never_taken_for_a_short_frame() {
+        let held = frame(0x1, false, b"12345");
+        let cases = [
+            ("control", vec![long_header(0x9, true, u64::MAX)]),
+            ("stray continuation", vec![long_header(0x0, true, u64::MAX)]),
+            ("a new message while one is held", vec![held, long_header(0x1, true, u64::MAX)]),
+        ];
+        for (name, frames) in cases {
+            // The bytes after the header are the frame's payload, however
+            // long it claims to be: never read as a header of their own.
+            let tail = frame(0x1, true, &vec![b'x'; 2000]);
+            let input = [frames.concat(), tail].concat();
+            let (out, dropped) = through(input.clone(), 100, 16).await;
+            assert_eq!(dropped, 0, "{name}");
+            assert!(out == input, "{name}: the stream changed");
+        }
     }
 }
