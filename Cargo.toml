@@ -95,6 +95,8 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # through the alias too: `use schemars::PlexusRequest;`.)
 schemars = { path = "../plexus-macros", package = "plexus-macros", features = ["schemars-compat"] }
 plexus-core = { path = "../plexus-core", version = "0.7.0" }
+# BIDIR-6: tests/duplex_wire.rs's activation; a crate of its own, see its manifest.
+duplex-fixture = { path = "tests/duplex_fixture" }
 
 [features]
 default = []
