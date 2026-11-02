@@ -170,7 +170,8 @@ impl WebSocketConfig {
 /// Stdio (line-delimited JSON-RPC) configuration
 #[derive(Debug, Clone)]
 pub struct StdioConfig {
-    /// Buffer size for subscription notifications
+    /// Buffer size for subscription notifications, and the lines the one writer
+    /// holds queued before a stream waits for stdout
     pub subscription_buffer_size: usize,
 }
 

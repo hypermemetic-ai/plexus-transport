@@ -3,6 +3,17 @@
 All notable changes to plexus-transport are documented here. This file starts
 at 0.6.0; earlier changes are in the git history.
 
+## [Unreleased]
+
+### Fixed
+
+- TRANSPORT-17: `serve_stdio` has one writer. Every line, an answer or a stream's
+  item, goes through one bounded queue to one task, which writes each message
+  with its newline, so two live streams can no longer interleave inside a line
+  (spec/11). Lines ready together go out in one write, at most 64 KiB gathered.
+  `StdioConfig::subscription_buffer_size` also sizes that queue. At the end of
+  stdin every call ends, as spec/11 says, and what was queued has 5 s to go out.
+
 ## [0.6.0]
 
 Release with plexus-core 0.7.0.
