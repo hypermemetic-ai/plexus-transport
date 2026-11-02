@@ -102,6 +102,10 @@ plexus-core = { path = "../plexus-core", version = "0.7.0" }
 name = "stdio_pipes"
 harness = false
 
+[[test]]
+name = "stdio_kit"
+harness = false
+
 [features]
 default = []
 # MCP transport (rmcp-based). Default-OFF as of 0.5.0: REST/WebSocket-only
