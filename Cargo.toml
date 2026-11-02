@@ -86,6 +86,9 @@ http-body-util = "0.1"
 # records are caught too).
 tokio-tungstenite = "0.30"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+# PERF-9: tests/ws_encodings.rs reads and writes msgpack frames with rmp-serde,
+# not with plexus-core's writer: the wire checked against another msgpack.
+rmp-serde = "1.3"
 # plexus-macros aliased as "schemars" (schemars-compat feature) so that
 # #[derive(schemars::JsonSchema)] in tests resolves to the no-op derive,
 # preventing duplicate impl JsonSchema conflicts with PlexusRequest's

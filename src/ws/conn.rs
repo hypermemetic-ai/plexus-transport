@@ -33,6 +33,16 @@
 //! **Liveness** (RPC-5): a ping on the interval; a peer from which nothing
 //! has come past the ping timeout is closed; under an idle limit a socket
 //! with no call open and none begun past it is closed.
+//!
+//! **The encoding** (PERF-9, spec/13), fixed at the upgrade. Under msgpack
+//! every frame is one binary message: the calls' frames are msgpack as
+//! plexus-core's pipe wrote them, and the method table's own (each call's
+//! answer, a refusal, what a subscription writes through jsonrpsee's sink),
+//! which are JSON text, cross once, `jsonrpc` left out; a call that arrives
+//! in msgpack crosses to the method table as JSON text, `jsonrpc` put back
+//! (small, once a call, never an item). A text message on a msgpack socket
+//! closes it 1003. A socket whose client named nothing the service offers is
+//! closed 4415 before it is served ([`refuse`]).
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -53,6 +63,8 @@ use jsonrpsee::core::server::{BatchResponseBuilder, MethodCallback, MethodRespon
 use jsonrpsee::types::error::{reject_too_big_request, reject_too_many_subscriptions, ErrorCode};
 use jsonrpsee::types::{ErrorObject, Id, Notification, Params, Request};
 use jsonrpsee::ConnectionId;
+use plexus_core::plexus::encoding::{Encodings, REFUSED_CLOSE_CODE, UNSUPPORTED_DATA_CLOSE_CODE};
+use plexus_core::plexus::msgpack;
 use plexus_core::plexus::wire::{FrameReceiver, FrameSink, WireEncoding, WireFrame};
 use serde_json::value::RawValue;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
@@ -96,6 +108,8 @@ enum End {
     Silent,
     /// No call open and none begun past the idle limit (RPC-5).
     Idle,
+    /// PERF-9: a text message on a msgpack socket (spec/13).
+    TextOnMsgpack,
 }
 
 impl End {
@@ -110,6 +124,7 @@ impl End {
             End::Closed => frame(CloseCode::Normal, "closed"),
             End::Silent => frame(CloseCode::Away, "no answer to pings"),
             End::Idle => frame(CloseCode::Normal, "idle"),
+            End::TextOnMsgpack => frame(CloseCode::from(UNSUPPORTED_DATA_CLOSE_CODE), "a text message on a plexus.msgpack socket"),
         }
     }
 }
@@ -219,19 +234,50 @@ fn text(raw: Box<RawValue>) -> Message {
     Message::Text(String::from(Box::<str>::from(raw)).into())
 }
 
-fn own(frame: Outbound) -> Message {
+/// A JSON frame of the method table's (or this side's own) on a socket in
+/// `encoding`: as it is under JSON; under msgpack the same object as a map,
+/// `jsonrpc` left out, in one binary message (spec/13).
+fn json_out(encoding: WireEncoding, json: &str) -> Message {
+    match encoding {
+        WireEncoding::Msgpack => match msgpack::frame_from_json(json.as_bytes()) {
+            Ok(b) => Message::Binary(b.into()),
+            Err(e) => {
+                // The table writes serde_json's own text: not reached.
+                tracing::error!("a frame of the method table's did not cross to msgpack: {e}");
+                Message::Binary(Bytes::from_static(&[0xc0]))
+            }
+        },
+        _ => Message::Text(json.to_string().into()),
+    }
+}
+
+fn table_out(encoding: WireEncoding, raw: Box<RawValue>) -> Message {
+    match encoding {
+        WireEncoding::Json => text(raw),
+        _ => json_out(encoding, raw.get()),
+    }
+}
+
+fn own(encoding: WireEncoding, frame: Outbound) -> Message {
     match frame {
+        Outbound::Text(t) if encoding != WireEncoding::Json => json_out(encoding, &t),
         Outbound::Text(t) => Message::Text(t.into()),
         Outbound::Binary(b) => Message::Binary(b),
     }
 }
 
-/// A call's frame as the socket writes it: its bytes, as they are.
-fn framed(bytes: Bytes) -> Message {
-    // SAFETY: every byte of a frame is serde_json's output — the
-    // notification around the item, the item's own JSON — or JSON text
-    // checked when it was made (`Content::from_json`): UTF-8.
-    Message::Text(unsafe { Utf8Bytes::from_bytes_unchecked(bytes) })
+/// A call's frame as the socket writes it: its bytes, as they are — a text
+/// message under JSON, a binary one under msgpack.
+fn framed(encoding: WireEncoding, bytes: Bytes) -> Message {
+    match encoding {
+        WireEncoding::Json => {
+            // SAFETY: every byte of a JSON frame is serde_json's output — the
+            // notification around the item, the item's own JSON — or JSON
+            // text checked when it was made (`Content::from_json`): UTF-8.
+            Message::Text(unsafe { Utf8Bytes::from_bytes_unchecked(bytes) })
+        }
+        _ => Message::Binary(bytes),
+    }
 }
 
 /// The queues the writer takes from, by turns.
@@ -248,6 +294,8 @@ enum Queue {
 /// One socket (see the module docs).
 struct Loop {
     ws: Socket,
+    /// PERF-9: what every frame on the socket is in.
+    encoding: WireEncoding,
     conn: Arc<Connection>,
     ext: Extensions,
     dispatch: Dispatch,
@@ -304,7 +352,7 @@ impl Loop {
         if rp.is_method_call() || rp.is_batch() {
             let ok = rp.is_success();
             let (json, on_close, _) = rp.into_parts();
-            self.out.push_back(text(json));
+            self.out.push_back(table_out(self.encoding, json));
             if let Some(n) = on_close {
                 n.notify(ok);
             }
@@ -344,6 +392,8 @@ impl Loop {
     fn message(&mut self, m: Message) -> Result<(), End> {
         self.last_in = Instant::now();
         let data = match m {
+            // spec/13: every frame on a msgpack socket is binary.
+            Message::Text(_) if self.encoding == WireEncoding::Msgpack => return Err(End::TextOnMsgpack),
             Message::Text(t) => Bytes::from(t),
             Message::Binary(b) => b,
             Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Ok(()),
@@ -354,6 +404,18 @@ impl Loop {
                 return Ok(());
             }
         }
+        // PERF-9: a msgpack frame crosses to the method table as JSON text,
+        // `jsonrpc` put back; one that is not a msgpack map is `-32700`.
+        let data = match self.encoding {
+            WireEncoding::Msgpack => match msgpack::frame_to_json(&data) {
+                Ok(json) => Bytes::from(json),
+                Err(_) => {
+                    self.respond(MethodResponse::error(Id::Null, ErrorObject::from(ErrorCode::ParseError)));
+                    return Ok(());
+                }
+            },
+            _ => data,
+        };
         let first = data.iter().take(128).position(|b| !b.is_ascii_whitespace());
         match first.map(|i| (i, data[i])) {
             Some((i, b'{')) => self.single(&data[i..]),
@@ -475,16 +537,17 @@ impl Loop {
             // `try_recv`, not `poll_recv`: tokio's cooperative budget can
             // answer a poll `Pending` with a frame waiting.
             if let Ok(m) = self.table.try_recv() {
-                return Some(text(m));
+                return Some(table_out(self.encoding, m));
             }
-            return self.fenced.take().map(framed);
+            let encoding = self.encoding;
+            return self.fenced.take().map(|b| framed(encoding, b));
         }
         const TURNS: [Queue; 3] = [Queue::Own, Queue::Table, Queue::Frames];
         for i in 0..TURNS.len() {
             let q = TURNS[(self.turn + i) % TURNS.len()];
             let got = match q {
                 Queue::Own if self.own_open => match self.own.poll_recv(cx) {
-                    Poll::Ready(Some(f)) => Some(own(f)),
+                    Poll::Ready(Some(f)) => Some(own(self.encoding, f)),
                     Poll::Ready(None) => {
                         self.own_open = false;
                         None
@@ -493,7 +556,7 @@ impl Loop {
                 },
                 Queue::Own => None,
                 Queue::Table => match self.table.poll_recv(cx) {
-                    Poll::Ready(Some(m)) => Some(text(m)),
+                    Poll::Ready(Some(m)) => Some(table_out(self.encoding, m)),
                     _ => None,
                 },
                 Queue::Frames => match self.frames.poll_recv(cx) {
@@ -502,7 +565,7 @@ impl Loop {
                         self.fenced = Some(f.into_bytes());
                         return self.next_out(cx);
                     }
-                    Poll::Ready(Some(f)) => Some(framed(WireFrame::into_bytes(f))),
+                    Poll::Ready(Some(f)) => Some(framed(self.encoding, WireFrame::into_bytes(f))),
                     _ => None,
                 },
             };
@@ -635,7 +698,7 @@ impl Loop {
                     // write after the peer's close is refused, a flush is not.
                     let _ = SinkExt::close(&mut ws).await;
                 }
-                End::Protocol => {
+                End::Protocol | End::TextOnMsgpack => {
                     let _ = ws.send(Message::Close(end.frame())).await;
                 }
                 _ => {
@@ -674,11 +737,10 @@ pub(crate) async fn run(
 
     let (tx, table) = mpsc::channel::<Box<RawValue>>(limits.queue);
     let (own_tx, own_rx) = mpsc::channel(limits.queue);
-    // PERF-7: the calls' frames, each item encoded once by plexus-core's pipe;
-    // every call finds the sink in its extensions.
-    let encoding = match negotiated.encoding {
-        super::Encoding::Json => WireEncoding::Json,
-    };
+    // PERF-7: the calls' frames, each item encoded once by plexus-core's pipe
+    // in the socket's encoding (PERF-9); every call finds the sink in its
+    // extensions.
+    let encoding = negotiated.encoding;
     let (frame_sink, frames) = FrameSink::channel(limits.queue, encoding);
     let mut ext = ext;
     ext.insert(frame_sink);
@@ -701,6 +763,7 @@ pub(crate) async fn run(
     let now = Instant::now();
     let mut l = Loop {
         ws,
+        encoding,
         conn: conn.clone(),
         ext,
         dispatch,
@@ -738,4 +801,19 @@ pub(crate) async fn run(
         hook.on_close();
     }
     conn.ended();
+}
+
+/// PERF-9 (spec/13): a socket whose client named no encoding the service
+/// offers. The `101` is out (naming the first entry of the ask, so the client
+/// completes its handshake); the socket is closed 4415 at once, its reason
+/// the offered tokens, and nothing is served on it.
+pub(crate) async fn refuse(io: TokioIo<Upgraded>, offered: &Encodings, _place: OwnedSemaphorePermit) {
+    let mut ws = WebSocketStream::from_raw_socket(io, Role::Server, None).await;
+    let close = CloseFrame { code: CloseCode::from(REFUSED_CLOSE_CODE), reason: offered.refusal_reason().into() };
+    let _ = tokio::time::timeout(CLOSE_WAIT, async {
+        if ws.send(Message::Close(Some(close))).await.is_ok() {
+            while let Some(Ok(_)) = ws.next().await {}
+        }
+    })
+    .await;
 }

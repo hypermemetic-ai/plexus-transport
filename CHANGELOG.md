@@ -3,6 +3,42 @@
 All notable changes to plexus-transport are documented here. This file starts
 at 0.6.0; earlier changes are in the git history.
 
+## [Unreleased]
+
+PERF-9: msgpack beside JSON on one wire (plexus-wire `spec/13-encodings.md`).
+A service offers both by default, a client names the ones it speaks at the
+upgrade (`Sec-WebSocket-Protocol: plexus.msgpack, plexus.json`), and a client
+that names none gets JSON as before. Needs the plexus-core that carries
+`plexus::encoding`. Breaking under Cargo's rules because two structs whose
+fields are all public gained a field, so it goes out as a minor version, not a
+patch.
+
+### Breaking
+
+| Change | Before | After | What to do |
+|---|---|---|---|
+| `UpgradeOptions` | no `encodings` | `encodings: Encodings`, both by default | Build it with `..UpgradeOptions::default()` |
+| `StdioConfig` | no `encodings` | `encodings: Encodings`, both by default | Build it with `..StdioConfig::default()` |
+
+### Added
+
+- `UpgradeOptions::encodings` and `TransportServerBuilder::with_wire_encodings`:
+  what the service offers, on its WebSocket and on stdio. `Encodings` parses a
+  service's `--wire-encodings msgpack,json`.
+- The upgrade picks the first encoding the client named that the service
+  offers, and the `101` names it. A client that names only what is not offered
+  gets the `101`, then close 4415 whose reason lists the offer.
+- Under msgpack every frame both ways is one binary message. A text message
+  closes the socket 1003.
+- stdio: a first line that is the request `plexus.encoding` is answered with
+  the pick; under msgpack every frame after it is a 4-byte length and one map,
+  written whole by one writer. Without it, JSON lines as before.
+- `stdio::serve_stdio_io`, over any reader and writer.
+
+### Changed
+
+- `Encoding` is plexus-core's `WireEncoding`, re-exported.
+
 ## [0.6.0]
 
 Release with plexus-core 0.7.0.
