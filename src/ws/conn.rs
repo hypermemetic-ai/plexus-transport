@@ -62,7 +62,8 @@ use jsonrpsee::types::error::{reject_too_big_request, reject_too_many_subscripti
 use jsonrpsee::types::{ErrorObject, Id, Notification, Params, Request};
 use jsonrpsee::ConnectionId;
 use plexus_core::plexus::wire::{FrameReceiver, FrameSink, WireEncoding, WireFrame};
-use plexus_core::plexus::InputTable;
+use plexus_core::plexus::input::BINARY_INPUT;
+use plexus_core::plexus::{Delivered, InputTable};
 use serde_json::value::RawValue;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -354,8 +355,21 @@ impl Loop {
     /// One inbound message, in arrival order.
     fn message(&mut self, m: Message) -> Result<(), End> {
         self.last_in = Instant::now();
+        let binary = matches!(m, Message::Binary(_));
         let data = match m {
             Message::Text(t) => Bytes::from(t),
+            // BIDIR-17: a binary input frame, routed with no parse.
+            Message::Binary(b) if b.first() == Some(&BINARY_INPUT) => {
+                if let Some(hook) = &self.hook {
+                    if hook.on_frame(&b) {
+                        return Ok(());
+                    }
+                }
+                if self.inputs.take_binary(&b) == Delivered::Malformed {
+                    self.malformed("a binary input frame is 17 bytes of header and its payload");
+                }
+                return Ok(());
+            }
             Message::Binary(b) => b,
             Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Ok(()),
             Message::Close(_) => return Err(End::PeerClosed),
@@ -382,9 +396,23 @@ impl Loop {
                     running.fetch_sub(1, Ordering::AcqRel);
                 });
             }
+            // BIDIR-17: a binary message that is neither JSON nor an input
+            // frame names its tag.
+            _ if binary => self.malformed(&match data.first() {
+                Some(tag) => format!("a binary message tagged {tag:#04x}: the only tag is 0x01, an input frame"),
+                None => "an empty binary message".to_string(),
+            }),
             _ => self.respond(MethodResponse::error(Id::Null, ErrorObject::from(ErrorCode::ParseError))),
         }
         Ok(())
+    }
+
+    /// BIDIR-17: one typed error for a binary message this socket cannot read
+    /// (`-32700`, `data.error_kind` `malformed_frame`). It names no call:
+    /// nothing in it can be trusted to.
+    fn malformed(&mut self, why: &str) {
+        let data = serde_json::json!({ "error_kind": "malformed_frame" });
+        self.respond(MethodResponse::error(Id::Null, ErrorObject::owned(ErrorCode::ParseError.code(), format!("malformed_frame: {why}"), Some(data))));
     }
 
     fn single(&mut self, data: &[u8]) {
