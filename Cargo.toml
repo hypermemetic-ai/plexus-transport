@@ -96,6 +96,12 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 schemars = { path = "../plexus-macros", package = "plexus-macros", features = ["schemars-compat"] }
 plexus-core = { path = "../plexus-core", version = "0.7.0" }
 
+# TRANSPORT-17: each is its own child, `serve_stdio` on its own stdout, so
+# libtest's lines stay off that stdout.
+[[test]]
+name = "stdio_pipes"
+harness = false
+
 [features]
 default = []
 # MCP transport (rmcp-based). Default-OFF as of 0.5.0: REST/WebSocket-only
