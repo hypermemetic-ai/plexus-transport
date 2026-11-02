@@ -16,7 +16,8 @@ use plexus_transport::{stdio::serve_stdio, StdioConfig};
 use serde_json::{json, Value};
 
 /// `ping`, an answer and no stream; `stream [tag, n, size]`, `n` notifications
-/// of `size` bytes and an end; `n` of `u32::MAX` runs until it is let go.
+/// of `size` bytes and an end; `n` of `u32::MAX` runs until it is let go;
+/// `flood [size]`, one item as fast as it will go, until it is let go.
 fn module() -> RpcModule<()> {
     let mut m = RpcModule::new(());
     m.register_method("ping", |params, _, _| params.one::<u64>().unwrap_or(0)).unwrap();
@@ -27,6 +28,14 @@ fn module() -> RpcModule<()> {
         for i in 0..n {
             sink.send(serde_json::value::to_raw_value(&json!({"tag": tag, "i": i, "pad": pad}))?).await?;
         }
+        jsonrpsee::core::SubscriptionResult::Ok(())
+    })
+    .unwrap();
+    m.register_subscription("flood", "note", "unflood", |params, pending, _, _| async move {
+        let size: usize = params.one()?;
+        let sink = pending.accept().await?;
+        let item = serde_json::value::to_raw_value(&"x".repeat(size))?;
+        while sink.send(item.clone()).await.is_ok() {}
         jsonrpsee::core::SubscriptionResult::Ok(())
     })
     .unwrap();
@@ -173,38 +182,33 @@ fn the_end_of_input_ends_a_stream_that_never_would() {
     l.send("stream", json!(["a", u32::MAX, 100]));
     while l.line().expect("items").get("params").is_none() {}
     l.stdin = None;
-    let drain = std::thread::spawn({
-        let mut out = BufReader::new(l.child.stdout.take().map_or_else(|| std::mem::replace(&mut l.out, null_out()).into_inner(), |o| o));
-        move || while out.fill_buf().map(|b| !b.is_empty()).unwrap_or(false) { let n = out.buffer().len(); out.consume(n); }
+    let (out, child) = (&mut l.out, &mut l.child);
+    std::thread::scope(|scope| {
+        scope.spawn(move || std::io::copy(out, &mut std::io::sink()));
+        let t0 = Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if t0.elapsed() > Duration::from_secs(2) {
+                child.kill().unwrap();
+                panic!("the child did not exit at the end of its input, with a stream live");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     });
-    let t0 = Instant::now();
-    while l.child.try_wait().unwrap().is_none() {
-        assert!(t0.elapsed() < Duration::from_secs(5), "the child did not exit at the end of its input, with a stream live");
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    drain.join().unwrap();
 }
 
-/// A stdout of a child that has ended, to leave in a `Link` whose own was taken.
-fn null_out() -> BufReader<ChildStdout> {
-    let mut c = Command::new("true").stdout(Stdio::piped()).spawn().unwrap();
-    let out = c.stdout.take().unwrap();
-    let _ = c.wait();
-    BufReader::new(out)
-}
-
-/// A reader that stops holds the stream back: a stream of 8 GB, not read, leaves
-/// the child no larger than its queues.
+/// A reader that stops holds the stream back: a flood nobody reads leaves the
+/// child no larger than its queues.
 fn a_reader_that_stops_holds_the_stream_back() {
     let mut l = Link::open();
-    l.send("stream", json!(["a", 2_000_000, 4000]));
+    l.send("flood", json!([4000]));
     std::thread::sleep(Duration::from_millis(1500));
     let status = std::fs::read_to_string(format!("/proc/{}/status", l.child.id())).unwrap();
     let rss_kb: u64 = status.lines().find_map(|s| s.strip_prefix("VmRSS:")).and_then(|s| s.split_whitespace().next()).and_then(|s| s.parse().ok()).unwrap();
-    assert!(rss_kb < 200_000, "{rss_kb} kB resident with nobody reading: the queue is not holding the stream back");
+    eprintln!("{rss_kb} kB resident with nobody reading");
+    assert!(rss_kb < 64_000, "{rss_kb} kB resident with nobody reading: the queue is not holding the stream back");
     assert_eq!(l.line().expect("the answer")["id"], 1);
-    for i in 0..1000 {
-        assert_eq!(l.line().expect("an item")["params"]["result"]["i"], i);
+    for _ in 0..1000 {
+        assert_eq!(l.line().expect("an item")["params"]["result"].as_str().map(str::len), Some(4000));
     }
 }
 
