@@ -175,15 +175,26 @@ impl IngestActivation {
         }
     }
 
-    /// Holds at most 64 bytes.
-    #[plexus_macros::method(input_window = 1000, input_max_buffered = 64)]
-    pub async fn small(&self, tokens: Input<Token>) -> impl Stream<Item = IngestEvent> + Send + 'static {
+    /// `gated` with a window of 8 and a cap of 1,000 bytes held: a client
+    /// sending large items is held back by credit, never ended.
+    #[plexus_macros::method(input_window = 8, input_max_buffered = 1000)]
+    pub async fn heavy(&self, tokens: Input<Token>) -> impl Stream<Item = IngestEvent> + Send + 'static {
         let probe = self.probe.clone();
         async_stream::stream! {
             let _guard = probe.guard();
-            let _held = tokens;
-            yield IngestEvent::Ok;
-            futures::future::pending::<()>().await;
+            let mut tokens = tokens.into_stream();
+            let mut count = 0;
+            loop {
+                probe.permits.acquire().await.unwrap().forget();
+                match tokens.next().await {
+                    Some(token) => {
+                        probe.seen.lock().unwrap().push(token.t);
+                        count += 1;
+                    }
+                    None => break,
+                }
+            }
+            yield IngestEvent::Ingested { count };
         }
     }
 

@@ -341,21 +341,67 @@ async fn a_method_that_opted_in_gets_too_much_input() {
     assert_eq!((error["error_kind"].as_str(), error["limit"].as_str(), error["max"].as_u64()), (Some("too_much_input"), Some("items"), Some(3)), "{error}");
 }
 
-/// What a call holds is bounded whoever the client is: past the method's cap
-/// of bytes, `too_much_input`, the handler not reading.
+/// What a call holds is bounded by credit, and an obedient client is never
+/// ended for it (owner, 2026-11-02): past the method's cap of bytes held, the
+/// server grants nothing more until the handler drains below it.
 #[tokio::test]
-async fn what_a_call_holds_is_capped() {
+async fn an_obedient_client_sending_large_items_is_slowed_never_ended() {
     let probe = Probe::default();
     let port = served(&probe).await;
     let mut ws = connect(port).await;
-    let (sub, credit) = open(&mut ws, 1, "ingest.small", json!({})).await;
-    assert_eq!(credit, 1000);
-    next_item(&mut ws).await;
-    let big = "y".repeat(100);
-    send(&mut ws, input(sub, 0, &[&big])).await;
-    assert_eq!(next_item(&mut ws).await["type"], "input_closed");
-    let error = next_item(&mut ws).await;
-    assert_eq!((error["error_kind"].as_str(), error["limit"].as_str(), error["max"].as_u64()), (Some("too_much_input"), Some("buffered_bytes"), Some(64)), "{error}");
+    let (sub, mut credit) = open(&mut ws, 1, "ingest.heavy", json!({})).await;
+    assert_eq!(credit, 8);
+    // Each item is 408 bytes as JSON: eight of them, all within credit, hold
+    // 3,264 bytes against a cap of 1,000. Nothing is refused.
+    let big = "y".repeat(400);
+    for seq in 0..8 {
+        send(&mut ws, input(sub, seq, &[&big])).await;
+    }
+    credit -= 8;
+    nothing_for_a_while(&mut ws).await;
+    // Four consumed is half the window, but four held is 1,632 bytes: no credit.
+    probe.permits.add_permits(5);
+    tokio::time::sleep(QUIET).await;
+    assert_eq!(probe.seen().len(), 5);
+    nothing_for_a_while(&mut ws).await;
+    // Six consumed, two held (816 bytes): below the cap, the credit comes.
+    probe.permits.add_permits(2);
+    assert_eq!(next_item(&mut ws).await, json!({"type":"ack","seq":5}));
+    assert_eq!(next_item(&mut ws).await, json!({"type":"credit","n":6}));
+    credit += 6;
+    // The rest at the client's own pace, under whatever credit it is given.
+    probe.permits.add_permits(1_000_000);
+    let total = 64u64;
+    let mut sent = 8u64;
+    while sent < total {
+        while credit > 0 && sent < total {
+            send(&mut ws, input(sub, sent, &[&big])).await;
+            sent += 1;
+            credit -= 1;
+        }
+        if sent == total {
+            break;
+        }
+        let item = next_item(&mut ws).await;
+        match item["type"].as_str() {
+            Some("ack") => {}
+            Some("credit") => credit += item["n"].as_u64().unwrap(),
+            other => panic!("an obedient client is never ended: {other:?}: {item}"),
+        }
+    }
+    send(&mut ws, end(sub, total)).await;
+    loop {
+        let item = next_item(&mut ws).await;
+        match item["type"].as_str() {
+            Some("ack" | "credit") => {}
+            Some("data") => {
+                assert_eq!(item["content"]["count"], total);
+                break;
+            }
+            other => panic!("{other:?}: {item}"),
+        }
+    }
+    assert_eq!(next_item(&mut ws).await["type"], "done");
 }
 
 // ------------------------------------------------------- how a call can end
