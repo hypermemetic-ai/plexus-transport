@@ -584,7 +584,7 @@ impl SessionValidator for Ada {
 }
 
 async fn gated(probe: &Probe, members: &Arc<Members>) -> (u16, Gate) {
-    let roles = RoleTable::new().define("writer", ["ingest.tokens"]).unwrap();
+    let roles = RoleTable::new().define("writer", ["ingest.tokens", "ingest.chunks"]).unwrap();
     let gate = Gate::new(members.clone(), Arc::new(roles), Arc::new(Everything));
     let served = service(probe).with_gate(Arc::new(gate.clone()));
     let validator: Arc<dyn SessionValidator> = Arc::new(Ada);
@@ -718,4 +718,223 @@ async fn dropping_the_clients_stream_cancels_the_call() {
     assert!(tokio::time::timeout(QUIET, events.next()).await.is_err());
     drop(events);
     until_dropped(&probe, 1).await;
+}
+
+// ------------------------------------------- BIDIR-17: binary input frames
+
+/// `[0x01][subscription: u64 BE][seq: u64 BE][payload]`, one item a frame.
+fn binary(sub: u64, seq: u64, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(17 + payload.len());
+    frame.push(0x01);
+    frame.extend_from_slice(&sub.to_be_bytes());
+    frame.extend_from_slice(&seq.to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+async fn send_binary(ws: &mut Ws, frame: Vec<u8>) {
+    ws.send(Message::binary(frame)).await.unwrap();
+}
+
+fn chunks(probe: &Probe) -> Vec<Vec<u8>> {
+    probe.chunks.lock().unwrap().iter().map(|c| c.to_vec()).collect()
+}
+
+/// Until `done`, the call's data item.
+async fn data_then_done(ws: &mut Ws) -> Value {
+    loop {
+        let item = next_item(ws).await;
+        match item["type"].as_str() {
+            Some("ack" | "credit") => {}
+            Some("data") => {
+                assert_eq!(next_item(ws).await["type"], "done");
+                return item["content"].clone();
+            }
+            other => panic!("{other:?}: {item}"),
+        }
+    }
+}
+
+/// Acceptance 1: binary frames reach the handler as the bytes sent, in
+/// order: any byte, a payload that begins `{`, an empty one. `end` is JSON.
+#[tokio::test]
+async fn binary_frames_reach_the_handler_exactly_in_order() {
+    let probe = Probe::default();
+    probe.permits.add_permits(1_000_000);
+    let port = served(&probe).await;
+    let mut ws = connect(port).await;
+    let (sub, credit) = open(&mut ws, 1, "ingest.chunks", json!({"run":"r"})).await;
+    assert_eq!(credit, 4);
+    let payloads: Vec<Vec<u8>> = vec![vec![0, 1, 2, 255], b"{\"not\":\"json to anyone\"}".to_vec(), vec![], (0..=255u8).collect()];
+    for (seq, p) in payloads.iter().enumerate() {
+        send_binary(&mut ws, binary(sub, seq as u64, p)).await;
+    }
+    send(&mut ws, end(sub, payloads.len() as u64)).await;
+    assert_eq!(data_then_done(&mut ws).await, json!({"type":"ingested","count":4}));
+    assert_eq!(chunks(&probe), payloads);
+}
+
+/// Acceptance 3: the same call as base64 JSON items, and the two kinds of
+/// frame in one sequence.
+#[tokio::test]
+async fn the_same_call_works_as_base64_json() {
+    let probe = Probe::default();
+    probe.permits.add_permits(1_000_000);
+    let port = served(&probe).await;
+    let mut ws = connect(port).await;
+    let (sub, _) = open(&mut ws, 1, "ingest.chunks", json!({"run":"r"})).await;
+    send(&mut ws, json!({"jsonrpc":"2.0","method":"menger.input","params":{"subscription":sub,"seq":0,"items":["AAEC/w==", ""]}}).to_string()).await;
+    send_binary(&mut ws, binary(sub, 1, b"raw")).await;
+    send(&mut ws, end(sub, 2)).await;
+    assert_eq!(data_then_done(&mut ws).await, json!({"type":"ingested","count":3}));
+    assert_eq!(chunks(&probe), vec![vec![0, 1, 2, 255], vec![], b"raw".to_vec()]);
+}
+
+/// A JSON item of a binary input that is not base64 is `invalid_input`; so is
+/// a binary frame for an input of JSON items.
+#[tokio::test]
+async fn an_item_of_the_wrong_kind_is_invalid_input() {
+    let probe = Probe::default();
+    probe.permits.add_permits(1_000_000);
+    let port = served(&probe).await;
+    let mut ws = connect(port).await;
+    let (sub, _) = open(&mut ws, 1, "ingest.chunks", json!({"run":"r"})).await;
+    send(&mut ws, json!({"jsonrpc":"2.0","method":"menger.input","params":{"subscription":sub,"seq":0,"items":["not base64!"]}}).to_string()).await;
+    assert_eq!(next_item(&mut ws).await["type"], "input_closed");
+    let error = next_item(&mut ws).await;
+    assert_eq!((error["error_kind"].as_str(), error["seq"].as_u64()), (Some("invalid_input"), Some(0)), "{error}");
+
+    let (sub, _) = open(&mut ws, 2, "ingest.tokens", json!({"run":"r"})).await;
+    send_binary(&mut ws, binary(sub, 0, br#"{"t":"a"}"#)).await;
+    assert_eq!(next_item(&mut ws).await["type"], "input_closed");
+    let error = next_item(&mut ws).await;
+    assert_eq!((error["error_kind"].as_str(), error["seq"].as_u64()), (Some("invalid_input"), Some(0)), "{error}");
+}
+
+/// Acceptance 2: a malformed binary frame (a short header, a tag that is not
+/// `0x01`) is one typed error, and the socket goes on.
+#[tokio::test]
+async fn a_malformed_binary_frame_is_one_typed_error() {
+    let probe = Probe::default();
+    probe.permits.add_permits(1_000_000);
+    let port = served(&probe).await;
+    let mut ws = connect(port).await;
+    for frame in [vec![0x01, 0, 0, 0], vec![0x7f, 1, 2, 3], vec![]] {
+        send_binary(&mut ws, frame.clone()).await;
+        let answer: Value = serde_json::from_str(&next_raw(&mut ws).await).unwrap();
+        assert_eq!(answer["id"], Value::Null, "{answer}");
+        assert_eq!(answer["error"]["data"]["error_kind"], "malformed_frame", "{frame:?}: {answer}");
+    }
+    let (sub, _) = open(&mut ws, 1, "ingest.chunks", json!({"run":"r"})).await;
+    send_binary(&mut ws, binary(sub, 0, b"ok")).await;
+    send(&mut ws, end(sub, 1)).await;
+    assert_eq!(data_then_done(&mut ws).await["count"], 1);
+}
+
+/// Acceptance 2: a frame naming no call of this socket is dropped (and
+/// counted, as a stranger's notification is), with a call open or none.
+#[tokio::test]
+async fn a_strangers_binary_frame_is_dropped() {
+    let probe = Probe::default();
+    probe.permits.add_permits(1_000_000);
+    let port = served(&probe).await;
+    let mut ws = connect(port).await;
+    send_binary(&mut ws, binary(424242, 0, b"no one's")).await;
+    nothing_for_a_while(&mut ws).await;
+    let (sub, _) = open(&mut ws, 1, "ingest.chunks", json!({"run":"r"})).await;
+    send_binary(&mut ws, binary(sub + 1, 0, b"no one's")).await;
+    nothing_for_a_while(&mut ws).await;
+    send_binary(&mut ws, binary(sub, 0, b"mine")).await;
+    send(&mut ws, end(sub, 1)).await;
+    assert_eq!(data_then_done(&mut ws).await["count"], 1);
+    assert_eq!(chunks(&probe), vec![b"mine".to_vec()]);
+}
+
+/// Acceptance 2: past credit in binary frames is `past_credit`, as in JSON.
+#[tokio::test]
+async fn past_credit_in_binary_frames_is_past_credit() {
+    let probe = Probe::default();
+    let port = served(&probe).await;
+    let mut ws = connect(port).await;
+    let (sub, credit) = open(&mut ws, 1, "ingest.chunks", json!({"run":"r"})).await;
+    for seq in 0..=credit {
+        send_binary(&mut ws, binary(sub, seq, b"x")).await;
+    }
+    assert_eq!(next_item(&mut ws).await["type"], "input_closed");
+    let error = next_item(&mut ws).await;
+    assert_eq!((error["error_kind"].as_str(), error["seq"].as_u64()), (Some("past_credit"), Some(credit)), "{error}");
+}
+
+/// Acceptance 2: a grant revoked mid-stream ends a binary call `forbidden`.
+#[tokio::test]
+async fn a_revoked_grant_ends_a_binary_call() {
+    let probe = Probe::default();
+    probe.permits.add_permits(1_000_000);
+    let members = Arc::new(Members::default());
+    members.add(ADA, "writer", "RUN");
+    let (port, gate) = gated(&probe, &members).await;
+    let mut ws = signed_in(port).await;
+    let (sub, _) = open(&mut ws, 1, "ingest.chunks", json!({"run":"RUN"})).await;
+    send_binary(&mut ws, binary(sub, 0, b"a")).await;
+    tokio::time::timeout(WAIT, async {
+        while probe.chunks.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    members.0.lock().unwrap().clear();
+    gate.moved(plexus_core::plexus::duplex_gate::GrantsMove::Revoke);
+    let closed = next_item(&mut ws).await;
+    assert_eq!((closed["type"].as_str(), closed["reason"].as_str()), (Some("input_closed"), Some("forbidden")), "{closed}");
+    let error = next_item(&mut ws).await;
+    assert_eq!(error["error_kind"], "forbidden", "{error}");
+    send_binary(&mut ws, binary(sub, 1, b"b")).await;
+    nothing_for_a_while(&mut ws).await;
+    assert_eq!(chunks(&probe), vec![b"a".to_vec()]);
+}
+
+/// The schema marks the input binary: base64 as JSON, raw in a frame.
+#[tokio::test]
+async fn the_schema_marks_the_input_binary() {
+    let probe = Probe::default();
+    let port = served(&probe).await;
+    let mut ws = connect(port).await;
+    send(&mut ws, json!({"jsonrpc":"2.0","id":1,"method":"menger.call","params":{"method":"ingest.schema","params":{"method":"chunks"}}}).to_string()).await;
+    next_raw(&mut ws).await;
+    let input = next_item(&mut ws).await["content"]["input"].clone();
+    assert_eq!((input["type"].as_str(), input["contentEncoding"].as_str(), input["x-plexus-binary"].as_bool()), (Some("string"), Some("base64"), Some(true)), "{input}");
+}
+
+/// Counts the binary input frames a socket reads.
+struct Binaries(Arc<std::sync::atomic::AtomicUsize>);
+
+impl plexus_transport::ConnectionHook for Binaries {
+    fn on_frame(&self, frame: &[u8]) -> bool {
+        if frame.first() == Some(&0x01) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        false
+    }
+}
+
+/// The emitted client sends `Input<Bytes>` as binary frames, one item each.
+#[tokio::test]
+async fn the_emitted_client_sends_bytes_as_binary_frames() {
+    let probe = Probe::default();
+    probe.permits.add_permits(1_000_000);
+    let counted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hook = counted.clone();
+    let options = UpgradeOptions {
+        hooks: Some(plexus_transport::Hooks::new(move |_, _| Some(Arc::new(Binaries(hook.clone())) as Arc<dyn plexus_transport::ConnectionHook>))),
+        ..UpgradeOptions::default()
+    };
+    let port = serve(service(&probe).into_rpc_module().unwrap(), options).await;
+    let transport = WsTransport::connect(&format!("ws://127.0.0.1:{port}/"), "menger").await.unwrap();
+    let client = IngestClient::new(transport);
+    let sent: Vec<bytes::Bytes> = (0..100u32).map(|i| bytes::Bytes::from(i.to_be_bytes().repeat(i as usize % 7))).collect();
+    let events = client.chunks_all("r".into(), futures::stream::iter(sent.clone())).await.unwrap();
+    assert_eq!(events, [IngestEvent::Ingested { count: 100 }]);
+    assert_eq!(chunks(&probe), sent.iter().map(|b| b.to_vec()).collect::<Vec<_>>());
+    assert_eq!(counted.load(std::sync::atomic::Ordering::SeqCst), 100, "one binary frame an item");
 }

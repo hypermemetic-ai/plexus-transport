@@ -6,6 +6,7 @@ pub use plexus_client;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use bytes::Bytes;
 use futures::stream::{Stream, StreamExt};
 use plexus_core::plexus::Input;
 use schemars::JsonSchema;
@@ -41,11 +42,13 @@ pub struct Probe {
     pub dropped: Arc<AtomicUsize>,
     /// `gated` takes a permit before it polls for its next item.
     pub permits: Arc<Semaphore>,
+    /// BIDIR-17: every chunk `chunks` read, as it read it.
+    pub chunks: Arc<Mutex<Vec<Bytes>>>,
 }
 
 impl Default for Probe {
     fn default() -> Self {
-        Self { seen: Arc::default(), dropped: Arc::default(), permits: Arc::new(Semaphore::new(0)) }
+        Self { seen: Arc::default(), dropped: Arc::default(), permits: Arc::new(Semaphore::new(0)), chunks: Arc::default() }
     }
 }
 
@@ -189,6 +192,35 @@ impl IngestActivation {
                 match tokens.next().await {
                     Some(token) => {
                         probe.seen.lock().unwrap().push(token.t);
+                        count += 1;
+                    }
+                    None => break,
+                }
+            }
+            yield IngestEvent::Ingested { count };
+        }
+    }
+
+    /// BIDIR-17: raw chunks of a run, a permit before each poll as `gated`.
+    #[plexus_macros::method(target = "run", input_window = 4)]
+    pub async fn chunks(
+        &self,
+        /// the run they belong to
+        run: String,
+        /// the bytes, as they arrive
+        chunks: Input<Bytes>,
+    ) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        let _ = run;
+        let probe = self.probe.clone();
+        async_stream::stream! {
+            let _guard = probe.guard();
+            let mut chunks = chunks.into_stream();
+            let mut count = 0;
+            loop {
+                probe.permits.acquire().await.unwrap().forget();
+                match chunks.next().await {
+                    Some(chunk) => {
+                        probe.chunks.lock().unwrap().push(chunk);
                         count += 1;
                     }
                     None => break,
