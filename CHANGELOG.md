@@ -3,6 +3,15 @@
 All notable changes to plexus-transport are documented here. This file starts
 at 0.6.0; earlier changes are in the git history.
 
+## [0.7.0] — unreleased (RETURNS-36)
+
+### Breaking
+
+- On plexus-core 0.8 (RETURNS-11): REST answers a call failure with its
+  `RemoteError` and a status by kind (404 · 400 · 401 · 403 · 501 · 500, and
+  429 · 503 · 504 for `too_many_calls`, `child_unavailable`,
+  `child_timeout`); SSE and MCP carry typed progress and error frames.
+
 ## [Unreleased]
 
 ### Fixed

@@ -22,7 +22,7 @@ use async_trait::async_trait;
 use jsonrpsee::core::server::Methods;
 use jsonrpsee::RpcModule;
 use plexus_core::plexus::{
-    auth::AuthContext, error_stream, schema::MethodSchema, wire, wrap_stream, Activation, ChildRouter, DynamicHub,
+    auth::AuthContext, schema::MethodSchema, wire, wrap_stream, Activation, ChildRouter, DynamicHub,
     MethodEnumSchema, PlexusError, PlexusStream, PluginSchema, PLEXUS_NOTIF_METHOD,
 };
 use plexus_core::request::RawRequestContext;
@@ -141,7 +141,7 @@ impl Activation for Echo {
     }
 
     fn plugin_schema(&self) -> PluginSchema {
-        let streaming = |name: &str| MethodSchema::new(name, name, name).with_streaming(true);
+        let streaming = |name: &str| MethodSchema::new(name, name, name).with_cardinality(plexus_core::plexus::Cardinality::Many);
         PluginSchema::leaf("echo", "0.0.1", "The kit's echo", vec![streaming("echo"), streaming("count"), streaming("whoami")])
     }
 }
@@ -158,7 +158,18 @@ fn module() -> RpcModule<()> {
                 let method = p["method"].as_str().unwrap_or_default();
                 let stream = match hub.route(method, p["params"].clone(), None).await {
                     Ok(stream) => stream,
-                    Err(e) => error_stream(e.to_string(), vec!["echo".to_string()], false),
+                    // RETURNS-36: the server's own line as spec/05's
+                    // `message`, the typed `error` beside it.
+                    Err(e) => Box::pin(futures::stream::once(async move {
+                        plexus_core::plexus::PlexusStreamItem::from_plexus_error(
+                            plexus_core::plexus::StreamMetadata::new(
+                                vec!["echo".to_string()],
+                                plexus_core::plexus::PlexusContext::hash(),
+                            ),
+                            &e,
+                            false,
+                        )
+                    })),
                 };
                 let sink = pending.accept().await?;
                 wire::pipe(sink, stream, &ext).await

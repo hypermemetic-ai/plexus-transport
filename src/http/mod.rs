@@ -6,8 +6,11 @@
 //!
 //! ## Response Formats
 //!
-//! - **Non-streaming methods**: Return structured JSON with `data`, `logs`, and `progress` fields
-//! - **Streaming methods**: Use Server-Sent Events (SSE) for real-time streaming
+//! - **Cardinality `one`**: one JSON body `{"data": [...], "progress"?: [<P>...], "error"?: <RemoteError>}`
+//! - **Cardinality `many`**: Server-Sent Events (SSE) for real-time streaming
+//!
+//! A failed call answers the status its `RemoteError` kind maps to
+//! ([`handler::remote_error_status`]); see [`handler`] for every frame's shape.
 //!
 //! ## Example
 //!
@@ -37,5 +40,5 @@ pub mod handler;
 pub mod server;
 
 pub use bridge::ActivationRestBridge;
-pub use handler::{handle_method_call, MethodInfo};
+pub use handler::{handle_method_call, remote_error_status, MethodInfo};
 pub use server::serve_rest_http;
