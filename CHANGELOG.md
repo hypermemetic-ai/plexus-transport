@@ -5,6 +5,14 @@ at 0.6.0; earlier changes are in the git history.
 
 ## [Unreleased]
 
+### Added
+
+- PERF-8: a client that offers `batch` in its upgrade's URL (`?batch`, or
+  `?batch=N` for at most N) is sent the items a stream has ready together in
+  one notification, `results`, the metadata said once (plexus-wire spec/02).
+  A client that offers nothing is sent today's frames. `Negotiated` says what
+  was taken. Needs plexus-core's `FrameSink::batching`.
+
 ### Fixed
 
 - TRANSPORT-17: `serve_stdio` has one writer. Every line, an answer or a stream's

@@ -80,6 +80,25 @@ fn plain(status: StatusCode, body: &'static str) -> Response<HttpBody> {
 }
 
 /// `426 Upgrade Required` (RFC 9110 §15.5.22): the port speaks WebSocket only.
+/// What a client's upgrade offers of batches (PERF-8, spec/02): `batch` in
+/// its URL's query, or `batch=N` for at most N items a notification, never
+/// more than plexus-core's `MAX_BATCH`. A browser can say it: it sets no
+/// header on a socket's upgrade, but it sets the URL. Nothing, or an offer
+/// that does not read, is one item a notification, as an unknown query is.
+fn batch_offer(query: Option<&str>) -> usize {
+    use plexus_core::plexus::wire::MAX_BATCH;
+    for pair in query.unwrap_or("").split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == "batch" {
+            return match value {
+                "" => MAX_BATCH,
+                n => n.parse::<usize>().map_or(0, |n| n.min(MAX_BATCH)),
+            };
+        }
+    }
+    0
+}
+
 fn upgrade_required() -> Response<HttpBody> {
     let mut r = plain(StatusCode::UPGRADE_REQUIRED, "Upgrade Required: this port speaks JSON-RPC over WebSocket only");
     r.headers_mut().insert(header::UPGRADE, HeaderValue::from_static("websocket"));
@@ -123,7 +142,7 @@ impl Upgrade {
         };
         // PERF-9 reads `Sec-WebSocket-Protocol` here, and PERF-8 the batch
         // offer: what the socket speaks is settled at the upgrade.
-        let negotiated = Negotiated::default();
+        let negotiated = Negotiated { batch: batch_offer(req.uri().query()), ..Negotiated::default() };
         let on_upgrade = hyper::upgrade::on(&mut req);
         let mut ext = req.extensions().clone();
         ext.insert(jsonrpsee::ConnectionId(conn.id() as usize));

@@ -680,6 +680,9 @@ pub(crate) async fn run(
         super::Encoding::Json => WireEncoding::Json,
     };
     let (frame_sink, frames) = FrameSink::channel(limits.queue, encoding);
+    // PERF-8: what a stream has ready together goes in one notification, for
+    // a client that offered `batch`.
+    let frame_sink = frame_sink.batching(negotiated.batch);
     let mut ext = ext;
     ext.insert(frame_sink);
     conn.upgraded(negotiated, ConnectionWriter { tx: own_tx });
