@@ -3,6 +3,14 @@
 All notable changes to plexus-transport are documented here. This file starts
 at 0.6.0; earlier changes are in the git history.
 
+## [Unreleased]
+
+### Added
+
+- BIDIR-6: the WebSocket loop takes `{ns}.input` and `{ns}.end` on its reader,
+  through a connection's `InputTable` in every call's extensions. With no input
+  half open that is one load; no frame of any other kind changes.
+
 ## [0.6.0]
 
 Release with plexus-core 0.7.0.

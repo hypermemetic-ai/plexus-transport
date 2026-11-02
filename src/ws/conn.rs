@@ -4,8 +4,9 @@
 //! **Reading.** Every inbound message is taken in the order it came; the
 //! connection's hook sees it first; then it is routed by its shape (spec/14
 //! rule 2): a call (`method` and `id`) to the method table, a notification
-//! to nothing (as before), an answer to no request of this side's dropped,
-//! any other object `-32600`, anything else `-32700`. A call is the method
+//! to nothing (as before) unless it is a call's input (below), an answer to
+//! no request of this side's dropped, any other object `-32600`, anything
+//! else `-32700`. A call is the method
 //! table's to run — jsonrpsee-core's own callbacks, through its public API,
 //! as jsonrpsee-server drove them: a subscription's callback starts the
 //! subscription's own task (the one task a call), and its acceptance is
@@ -14,6 +15,13 @@
 //! the method table sees calls in the order they came. At most
 //! [`READ_BUDGET`] frames are read a wakeup, and none while the answers wait
 //! on a full socket.
+//!
+//! **Input** (BIDIR-6). While a call on the socket has an input half, each
+//! message is offered first to the connection's [`InputTable`], which takes
+//! `{ns}.input` and `{ns}.end` notifications here on the reader, inline, in
+//! the order they came, sharing the message's bytes: nothing is spawned or
+//! decoded for them. With no input half open that is one load, and every
+//! other frame reads as it always has.
 //!
 //! **Writing.** When it wakes the loop takes every frame that is ready — the
 //! answers it made itself, the method table's queue (each call's answer,
@@ -54,6 +62,7 @@ use jsonrpsee::types::error::{reject_too_big_request, reject_too_many_subscripti
 use jsonrpsee::types::{ErrorObject, Id, Notification, Params, Request};
 use jsonrpsee::ConnectionId;
 use plexus_core::plexus::wire::{FrameReceiver, FrameSink, WireEncoding, WireFrame};
+use plexus_core::plexus::InputTable;
 use serde_json::value::RawValue;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -266,6 +275,8 @@ struct Loop {
     /// starves another).
     turn: usize,
     hook: Option<Arc<dyn ConnectionHook>>,
+    /// BIDIR-6: the input halves open on this socket.
+    inputs: Arc<InputTable>,
     /// Subscriptions whose acceptance is awaited (their callbacks' futures),
     /// in arrival order, each polled with the socket's own waker — at most
     /// 1,024 (a subscription's permit is taken first), and short-lived: a
@@ -356,6 +367,7 @@ impl Loop {
         }
         let first = data.iter().take(128).position(|b| !b.is_ascii_whitespace());
         match first.map(|i| (i, data[i])) {
+            Some(_) if !self.inputs.idle() && self.inputs.take_frame(&data) => {}
             Some((i, b'{')) => self.single(&data[i..]),
             Some((i, b'[')) => {
                 // A batch, which no client sends: a task of its own, so its
@@ -682,6 +694,10 @@ pub(crate) async fn run(
     let (frame_sink, frames) = FrameSink::channel(limits.queue, encoding);
     let mut ext = ext;
     ext.insert(frame_sink);
+    // BIDIR-6: every call finds its connection's input halves there too; a
+    // duplex call is one call in the connection's count.
+    let inputs = InputTable::new(conn.id(), Arc::new(conn.calls().clone()));
+    ext.insert(inputs.clone());
     conn.upgraded(negotiated, ConnectionWriter { tx: own_tx });
     let hook = shared.hooks.as_ref().and_then(|h| h.make(&conn, &ext));
     let dispatch = Dispatch {
@@ -712,6 +728,7 @@ pub(crate) async fn run(
         fenced: None,
         turn: 0,
         hook,
+        inputs,
         accepting: Vec::new(),
         running: Arc::new(AtomicUsize::new(0)),
         dropped,
