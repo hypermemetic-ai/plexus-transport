@@ -53,7 +53,7 @@ use jsonrpsee::core::server::{BatchResponseBuilder, MethodCallback, MethodRespon
 use jsonrpsee::types::error::{reject_too_big_request, reject_too_many_subscriptions, ErrorCode};
 use jsonrpsee::types::{ErrorObject, Id, Notification, Params, Request};
 use jsonrpsee::ConnectionId;
-use plexus_core::plexus::wire::{FrameReceiver, FrameSink, WireEncoding, WireFrame};
+use plexus_core::plexus::wire::{proto, FrameReceiver, FrameSink, InlineSlot, WireEncoding, WireFrame};
 use serde_json::value::RawValue;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -124,6 +124,20 @@ struct Dispatch {
     /// jsonrpsee-server's 1,024 subscriptions a connection: a permit each,
     /// held for the subscription's life — so the calls open are counted.
     subscriptions: Arc<Semaphore>,
+    /// PERF.115-38 (spike): what the client offered, and its own ids when it
+    /// offered `small-ids` (counted from 1 on this connection).
+    features: u32,
+    own_ids: Option<Arc<dyn jsonrpsee::core::traits::IdProvider>>,
+}
+
+/// PERF.115-38 (spike): subscription ids counted per connection.
+#[derive(Debug, Default)]
+struct CountedIds(std::sync::atomic::AtomicU64);
+
+impl jsonrpsee::core::traits::IdProvider for CountedIds {
+    fn next_id(&self) -> jsonrpsee::types::SubscriptionId<'static> {
+        jsonrpsee::types::SubscriptionId::Num(self.0.fetch_add(1, Ordering::Relaxed) + 1)
+    }
 }
 
 impl Dispatch {
@@ -144,7 +158,8 @@ impl Dispatch {
             }
             Some((_, MethodCallback::Subscription(cb))) => match self.subscriptions.clone().try_acquire_owned() {
                 Ok(permit) => {
-                    let state = SubscriptionState { conn_id: self.conn_id, id_provider: &*self.shared.ids, subscription_permit: permit };
+                    let ids = self.own_ids.as_deref().unwrap_or(&*self.shared.ids);
+                    let state = SubscriptionState { conn_id: self.conn_id, id_provider: ids, subscription_permit: permit };
                     (cb)(id, params, self.sink.clone(), state, ext).await
                 }
                 Err(_) => MethodResponse::error(id, reject_too_many_subscriptions(MAX_SUBSCRIPTIONS)),
@@ -417,7 +432,27 @@ impl Loop {
             }
             Some((_, MethodCallback::Subscription(cb))) => match self.dispatch.subscriptions.clone().try_acquire_owned() {
                 Ok(permit) => {
-                    let state = SubscriptionState { conn_id, id_provider: &*shared.ids, subscription_permit: permit };
+                    let own = self.dispatch.own_ids.clone();
+                    let ids = own.as_deref().unwrap_or(&*shared.ids);
+                    let state = SubscriptionState { conn_id, id_provider: ids, subscription_permit: permit };
+                    if self.dispatch.features & proto::UNARY != 0 {
+                        // PERF.115-38 (spike): the pipe may answer the call in
+                        // one frame; then jsonrpsee's answer for the
+                        // subscription it never accepted is dropped here.
+                        let slot = InlineSlot::new(serde_json::to_string(&id).unwrap_or_default());
+                        let mut ext = self.ext.clone();
+                        ext.insert(slot.clone());
+                        let fut = (cb)(id, params, self.dispatch.sink.clone(), state, ext);
+                        self.accepting.push(Box::pin(async move {
+                            let rp = fut.await;
+                            if slot.answered() {
+                                MethodResponse::notification()
+                            } else {
+                                rp
+                            }
+                        }));
+                        return;
+                    }
                     // The callback starts the subscription's own task; what it
                     // hands back resolves once the subscription is accepted
                     // (its id already sent through the sink) or refused.
@@ -680,6 +715,7 @@ pub(crate) async fn run(
         super::Encoding::Json => WireEncoding::Json,
     };
     let (frame_sink, frames) = FrameSink::channel(limits.queue, encoding);
+    let frame_sink = frame_sink.with_features(negotiated.features);
     let mut ext = ext;
     ext.insert(frame_sink);
     conn.upgraded(negotiated, ConnectionWriter { tx: own_tx });
@@ -689,6 +725,8 @@ pub(crate) async fn run(
         sink: MethodSink::new_with_limit(tx.clone(), MAX_RESPONSE as u32),
         subscriptions: Arc::new(Semaphore::new(MAX_SUBSCRIPTIONS as usize)),
         shared: shared.clone(),
+        features: negotiated.features,
+        own_ids: (negotiated.features & proto::SMALL_IDS != 0).then(|| Arc::new(CountedIds::default()) as Arc<dyn jsonrpsee::core::traits::IdProvider>),
     };
     let interval = |every: Duration| {
         let mut i = tokio::time::interval_at(tokio::time::Instant::now() + every, every);

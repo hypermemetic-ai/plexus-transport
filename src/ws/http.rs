@@ -123,7 +123,12 @@ impl Upgrade {
         };
         // PERF-9 reads `Sec-WebSocket-Protocol` here, and PERF-8 the batch
         // offer: what the socket speaks is settled at the upgrade.
-        let negotiated = Negotiated::default();
+        let mut negotiated = Negotiated::default();
+        // PERF.115-38 (spike): the offer rides a header of its own here; a
+        // browser cannot set one, so a build would read a subprotocol token.
+        if let Some(offer) = req.headers().get("plexus-wire").and_then(|v| v.to_str().ok()) {
+            negotiated.features = plexus_core::plexus::wire::proto::parse(offer);
+        }
         let on_upgrade = hyper::upgrade::on(&mut req);
         let mut ext = req.extensions().clone();
         ext.insert(jsonrpsee::ConnectionId(conn.id() as usize));

@@ -116,6 +116,10 @@ pub enum Encoding {
 pub struct Negotiated {
     /// The encoding every frame on the socket is in.
     pub encoding: Encoding,
+    /// PERF.115-38 (spike, never merged): what the client offered in its
+    /// upgrade's `Plexus-Wire` header (`plexus_core::plexus::wire::proto`):
+    /// 0, today's frames.
+    pub features: u32,
 }
 
 /// A connection's own reader of inbound frames (BIDIR-12's seam, in place of
