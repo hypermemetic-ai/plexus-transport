@@ -4,8 +4,9 @@
 //! **Reading.** Every inbound message is taken in the order it came; the
 //! connection's hook sees it first; then it is routed by its shape (spec/14
 //! rule 2): a call (`method` and `id`) to the method table, a notification
-//! to nothing (as before), an answer to no request of this side's dropped,
-//! any other object `-32600`, anything else `-32700`. A call is the method
+//! to nothing (as before) unless it is a call's input (below), an answer to
+//! no request of this side's dropped, any other object `-32600`, anything
+//! else `-32700`. A call is the method
 //! table's to run — jsonrpsee-core's own callbacks, through its public API,
 //! as jsonrpsee-server drove them: a subscription's callback starts the
 //! subscription's own task (the one task a call), and its acceptance is
@@ -14,6 +15,13 @@
 //! the method table sees calls in the order they came. At most
 //! [`READ_BUDGET`] frames are read a wakeup, and none while the answers wait
 //! on a full socket.
+//!
+//! **Input** (BIDIR-6). While a call on the socket has an input half, each
+//! message is offered first to the connection's [`InputTable`], which takes
+//! `{ns}.input` and `{ns}.end` notifications here on the reader, inline, in
+//! the order they came, sharing the message's bytes: nothing is spawned or
+//! decoded for them. With no input half open that is one load, and every
+//! other frame reads as it always has.
 //!
 //! **Writing.** When it wakes the loop takes every frame that is ready — the
 //! answers it made itself, the method table's queue (each call's answer,
@@ -54,6 +62,8 @@ use jsonrpsee::types::error::{reject_too_big_request, reject_too_many_subscripti
 use jsonrpsee::types::{ErrorObject, Id, Notification, Params, Request};
 use jsonrpsee::ConnectionId;
 use plexus_core::plexus::wire::{FrameReceiver, FrameSink, WireEncoding, WireFrame};
+use plexus_core::plexus::input::BINARY_INPUT;
+use plexus_core::plexus::{Delivered, InputTable};
 use serde_json::value::RawValue;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
@@ -266,6 +276,8 @@ struct Loop {
     /// starves another).
     turn: usize,
     hook: Option<Arc<dyn ConnectionHook>>,
+    /// BIDIR-6: the input halves open on this socket.
+    inputs: Arc<InputTable>,
     /// Subscriptions whose acceptance is awaited (their callbacks' futures),
     /// in arrival order, each polled with the socket's own waker — at most
     /// 1,024 (a subscription's permit is taken first), and short-lived: a
@@ -343,8 +355,21 @@ impl Loop {
     /// One inbound message, in arrival order.
     fn message(&mut self, m: Message) -> Result<(), End> {
         self.last_in = Instant::now();
+        let binary = matches!(m, Message::Binary(_));
         let data = match m {
             Message::Text(t) => Bytes::from(t),
+            // BIDIR-17: a binary input frame, routed with no parse.
+            Message::Binary(b) if b.first() == Some(&BINARY_INPUT) => {
+                if let Some(hook) = &self.hook {
+                    if hook.on_frame(&b) {
+                        return Ok(());
+                    }
+                }
+                if self.inputs.take_binary(&b) == Delivered::Malformed {
+                    self.malformed("a binary input frame is 17 bytes of header and its payload");
+                }
+                return Ok(());
+            }
             Message::Binary(b) => b,
             Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => return Ok(()),
             Message::Close(_) => return Err(End::PeerClosed),
@@ -356,6 +381,7 @@ impl Loop {
         }
         let first = data.iter().take(128).position(|b| !b.is_ascii_whitespace());
         match first.map(|i| (i, data[i])) {
+            Some(_) if !self.inputs.idle() && self.inputs.take_frame(&data) => {}
             Some((i, b'{')) => self.single(&data[i..]),
             Some((i, b'[')) => {
                 // A batch, which no client sends: a task of its own, so its
@@ -370,9 +396,23 @@ impl Loop {
                     running.fetch_sub(1, Ordering::AcqRel);
                 });
             }
+            // BIDIR-17: a binary message that is neither JSON nor an input
+            // frame names its tag.
+            _ if binary => self.malformed(&match data.first() {
+                Some(tag) => format!("a binary message tagged {tag:#04x}: the only tag is 0x01, an input frame"),
+                None => "an empty binary message".to_string(),
+            }),
             _ => self.respond(MethodResponse::error(Id::Null, ErrorObject::from(ErrorCode::ParseError))),
         }
         Ok(())
+    }
+
+    /// BIDIR-17: one typed error for a binary message this socket cannot read
+    /// (`-32700`, `data.error_kind` `malformed_frame`). It names no call:
+    /// nothing in it can be trusted to.
+    fn malformed(&mut self, why: &str) {
+        let data = serde_json::json!({ "error_kind": "malformed_frame" });
+        self.respond(MethodResponse::error(Id::Null, ErrorObject::owned(ErrorCode::ParseError.code(), format!("malformed_frame: {why}"), Some(data))));
     }
 
     fn single(&mut self, data: &[u8]) {
@@ -682,7 +722,11 @@ pub(crate) async fn run(
     let (frame_sink, frames) = FrameSink::channel(limits.queue, encoding);
     // PERF-8: what a stream has ready together goes in one notification, for
     // a client that offered `batch`.
-    let frame_sink = frame_sink.batching(negotiated.batch);
+    // BIDIR-6: every call finds its connection's input halves on the sink (an
+    // entry of their own in the extensions would be one more allocation each
+    // call clones them); a duplex call is one call in the connection's count.
+    let inputs = InputTable::new(conn.id(), Arc::new(conn.calls().clone()));
+    let frame_sink = frame_sink.batching(negotiated.batch).with_inputs(inputs.clone());
     let mut ext = ext;
     ext.insert(frame_sink);
     conn.upgraded(negotiated, ConnectionWriter { tx: own_tx });
@@ -715,6 +759,7 @@ pub(crate) async fn run(
         fenced: None,
         turn: 0,
         hook,
+        inputs,
         accepting: Vec::new(),
         running: Arc::new(AtomicUsize::new(0)),
         dropped,

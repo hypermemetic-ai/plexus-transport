@@ -14,6 +14,7 @@
 //! | frames arrive | the socket's reader takes them in arrival order and routes each by its shape (spec/14 rule 2); no task is spawned per frame |
 //! | a call frame (`method` and `id`) | the method table's callback runs it with the upgrade's extensions (the connection, its `AuthContext`, its `ConnectionId`); a subscription is its own task (jsonrpsee-core's), so calls on one socket overlap |
 //! | each inbound frame, before dispatch | the connection's [`ConnectionHook`] sees it and may take it (BIDIR-12) |
+//! | a call's `{ns}.input` or `{ns}.end` (BIDIR-6) | taken by the connection's input table on the reader, inline, in arrival order; no task, no decode |
 //! | a frame that answers no request of this side's | dropped, never answered `-32600` (LOCAL-7) |
 //! | frames are ready to write | the socket's writer takes every ready frame, up to its budget (64 KiB), writes them and flushes once, then yields |
 //! | a reader is slow | the socket's queue is bounded (1,024 frames); a full queue holds that socket's calls back |

@@ -1,0 +1,280 @@
+//! BIDIR-6: the activation `tests/duplex_wire.rs` drives: every way a handler
+//! can treat its input.
+
+pub use plexus_client;
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+
+use bytes::Bytes;
+use futures::stream::{Stream, StreamExt};
+use plexus_core::plexus::Input;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
+
+/// One token of a run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Token {
+    pub t: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum IngestEvent {
+    Ingested { count: u32 },
+    Ok,
+    Error { message: String },
+}
+
+impl plexus_client::FromClientError for IngestEvent {
+    fn from_client_error(error: plexus_client::ClientError) -> Self {
+        IngestEvent::Error { message: error.to_string() }
+    }
+}
+
+/// What a test sees of the handlers and tells them.
+#[derive(Clone)]
+pub struct Probe {
+    /// Every token a handler read, in order.
+    pub seen: Arc<Mutex<Vec<String>>>,
+    /// Handlers dropped (their stream ended or was dropped).
+    pub dropped: Arc<AtomicUsize>,
+    /// `gated` takes a permit before it polls for its next item.
+    pub permits: Arc<Semaphore>,
+    /// BIDIR-17: every chunk `chunks` read, as it read it.
+    pub chunks: Arc<Mutex<Vec<Bytes>>>,
+}
+
+impl Default for Probe {
+    fn default() -> Self {
+        Self { seen: Arc::default(), dropped: Arc::default(), permits: Arc::new(Semaphore::new(0)), chunks: Arc::default() }
+    }
+}
+
+struct Dropped(Arc<AtomicUsize>);
+
+impl Drop for Dropped {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl Probe {
+    fn guard(&self) -> Dropped {
+        Dropped(self.dropped.clone())
+    }
+
+    pub fn dropped(&self) -> usize {
+        self.dropped.load(Ordering::SeqCst)
+    }
+
+    pub fn seen(&self) -> Vec<String> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct IngestActivation {
+    pub probe: Probe,
+}
+
+#[plexus_macros::activation]
+impl IngestActivation {
+    /// Count a run's tokens.
+    #[plexus_macros::method(target = "run")]
+    pub async fn tokens(
+        &self,
+        /// the run they belong to
+        run: String,
+        /// the tokens, as they arrive
+        tokens: Input<Token>,
+    ) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        let _ = run;
+        let probe = self.probe.clone();
+        async_stream::stream! {
+            let _guard = probe.guard();
+            let mut tokens = tokens.into_stream();
+            let mut count = 0;
+            while let Some(token) = tokens.next().await {
+                probe.seen.lock().unwrap().push(token.t);
+                count += 1;
+            }
+            yield IngestEvent::Ingested { count };
+        }
+    }
+
+    /// Forward each token before asking for the next: a permit stands for
+    /// what is forwarded.
+    #[plexus_macros::method(input_window = 4)]
+    pub async fn gated(&self, tokens: Input<Token>) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        let probe = self.probe.clone();
+        async_stream::stream! {
+            let _guard = probe.guard();
+            let mut tokens = tokens.into_stream();
+            let mut count = 0;
+            loop {
+                probe.permits.acquire().await.unwrap().forget();
+                match tokens.next().await {
+                    Some(token) => {
+                        probe.seen.lock().unwrap().push(token.t);
+                        count += 1;
+                    }
+                    None => break,
+                }
+            }
+            yield IngestEvent::Ingested { count };
+        }
+    }
+
+    /// Take `take` tokens and end, the input half still open.
+    #[plexus_macros::method]
+    pub async fn early(&self, take: u32, tokens: Input<Token>) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        let probe = self.probe.clone();
+        async_stream::stream! {
+            let _guard = probe.guard();
+            let mut tokens = tokens.into_stream();
+            let mut count = 0;
+            while count < take {
+                if tokens.next().await.is_none() {
+                    break;
+                }
+                count += 1;
+            }
+            yield IngestEvent::Ingested { count };
+        }
+    }
+
+    /// Say so at once, then wait: never polls its input again.
+    #[plexus_macros::method(input_window = 4)]
+    pub async fn stuck(&self, tokens: Input<Token>) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        let probe = self.probe.clone();
+        async_stream::stream! {
+            let _guard = probe.guard();
+            let _held = tokens;
+            yield IngestEvent::Ok;
+            futures::future::pending::<()>().await;
+        }
+    }
+
+    /// Let its input go and carry on: the half closes, the call does not.
+    #[plexus_macros::method]
+    pub async fn letgo(&self, tokens: Input<Token>) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        let probe = self.probe.clone();
+        async_stream::stream! {
+            let _guard = probe.guard();
+            drop(tokens);
+            probe.permits.acquire().await.unwrap().forget();
+            yield IngestEvent::Ok;
+        }
+    }
+
+    /// Opted into a lifetime limit of 3 items.
+    #[plexus_macros::method(input_max_items = 3)]
+    pub async fn capped(&self, tokens: Input<Token>) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        async_stream::stream! {
+            let count = tokens.into_stream().count().await as u32;
+            yield IngestEvent::Ingested { count };
+        }
+    }
+
+    /// `gated` with a window of 8 and a cap of 1,000 bytes held: a client
+    /// sending large items is held back by credit, never ended.
+    #[plexus_macros::method(input_window = 8, input_max_buffered = 1000)]
+    pub async fn heavy(&self, tokens: Input<Token>) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        let probe = self.probe.clone();
+        async_stream::stream! {
+            let _guard = probe.guard();
+            let mut tokens = tokens.into_stream();
+            let mut count = 0;
+            loop {
+                probe.permits.acquire().await.unwrap().forget();
+                match tokens.next().await {
+                    Some(token) => {
+                        probe.seen.lock().unwrap().push(token.t);
+                        count += 1;
+                    }
+                    None => break,
+                }
+            }
+            yield IngestEvent::Ingested { count };
+        }
+    }
+
+    /// BIDIR-17: raw chunks of a run, a permit before each poll as `gated`.
+    #[plexus_macros::method(target = "run", input_window = 4)]
+    pub async fn chunks(
+        &self,
+        /// the run they belong to
+        run: String,
+        /// the bytes, as they arrive
+        chunks: Input<Bytes>,
+    ) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        let _ = run;
+        let probe = self.probe.clone();
+        async_stream::stream! {
+            let _guard = probe.guard();
+            let mut chunks = chunks.into_stream();
+            let mut count = 0;
+            loop {
+                probe.permits.acquire().await.unwrap().forget();
+                match chunks.next().await {
+                    Some(chunk) => {
+                        probe.chunks.lock().unwrap().push(chunk);
+                        count += 1;
+                    }
+                    None => break,
+                }
+            }
+            yield IngestEvent::Ingested { count };
+        }
+    }
+
+    /// BIDIR-17 review: read the first token before the stream is returned,
+    /// so the input half must flow while the route is still resolving.
+    #[plexus_macros::method]
+    pub async fn head(&self, tokens: Input<Token>) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        let probe = self.probe.clone();
+        let guard = probe.guard();
+        let mut tokens = tokens.into_stream();
+        let first = tokens.next().await;
+        async_stream::stream! {
+            let _guard = guard;
+            let mut count = 0;
+            if let Some(token) = first {
+                probe.seen.lock().unwrap().push(token.t);
+                count += 1;
+            }
+            while let Some(token) = tokens.next().await {
+                probe.seen.lock().unwrap().push(token.t);
+                count += 1;
+            }
+            yield IngestEvent::Ingested { count };
+        }
+    }
+
+    /// BIDIR-17 review: read to the end, then "commit": what a refused input
+    /// must never reach, since its end is not the client's.
+    #[plexus_macros::method]
+    pub async fn commit(&self, tokens: Input<Token>) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        let probe = self.probe.clone();
+        async_stream::stream! {
+            let _guard = probe.guard();
+            let mut tokens = tokens.into_stream();
+            let mut count = 0;
+            while let Some(token) = tokens.next().await {
+                probe.seen.lock().unwrap().push(token.t);
+                count += 1;
+            }
+            probe.seen.lock().unwrap().push("COMMITTED".into());
+            yield IngestEvent::Ingested { count };
+        }
+    }
+
+    /// No input half at all.
+    #[plexus_macros::method]
+    pub async fn plain(&self, run: String) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        let _ = run;
+        futures::stream::iter(vec![IngestEvent::Ok])
+    }
+}

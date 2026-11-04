@@ -16,6 +16,12 @@ at 0.6.0; earlier changes are in the git history.
 
 ### Added
 
+- BIDIR-6: the WebSocket loop takes `{ns}.input` and `{ns}.end` on its reader,
+  through a connection's `InputTable`, carried on the `FrameSink` every call's extensions hold. With no input
+  half open that is one load; no frame of any other kind changes.
+- BIDIR-17: a binary message tagged `0x01` is an input frame, routed to the
+  `InputTable` with no parse; a malformed one, or a binary message neither JSON
+  nor an input frame, is one `-32700` `malformed_frame` error (`id` null).
 - PERF-8: a client that offers `batch` in its upgrade's URL (`?batch`, or
   `?batch=N` for at most N) is sent the items a stream has ready together in
   one notification, `results`, the metadata said once (plexus-wire spec/02).
