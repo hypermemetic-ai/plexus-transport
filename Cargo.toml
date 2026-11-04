@@ -47,7 +47,7 @@ rmcp = { version = "0.12", features = ["server", "transport-streamable-http-serv
 # TRANSPORT-16: the bridge as a client of the RPC, mounted in-process over
 # HubTransport (`TransportServerBuilder::with_mcp`). TRANSPORT-9 removes the
 # old bridge above and its rmcp 0.12 in favour of this one.
-plexus-transport-mcp = { path = "../plexus-transport-mcp", version = "0.1", default-features = false, optional = true }
+plexus-transport-mcp = { path = "../plexus-transport-mcp", version = "0.2", default-features = false, optional = true }
 
 # HTTP server
 axum = "0.8.9"
