@@ -230,6 +230,47 @@ impl IngestActivation {
         }
     }
 
+    /// BIDIR-17 review: read the first token before the stream is returned,
+    /// so the input half must flow while the route is still resolving.
+    #[plexus_macros::method]
+    pub async fn head(&self, tokens: Input<Token>) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        let probe = self.probe.clone();
+        let guard = probe.guard();
+        let mut tokens = tokens.into_stream();
+        let first = tokens.next().await;
+        async_stream::stream! {
+            let _guard = guard;
+            let mut count = 0;
+            if let Some(token) = first {
+                probe.seen.lock().unwrap().push(token.t);
+                count += 1;
+            }
+            while let Some(token) = tokens.next().await {
+                probe.seen.lock().unwrap().push(token.t);
+                count += 1;
+            }
+            yield IngestEvent::Ingested { count };
+        }
+    }
+
+    /// BIDIR-17 review: read to the end, then "commit": what a refused input
+    /// must never reach, since its end is not the client's.
+    #[plexus_macros::method]
+    pub async fn commit(&self, tokens: Input<Token>) -> impl Stream<Item = IngestEvent> + Send + 'static {
+        let probe = self.probe.clone();
+        async_stream::stream! {
+            let _guard = probe.guard();
+            let mut tokens = tokens.into_stream();
+            let mut count = 0;
+            while let Some(token) = tokens.next().await {
+                probe.seen.lock().unwrap().push(token.t);
+                count += 1;
+            }
+            probe.seen.lock().unwrap().push("COMMITTED".into());
+            yield IngestEvent::Ingested { count };
+        }
+    }
+
     /// No input half at all.
     #[plexus_macros::method]
     pub async fn plain(&self, run: String) -> impl Stream<Item = IngestEvent> + Send + 'static {

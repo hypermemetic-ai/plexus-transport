@@ -423,7 +423,9 @@ async fn the_handler_ending_first_says_input_closed_before_done() {
     assert_eq!(next_item(&mut ws).await["type"], "done");
     send(&mut ws, input(sub, 1, &["c"])).await;
     nothing_for_a_while(&mut ws).await;
-    assert_eq!(request(&mut ws, 9, "menger.input", json!({"subscription":sub,"seq":2,"items":[]})).await["error"]["data"]["error_kind"], "not_this_call");
+    // The call is over and was this socket's: a late request is `false`
+    // (spec/10), not a stranger's `not_this_call`.
+    assert_eq!(request(&mut ws, 9, "menger.input", json!({"subscription":sub,"seq":2,"items":[{"t":"d"}]})).await["result"], false);
 }
 
 /// A handler that drops its input closes the half and goes on with the call.
@@ -940,4 +942,168 @@ async fn the_emitted_client_sends_bytes_as_binary_frames() {
     assert_eq!(events, [IngestEvent::Ingested { count: 100 }]);
     assert_eq!(chunks(&probe), sent.iter().map(|b| b.to_vec()).collect::<Vec<_>>());
     assert_eq!(counted.load(std::sync::atomic::Ordering::SeqCst), 100, "one binary frame an item");
+}
+
+// ------------------------------------------------- BIDIR-17's review, red first
+
+/// Frames until the answer to request `id`: the answer, and every
+/// notification's `result` read before it.
+async fn answer_of(ws: &mut Ws, id: u64, method: &str, params: Value) -> (Value, Vec<Value>) {
+    send(ws, json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}).to_string()).await;
+    let mut before = Vec::new();
+    loop {
+        let frame: Value = serde_json::from_str(&next_raw(ws).await).unwrap();
+        if frame.get("id") == Some(&json!(id)) {
+            return (frame, before);
+        }
+        before.push(frame["params"]["result"].clone());
+    }
+}
+
+/// The next items up to and including the terminal one, `before` first.
+async fn rest_of_call(ws: &mut Ws, mut before: Vec<Value>) -> Vec<Value> {
+    while !before.last().is_some_and(|i| matches!(i["type"].as_str(), Some("done" | "error"))) {
+        before.push(next_item(ws).await);
+    }
+    before
+}
+
+/// Review 1: a handler that reads its input before it returns its stream
+/// gets its items: credit flows while the route is still resolving.
+#[tokio::test]
+async fn a_handler_reading_before_it_returns_its_stream_gets_its_input() {
+    let probe = Probe::default();
+    let port = served(&probe).await;
+    let mut ws = connect(port).await;
+    let (sub, credit) = open(&mut ws, 1, "ingest.head", json!({})).await;
+    assert_eq!(credit, 64);
+    send(&mut ws, input(sub, 0, &["a"])).await;
+    send(&mut ws, input(sub, 1, &["b", "c"])).await;
+    send(&mut ws, end(sub, 2)).await;
+    let (_, content) = loop {
+        let item = next_item(&mut ws).await;
+        if item["type"] == "data" {
+            break (item.clone(), item["content"].clone());
+        }
+        assert!(matches!(item["type"].as_str(), Some("ack" | "credit")), "{item}");
+    };
+    assert_eq!(content, json!({"type":"ingested","count":3}));
+    assert_eq!(next_item(&mut ws).await["type"], "done");
+    assert_eq!(probe.seen(), ["a", "b", "c"]);
+}
+
+/// Review 1: cancelled while its handler waits for its first item, before
+/// the stream exists, the call ends: the handler dropped, the call's place
+/// and the table's slot freed.
+#[tokio::test]
+async fn a_call_cancelled_before_its_stream_exists_frees_its_places() {
+    let probe = Probe::default();
+    let mut config = WebSocketConfig::new(0);
+    config.quotas = ConnectionQuotas { max_calls_per_connection: 1, ..ConnectionQuotas::default() };
+    let port = serve_with(service(&probe).into_rpc_module().unwrap(), config, UpgradeOptions::default()).await;
+    let mut ws = connect(port).await;
+    let (sub, _) = open(&mut ws, 1, "ingest.head", json!({})).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let answer = request(&mut ws, 2, "menger.call_unsub", json!([sub])).await;
+    assert_eq!(answer["result"], true, "{answer}");
+    until_dropped(&probe, 1).await;
+    let (answer, _) = answer_of(&mut ws, 3, "menger.input", json!({"subscription":sub,"seq":0,"items":[{"t":"late"}]})).await;
+    assert_eq!(answer["result"], false, "the slot is gone: {answer}");
+    // The call's place is free: the one call this socket may hold opens.
+    let (sub2, _) = open(&mut ws, 4, "ingest.tokens", json!({"run":"r2"})).await;
+    assert_ne!(sub2, sub);
+}
+
+/// Review 1: a lost socket in that window ends the call as well.
+#[tokio::test]
+async fn a_socket_lost_before_the_stream_exists_ends_the_call() {
+    let probe = Probe::default();
+    let port = served(&probe).await;
+    let mut ws = connect(port).await;
+    open(&mut ws, 1, "ingest.head", json!({})).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    drop(ws);
+    until_dropped(&probe, 1).await;
+}
+
+/// Review 2: a frame with no items is a broken client: `invalid_input`, the
+/// call ends. It does not pass credit to queue without bound.
+#[tokio::test]
+async fn an_empty_frame_is_invalid_input() {
+    let probe = Probe::default();
+    let port = served(&probe).await;
+    let mut ws = connect(port).await;
+    let (sub, _) = open(&mut ws, 1, "ingest.tokens", json!({"run":"r1"})).await;
+    send(&mut ws, input(sub, 0, &["a"])).await;
+    send(&mut ws, input(sub, 1, &[])).await;
+    let items = rest_of_call(&mut ws, Vec::new()).await;
+    let closed = items.iter().find(|i| i["type"] == "input_closed").unwrap_or_else(|| panic!("{items:?}"));
+    assert_eq!(closed["reason"], "invalid_input", "{closed}");
+    let error = items.last().unwrap();
+    assert_eq!((error["error_kind"].as_str(), error["seq"].as_u64()), (Some("invalid_input"), Some(1)), "{error}");
+    until_dropped(&probe, 1).await;
+}
+
+/// Review 2, the request form: an empty frame is not `true`.
+#[tokio::test]
+async fn an_empty_frame_as_a_request_is_not_taken() {
+    let probe = Probe::default();
+    let port = served(&probe).await;
+    let mut ws = connect(port).await;
+    let (sub, _) = open(&mut ws, 1, "ingest.tokens", json!({"run":"r1"})).await;
+    let (answer, before) = answer_of(&mut ws, 2, "menger.input", json!({"subscription":sub,"seq":0,"items":[]})).await;
+    assert_eq!(answer["result"], false, "{answer}");
+    let items = rest_of_call(&mut ws, before).await;
+    assert_eq!(items.last().unwrap()["error_kind"], "invalid_input", "{items:?}");
+}
+
+/// Review 3: after an item that does not decode the handler's input never
+/// ends as a clean end would, so code after its loop never runs.
+#[tokio::test]
+async fn a_refused_input_never_reads_as_its_end() {
+    let probe = Probe::default();
+    let port = served(&probe).await;
+    let mut ws = connect(port).await;
+    let (sub, _) = open(&mut ws, 1, "ingest.commit", json!({})).await;
+    send(&mut ws, input(sub, 0, &["a"])).await;
+    send(&mut ws, json!({"jsonrpc":"2.0","method":"menger.input","params":{"subscription":sub,"seq":1,"items":[{"t":5}]}}).to_string()).await;
+    let items = rest_of_call(&mut ws, Vec::new()).await;
+    assert_eq!(items.last().unwrap()["error_kind"], "invalid_input", "{items:?}");
+    until_dropped(&probe, 1).await;
+    assert_eq!(probe.seen(), ["a"], "the handler never saw an end");
+}
+
+/// Review 4: after the call has ended, a late input request is `false`, a
+/// closed half, not `not_this_call`.
+#[tokio::test]
+async fn a_late_input_request_after_the_call_is_false() {
+    let probe = Probe::default();
+    let port = served(&probe).await;
+    let mut ws = connect(port).await;
+    let (sub, _) = open(&mut ws, 1, "ingest.early", json!({"take":0})).await;
+    let items = rest_of_call(&mut ws, Vec::new()).await;
+    assert_eq!(items.last().unwrap()["type"], "done", "{items:?}");
+    until_dropped(&probe, 1).await;
+    let (answer, _) = answer_of(&mut ws, 2, "menger.input", json!({"subscription":sub,"seq":0,"items":[{"t":"late"}]})).await;
+    assert_eq!(answer["result"], false, "{answer}");
+    let (answer, _) = answer_of(&mut ws, 3, "menger.end", json!({"subscription":sub,"seq":0})).await;
+    assert_eq!(answer["result"], false, "{answer}");
+}
+
+/// Review 4: a request past credit, or out of sequence, is refused and ends
+/// the call; it is never answered `true`.
+#[tokio::test]
+async fn a_refused_request_is_not_answered_true() {
+    for (frame, kind) in [(json!({"seq":0,"items":[{"t":"a"},{"t":"b"},{"t":"c"},{"t":"d"},{"t":"e"}]}), "past_credit"), (json!({"seq":3,"items":[{"t":"a"}]}), "out_of_sequence")] {
+        let probe = Probe::default();
+        let port = served(&probe).await;
+        let mut ws = connect(port).await;
+        let (sub, _) = open(&mut ws, 1, "ingest.gated", json!({})).await;
+        let mut params = frame.clone();
+        params["subscription"] = json!(sub);
+        let (answer, before) = answer_of(&mut ws, 2, "menger.input", params).await;
+        assert_eq!(answer["result"], false, "{kind}: {answer}");
+        let items = rest_of_call(&mut ws, before).await;
+        assert_eq!(items.last().unwrap()["error_kind"], kind, "{items:?}");
+    }
 }
