@@ -154,7 +154,7 @@ where
     A: Activation + 'static,
 {
     // Look up method info (its verb and cardinality). Unknown → 404 with the
-    // typed `RemoteError`, as a hub's own route would answer it.
+    // typed `RemoteError`, as a service's own route would answer it.
     let rest_method_info = match state.registry.get(&namespace, &method) {
         Some(info) => info.clone(),
         None => {
