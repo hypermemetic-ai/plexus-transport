@@ -9,16 +9,21 @@ use std::time::Duration;
 use plexus_core::activations::echo::EchoActivation;
 use plexus_core::plexus::DynamicHub;
 use plexus_transport::{McpConfig, TransportServer};
-use rmcp3::model::CallToolRequestParams;
-use rmcp3::transport::streamable_http_client::StreamableHttpClientTransportConfig;
-use rmcp3::transport::StreamableHttpClientTransport;
-use rmcp3::ServiceExt;
+#[cfg(feature = "__mcp-test-client")]
+use rmcp::model::CallToolRequestParams;
+#[cfg(feature = "__mcp-test-client")]
+use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+#[cfg(feature = "__mcp-test-client")]
+use rmcp::transport::StreamableHttpClientTransport;
+#[cfg(feature = "__mcp-test-client")]
+use rmcp::ServiceExt;
 use serde_json::json;
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+#[cfg(feature = "__mcp-test-client")]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_mounted_bridge_lists_the_hubs_tools_and_calls_them() {
     let hub = Arc::new(DynamicHub::new("x").register(EchoActivation::new()));

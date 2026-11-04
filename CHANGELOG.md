@@ -11,9 +11,24 @@ at 0.6.0; earlier changes are in the git history.
   `RemoteError` and a status by kind (404 · 400 · 401 · 403 · 501 · 500, and
   429 · 503 · 504 for `too_many_calls`, `child_unavailable`,
   `child_timeout`); SSE and MCP carry typed progress and error frames.
+- TRANSPORT-23: rmcp moves from 0.12 to 3.8, the version plexus-transport-mcp
+  is on, so an `mcp` build compiles one rmcp stack. rmcp's types are in the
+  public API under `mcp` (`ActivationMcpBridge` is an rmcp 3.8
+  `ServerHandler`). Without `mcp` there is no rmcp at all: it left
+  `[dev-dependencies]`, and the tests' MCP client is the `__mcp-test-client`
+  feature (test support, not API).
+- TRANSPORT-23: `with_mcp_http` and `serve_combined` check `Host` (rmcp 3.8):
+  the loopback names, plus the literal listen address when it is neither
+  loopback nor unspecified. Any other `Host` is refused 403. A service behind a
+  name, or bound to `0.0.0.0`, names its hosts with
+  `McpHttpConfig::with_allowed_hosts` or `serve_combined_with_allowed_hosts`.
+- TRANSPORT-23: `McpHttpConfig` gains a public field, `allowed_hosts`.
 
 ### Added
 
+- TRANSPORT-23: `McpHttpConfig::with_allowed_hosts`,
+  `serve_combined_with_allowed_hosts`. `scripts/check-rmcp.sh`, run by
+  `cargo test`, fails if rmcp reaches a non-`mcp` build or two versions appear.
 - BIDIR-6: the WebSocket loop takes `{ns}.input` and `{ns}.end` on its reader,
   through a connection's `InputTable`, carried on the `FrameSink` every call's extensions hold. With no input
   half open that is one load; no frame of any other kind changes.

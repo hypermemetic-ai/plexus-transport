@@ -546,7 +546,9 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
-    /// Enable MCP HTTP transport on the specified port
+    /// Enable MCP HTTP transport on the specified port. Answers the loopback
+    /// `Host` names; [`Self::with_mcp_http_config`] with
+    /// [`McpHttpConfig::with_allowed_hosts`] names others.
     #[cfg(feature = "mcp")]
     pub fn with_mcp_http(mut self, port: u16) -> Self {
         self.config.mcp_http = Some(McpHttpConfig::new(port));

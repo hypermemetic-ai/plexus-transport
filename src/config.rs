@@ -194,6 +194,10 @@ pub struct McpHttpConfig {
     pub server_version: Option<String>,
     /// Optional bearer token required on all MCP HTTP requests.
     pub api_key: Option<String>,
+    /// ACCESS-25: the `Host` values the endpoint answers to. Empty (the
+    /// default): the loopback names, plus the literal listen address when it
+    /// is neither loopback nor unspecified. Any other `Host` is refused 403.
+    pub allowed_hosts: Vec<String>,
 }
 
 impl McpHttpConfig {
@@ -206,7 +210,20 @@ impl McpHttpConfig {
             server_name: None,
             server_version: None,
             api_key: None,
+            allowed_hosts: Vec::new(),
         }
+    }
+
+    /// ACCESS-25: the `Host` values this listener answers to, as
+    /// [`Self::allowed_hosts`]. A service behind a name, or bound to
+    /// `0.0.0.0`, names its public host here.
+    pub fn with_allowed_hosts<I, S>(mut self, hosts: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_hosts = hosts.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Override the server name reported in MCP server info

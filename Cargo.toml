@@ -39,14 +39,12 @@ http-body = "1"
 # ACCESS-62: the framing's `log` records are capped at debug (src/ws/mod.rs).
 log = "0.4"
 
-# MCP protocol (feature "mcp", default-OFF as of 0.5.0).
-# Held at 0.12 deliberately: plexus-core 0.8 depends on rmcp 0.12
-# unconditionally, so bumping here (latest is 3.x) would compile two rmcp
-# stacks into every mcp build.
-rmcp = { version = "0.12", features = ["server", "transport-streamable-http-server"], optional = true }
+# MCP protocol (feature "mcp", default-OFF as of 0.5.0). TRANSPORT-23: the
+# version plexus-transport-mcp is on, so an mcp build compiles one rmcp stack;
+# scripts/check-rmcp.sh fails if a second version appears.
+rmcp = { version = "3.8", default-features = false, features = ["server", "transport-streamable-http-server"], optional = true }
 # TRANSPORT-16: the bridge as a client of the RPC, mounted in-process over
-# HubTransport (`TransportServerBuilder::with_mcp`). TRANSPORT-9 removes the
-# old bridge above and its rmcp 0.12 in favour of this one.
+# HubTransport (`TransportServerBuilder::with_mcp`).
 plexus-transport-mcp = { path = "../plexus-transport-mcp", version = "0.2", default-features = false, optional = true }
 
 # HTTP server
@@ -72,10 +70,10 @@ serde_json = "1.0"
 conformance = { path = "../plexus-macros/fixtures/conformance" }
 # BIDIR-8: the duplex gate's test builds a gate in plexus-auth-core's terms.
 plexus-auth-core = { path = "../plexus-auth-core" }
-# TRANSPORT-16: an rmcp 3.x client for the mounted bridge's test; aliased,
-# since `rmcp` above is the old bridge's 0.12 until TRANSPORT-9.
-rmcp3 = { package = "rmcp", version = "3.8", default-features = false, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
-reqwest = { version = "0.13", default-features = false }
+# TRANSPORT-23: no rmcp here. `cargo tree` walks dev edges and a dev-dependency
+# cannot be optional, so one here would show in every non-mcp tree. The tests'
+# MCP client is the `__mcp-test-client` feature below.
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 async-stream = "0.3"
 async-trait = "0.1"
 uuid = { version = "1.6", features = ["v4"] }
@@ -88,10 +86,6 @@ http-body-util = "0.1"
 # records are caught too).
 tokio-tungstenite = "0.30"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
-# RETURNS-11 MCP typed-frame tests (tests/mcp_typed_frames.rs, feature
-# "mcp"): a real rmcp client over an in-memory duplex. Same 0.12 line as the
-# optional dependency above.
-rmcp = { version = "0.12", features = ["client", "server"] }
 # plexus-macros aliased as "schemars" (schemars-compat feature) so that
 # #[derive(schemars::JsonSchema)] in tests resolves to the no-op derive,
 # preventing duplicate impl JsonSchema conflicts with PlexusRequest's
@@ -119,6 +113,9 @@ default = []
 # MCP transport (rmcp-based). Default-OFF as of 0.5.0: REST/WebSocket-only
 # consumers no longer pull in the rmcp stack. Enable with `--features mcp`.
 mcp = ["dep:rmcp", "dep:plexus-transport-mcp"]
+# Test support, not API: rmcp's client, for the tests that drive the bridges
+# with a real MCP client. On under --all-features.
+__mcp-test-client = ["mcp", "rmcp/client", "rmcp/transport-streamable-http-client-reqwest", "rmcp/reqwest"]
 mcp-gateway = ["mcp"]
 http-gateway = []
 sqlite-sessions = ["mcp", "sqlx", "tokio-stream"]

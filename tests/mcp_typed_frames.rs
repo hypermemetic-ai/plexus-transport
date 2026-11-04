@@ -13,7 +13,12 @@
 //! - a call rejected before its stream starts is a JSON-RPC error whose
 //!   `data` is the `RemoteError`.
 
-#![cfg(feature = "mcp")]
+// TRANSPORT-23: the rmcp client is the `__mcp-test-client` feature (rmcp 3.8),
+// not a dev-dependency.
+#![cfg(feature = "__mcp-test-client")]
+// The bridge under test streams items as logging notifications, which rmcp 3.x
+// deprecates (SEP-2577); see src/mcp/bridge.rs.
+#![allow(deprecated)]
 
 use std::borrow::Cow;
 use std::future::Future;
@@ -31,7 +36,7 @@ use plexus_core::plexus::{
 };
 use plexus_core::request::RawRequestContext;
 use plexus_transport::ActivationMcpBridge;
-use rmcp::model::{CallToolRequestParam, LoggingMessageNotificationParam};
+use rmcp::model::{CallToolRequestParams, LoggingMessageNotificationParam};
 use rmcp::service::{NotificationContext, RoleClient, RunningService};
 use rmcp::{ClientHandler, ServiceError, ServiceExt};
 use serde_json::{json, Value};
@@ -209,11 +214,8 @@ async fn connect() -> (RunningService<RoleClient, Recorder>, Recorder) {
     (client, recorder)
 }
 
-fn call(name: &'static str) -> CallToolRequestParam {
-    CallToolRequestParam {
-        name: name.into(),
-        arguments: Some(serde_json::Map::new()),
-    }
+fn call(name: &'static str) -> CallToolRequestParams {
+    CallToolRequestParams::new(name).with_arguments(serde_json::Map::new())
 }
 
 // =============================================================================
