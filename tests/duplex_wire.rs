@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use duplex_fixture::plexus_client::{ClientError, ClientEvent, WsTransport};
+use duplex_fixture::plexus_client::{ClientError, WsTransport};
+use futures::TryStreamExt;
 use duplex_fixture::{IngestActivation, IngestClient, IngestEvent, Probe, Token};
 use futures::{SinkExt, StreamExt};
 use plexus_core::plexus::{AuthContext, DynamicHub, Gate, Membership, Memberships, Resolve, RoleTable, ScopeRef, SessionValidator};
@@ -657,7 +658,7 @@ async fn the_emitted_client_streams_its_input() {
     let transport = WsTransport::connect(&format!("ws://127.0.0.1:{port}/"), "menger").await.unwrap();
     let client = IngestClient::new(transport);
     let tokens = futures::stream::iter((0..1000).map(|i| Token { t: format!("t{i}") }));
-    let events = client.tokens_all("r1".into(), tokens).await.unwrap();
+    let events = client.tokens("r1".into(), tokens).try_collect::<Vec<_>>().await.unwrap();
     assert_eq!(events, [IngestEvent::Ingested { count: 1000 }]);
     let seen = probe.seen();
     assert_eq!(seen.len(), 1000);
@@ -670,7 +671,7 @@ async fn the_emitted_client_ends_an_empty_input() {
     let probe = Probe::default();
     let port = served(&probe).await;
     let transport = WsTransport::connect(&format!("ws://127.0.0.1:{port}/"), "menger").await.unwrap();
-    let events = IngestClient::new(transport).tokens_all("r1".into(), futures::stream::empty()).await.unwrap();
+    let events = IngestClient::new(transport).tokens("r1".into(), futures::stream::empty()).try_collect::<Vec<_>>().await.unwrap();
     assert_eq!(events, [IngestEvent::Ingested { count: 0 }]);
 }
 
@@ -689,7 +690,7 @@ async fn the_emitted_client_feeds_as_items_come() {
     };
     let mut events = client.tokens("r1".into(), Box::pin(tokens));
     let first = tokio::time::timeout(WAIT, events.next()).await.unwrap().unwrap();
-    assert!(matches!(first, Ok(ClientEvent::Data(IngestEvent::Ingested { count: 5 }))), "{first:?}");
+    assert!(matches!(first, Ok(IngestEvent::Ingested { count: 5 })), "{first:?}");
     assert!(events.next().await.is_none());
 }
 
@@ -701,8 +702,10 @@ async fn the_emitted_client_hears_a_refusal() {
     let transport = WsTransport::connect(&format!("ws://127.0.0.1:{port}/"), "menger").await.unwrap();
     let client = IngestClient::new(transport);
     let tokens = futures::stream::iter((0..10).map(|i| Token { t: format!("t{i}") }));
-    let err = client.capped_all(tokens).await.unwrap_err();
-    assert!(matches!(&err, ClientError::Remote { code: Some(c), .. } if c == "too_much_input"), "{err:?}");
+    let err = client.capped(tokens).try_collect::<Vec<_>>().await.unwrap_err();
+    // RETURNS-36: the refusal is the error frame's typed `RemoteError`, a
+    // kind of the input half's own read as `Other`.
+    assert!(matches!(&err, ClientError::Remote(r) if r.kind() == "too_much_input"), "{err:?}");
 }
 
 /// Dropping the client's stream cancels the call.
@@ -933,7 +936,7 @@ async fn the_emitted_client_sends_bytes_as_binary_frames() {
     let transport = WsTransport::connect(&format!("ws://127.0.0.1:{port}/"), "menger").await.unwrap();
     let client = IngestClient::new(transport);
     let sent: Vec<bytes::Bytes> = (0..100u32).map(|i| bytes::Bytes::from(i.to_be_bytes().repeat(i as usize % 7))).collect();
-    let events = client.chunks_all("r".into(), futures::stream::iter(sent.clone())).await.unwrap();
+    let events = client.chunks("r".into(), futures::stream::iter(sent.clone())).try_collect::<Vec<_>>().await.unwrap();
     assert_eq!(events, [IngestEvent::Ingested { count: 100 }]);
     assert_eq!(chunks(&probe), sent.iter().map(|b| b.to_vec()).collect::<Vec<_>>());
     assert_eq!(counted.load(std::sync::atomic::Ordering::SeqCst), 100, "one binary frame an item");

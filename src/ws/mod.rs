@@ -111,12 +111,15 @@ pub enum Encoding {
 }
 
 /// What a socket's upgrade settled: its [`Encoding`] (PERF-9 reads the
-/// offer here) and, with PERF-8, whether the client takes batches.
+/// offer here) and how many items one notification may carry (PERF-8).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct Negotiated {
     /// The encoding every frame on the socket is in.
     pub encoding: Encoding,
+    /// The most items one notification carries: what the client's `batch`
+    /// offered, at most plexus-core's `MAX_BATCH`; 0 or 1, one an item.
+    pub batch: usize,
 }
 
 /// A connection's own reader of inbound frames (BIDIR-12's seam, in place of

@@ -11,7 +11,7 @@ mod http_streaming_tests {
     use async_stream::stream;
     use plexus_core::plexus::{
         types::{PlexusStreamItem, StreamMetadata},
-        PlexusStream,
+        Cardinality, PlexusStream,
     };
     use plexus_transport::http::handler::{handle_method_call, MethodInfo};
     use serde_json::json;
@@ -87,11 +87,11 @@ mod http_streaming_tests {
         })
     }
 
-    fn create_method_info(streaming: bool) -> MethodInfo {
+    fn create_method_info(cardinality: Cardinality) -> MethodInfo {
         MethodInfo {
             namespace: "test".to_string(),
             method: "test_method".to_string(),
-            streaming,
+            cardinality,
         }
     }
 
@@ -105,7 +105,7 @@ mod http_streaming_tests {
         // We use a timeout on the test itself to prevent CI from hanging
 
         let stream = create_infinite_stream();
-        let method_info = create_method_info(false); // Non-streaming method
+        let method_info = create_method_info(Cardinality::One); // Unary (cardinality one) method
 
         let handler_future = handle_method_call(stream, method_info);
 
@@ -124,7 +124,7 @@ mod http_streaming_tests {
         // After fix: handler should timeout gracefully
 
         let stream = create_infinite_stream();
-        let method_info = create_method_info(false);
+        let method_info = create_method_info(Cardinality::One);
 
         let response = handle_method_call(stream, method_info).await;
 
@@ -156,7 +156,7 @@ mod http_streaming_tests {
         // but kept to show the before/after behavior
 
         let stream = create_memory_exhaustion_stream(1000, 100);
-        let method_info = create_method_info(false);
+        let method_info = create_method_info(Cardinality::One);
 
         let handler_future = handle_method_call(stream, method_info);
 
@@ -181,7 +181,7 @@ mod http_streaming_tests {
         // After fix: should reject with 413 Payload Too Large
 
         let stream = create_memory_exhaustion_stream(1000, 100);
-        let method_info = create_method_info(false);
+        let method_info = create_method_info(Cardinality::One);
 
         let response = handle_method_call(stream, method_info).await;
 
@@ -208,7 +208,7 @@ mod http_streaming_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn test_normal_request_completes_successfully() {
         let stream = create_normal_stream();
-        let method_info = create_method_info(false);
+        let method_info = create_method_info(Cardinality::One);
 
         let response = handle_method_call(stream, method_info).await;
 
@@ -233,7 +233,7 @@ mod http_streaming_tests {
     async fn test_slow_completion_within_timeout() {
         // Request that takes ~1 second but completes within timeout
         let stream = create_slow_completion_stream(100, 10);
-        let method_info = create_method_info(false);
+        let method_info = create_method_info(Cardinality::One);
 
         let response = handle_method_call(stream, method_info).await;
 
@@ -263,7 +263,7 @@ mod http_streaming_tests {
         // After fix: should reject when too many items regardless of size
 
         let stream = create_memory_exhaustion_stream(20_000, 1);
-        let method_info = create_method_info(false);
+        let method_info = create_method_info(Cardinality::One);
 
         let response = handle_method_call(stream, method_info).await;
 
@@ -280,7 +280,7 @@ mod http_streaming_tests {
         // Test that total byte limit is enforced
 
         let stream = create_memory_exhaustion_stream(100, 2000);
-        let method_info = create_method_info(false);
+        let method_info = create_method_info(Cardinality::One);
 
         let response = handle_method_call(stream, method_info).await;
 

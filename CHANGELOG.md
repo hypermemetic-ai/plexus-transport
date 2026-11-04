@@ -3,6 +3,15 @@
 All notable changes to plexus-transport are documented here. This file starts
 at 0.6.0; earlier changes are in the git history.
 
+## [0.7.0] — unreleased (RETURNS-36)
+
+### Breaking
+
+- On plexus-core 0.8 (RETURNS-11): REST answers a call failure with its
+  `RemoteError` and a status by kind (404 · 400 · 401 · 403 · 501 · 500, and
+  429 · 503 · 504 for `too_many_calls`, `child_unavailable`,
+  `child_timeout`); SSE and MCP carry typed progress and error frames.
+
 ## [Unreleased]
 
 ### Added
@@ -13,6 +22,20 @@ at 0.6.0; earlier changes are in the git history.
 - BIDIR-17: a binary message tagged `0x01` is an input frame, routed to the
   `InputTable` with no parse; a malformed one, or a binary message neither JSON
   nor an input frame, is one `-32700` `malformed_frame` error (`id` null).
+- PERF-8: a client that offers `batch` in its upgrade's URL (`?batch`, or
+  `?batch=N` for at most N) is sent the items a stream has ready together in
+  one notification, `results`, the metadata said once (plexus-wire spec/02).
+  A client that offers nothing is sent today's frames. `Negotiated` says what
+  was taken. Needs plexus-core's `FrameSink::batching`.
+
+### Fixed
+
+- TRANSPORT-17: `serve_stdio` has one writer. Every line, an answer or a stream's
+  item, goes through one bounded queue to one task, which writes each message
+  with its newline, so two live streams can no longer interleave inside a line
+  (spec/11). Lines ready together go out in one write, at most 64 KiB gathered.
+  `StdioConfig::subscription_buffer_size` also sizes that queue. At the end of
+  stdin every call ends, as spec/11 says, and what was queued has 5 s to go out.
 
 ## [0.6.0]
 

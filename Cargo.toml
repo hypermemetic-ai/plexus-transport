@@ -1,6 +1,6 @@
 [package]
 name = "plexus-transport"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "MIT"
 description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
@@ -11,7 +11,7 @@ include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
 
 [dependencies]
 # Core dependencies
-plexus-core = { path = "../plexus-core", version = "0.7.0" }
+plexus-core = { path = "../plexus-core", version = "0.8.0" }
 tokio = { version = "1.53", features = ["full"] }
 futures = "0.3"
 async-stream = "0.3"
@@ -40,14 +40,14 @@ http-body = "1"
 log = "0.4"
 
 # MCP protocol (feature "mcp", default-OFF as of 0.5.0).
-# Held at 0.12 deliberately: plexus-core 0.6 depends on rmcp 0.12
+# Held at 0.12 deliberately: plexus-core 0.8 depends on rmcp 0.12
 # unconditionally, so bumping here (latest is 3.x) would compile two rmcp
 # stacks into every mcp build.
 rmcp = { version = "0.12", features = ["server", "transport-streamable-http-server"], optional = true }
 # TRANSPORT-16: the bridge as a client of the RPC, mounted in-process over
 # HubTransport (`TransportServerBuilder::with_mcp`). TRANSPORT-9 removes the
 # old bridge above and its rmcp 0.12 in favour of this one.
-plexus-transport-mcp = { path = "../plexus-transport-mcp", version = "0.1", default-features = false, optional = true }
+plexus-transport-mcp = { path = "../plexus-transport-mcp", version = "0.2", default-features = false, optional = true }
 
 # HTTP server
 axum = "0.8.9"
@@ -68,6 +68,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [dev-dependencies]
+# RETURNS-36: the conformance fixture's service, served for `tests/synapse_reads.rs`
+conformance = { path = "../plexus-macros/fixtures/conformance" }
 # BIDIR-8: the duplex gate's test builds a gate in plexus-auth-core's terms.
 plexus-auth-core = { path = "../plexus-auth-core" }
 # TRANSPORT-16: an rmcp 3.x client for the mounted bridge's test; aliased,
@@ -86,6 +88,10 @@ http-body-util = "0.1"
 # records are caught too).
 tokio-tungstenite = "0.30"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+# RETURNS-11 MCP typed-frame tests (tests/mcp_typed_frames.rs, feature
+# "mcp"): a real rmcp client over an in-memory duplex. Same 0.12 line as the
+# optional dependency above.
+rmcp = { version = "0.12", features = ["client", "server"] }
 # plexus-macros aliased as "schemars" (schemars-compat feature) so that
 # #[derive(schemars::JsonSchema)] in tests resolves to the no-op derive,
 # preventing duplicate impl JsonSchema conflicts with PlexusRequest's
@@ -94,9 +100,19 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # depending on the same crate under two names, so tests import PlexusRequest
 # through the alias too: `use schemars::PlexusRequest;`.)
 schemars = { path = "../plexus-macros", package = "plexus-macros", features = ["schemars-compat"] }
-plexus-core = { path = "../plexus-core", version = "0.7.0" }
+plexus-core = { path = "../plexus-core", version = "0.8.0" }
 # BIDIR-6: tests/duplex_wire.rs's activation; a crate of its own, see its manifest.
 duplex-fixture = { path = "tests/duplex_fixture" }
+
+# TRANSPORT-17: each is its own child, `serve_stdio` on its own stdout, so
+# libtest's lines stay off that stdout.
+[[test]]
+name = "stdio_pipes"
+harness = false
+
+[[test]]
+name = "stdio_kit"
+harness = false
 
 [features]
 default = []
