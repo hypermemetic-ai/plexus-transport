@@ -17,7 +17,7 @@ at 0.6.0; earlier changes are in the git history.
 ### Added
 
 - BIDIR-6: the WebSocket loop takes `{ns}.input` and `{ns}.end` on its reader,
-  through a connection's `InputTable` in every call's extensions. With no input
+  through a connection's `InputTable`, carried on the `FrameSink` every call's extensions hold. With no input
   half open that is one load; no frame of any other kind changes.
 - BIDIR-17: a binary message tagged `0x01` is an input frame, routed to the
   `InputTable` with no parse; a malformed one, or a binary message neither JSON

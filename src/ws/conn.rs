@@ -722,13 +722,13 @@ pub(crate) async fn run(
     let (frame_sink, frames) = FrameSink::channel(limits.queue, encoding);
     // PERF-8: what a stream has ready together goes in one notification, for
     // a client that offered `batch`.
-    let frame_sink = frame_sink.batching(negotiated.batch);
+    // BIDIR-6: every call finds its connection's input halves on the sink (an
+    // entry of their own in the extensions would be one more allocation each
+    // call clones them); a duplex call is one call in the connection's count.
+    let inputs = InputTable::new(conn.id(), Arc::new(conn.calls().clone()));
+    let frame_sink = frame_sink.batching(negotiated.batch).with_inputs(inputs.clone());
     let mut ext = ext;
     ext.insert(frame_sink);
-    // BIDIR-6: every call finds its connection's input halves there too; a
-    // duplex call is one call in the connection's count.
-    let inputs = InputTable::new(conn.id(), Arc::new(conn.calls().clone()));
-    ext.insert(inputs.clone());
     conn.upgraded(negotiated, ConnectionWriter { tx: own_tx });
     let hook = shared.hooks.as_ref().and_then(|h| h.make(&conn, &ext));
     let dispatch = Dispatch {
