@@ -10,7 +10,11 @@
 //!   that grows past the cap is dropped whole, never half-seen;
 //! - drops a message past the cap — its frames, as they stream in, without
 //!   keeping them — and counts it in [`Dropped`], which the socket's loop
-//!   answers `-32007` (`id: null`, spec/01).
+//!   answers `-32007` (`id: null`, spec/01);
+//! - refuses a frame whose 64-bit length has its top bit set (RFC 6455
+//!   section 5.2): the read fails with [`is_refused`]'s error, nothing of the
+//!   frame or of a message it continues is kept, and the socket's loop closes
+//!   `1002`. No cap applies to a length that cannot be meant.
 //!
 //! Everything else — masking, opcodes, UTF-8, control frames, a stray
 //! continuation (passed on, refused there) — stays tungstenite's. Writes
@@ -80,11 +84,17 @@ struct Header {
 impl Header {
     /// The frame's bytes, header and payload. The length is the client's own
     /// 64 bits: saturated, so a huge frame stays huge rather than wrapping
-    /// short and leaving its payload to be read as headers. Nothing sends
-    /// 2^64 bytes, and tungstenite refuses the frame first.
+    /// short and leaving its payload to be read as headers. A second layer:
+    /// [`illegal_length`] refuses every length this could wrap on.
     fn total(&self) -> u64 {
         (self.size as u64).saturating_add(self.len)
     }
+}
+
+/// RFC 6455 section 5.2: the top bit of a 64-bit length must be 0. It is
+/// the third byte's, so the frame is known before the rest of its header.
+fn illegal_length(b: &[u8]) -> bool {
+    matches!(b, [_, second, third, ..] if second & 0x7f == 127 && third & 0x80 != 0)
 }
 
 /// `Some` once the whole header is in `b`.
@@ -107,6 +117,24 @@ fn header(b: &[u8]) -> Option<Header> {
         size += 4;
     }
     (b.len() >= size).then_some(Header { fin, opcode, len, size })
+}
+
+/// The error a read fails with when the guard refuses a frame.
+#[derive(Debug)]
+struct Refused;
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a frame length with its top bit set")
+    }
+}
+
+impl std::error::Error for Refused {}
+
+/// Whether `e` is the guard refusing a frame: a protocol error, not a lost
+/// socket.
+pub(crate) fn is_refused(e: &io::Error) -> bool {
+    e.get_ref().is_some_and(|e| e.is::<Refused>())
 }
 
 /// The read side of a socket, a frame's length ahead of tungstenite (see
@@ -168,7 +196,7 @@ impl<S> Guard<S> {
             // dropped once it is past the cap.
             (0, Msg::Holding { len }) => {
                 // Both lengths are the client's: a total that overflows is
-                // past any cap.
+                // past any cap. A second layer, for [`illegal_length`].
                 let total = len.checked_add(h.len).filter(|&t| !over(t));
                 let Some(total) = total else {
                     self.buf.advance(h.size);
@@ -306,6 +334,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for Guard<S> {
                     }
                 }
                 In::Header => {
+                    if illegal_length(&this.buf) {
+                        this.hold.clear();
+                        return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, Refused)));
+                    }
                     if let Some(h) = header(&this.buf) {
                         this.decide(h);
                         continue;
@@ -388,7 +420,11 @@ mod tests {
 
     /// Everything the guard hands on, read `chunk` bytes at a time.
     async fn through(input: Vec<u8>, cap: usize, chunk: usize) -> (Vec<u8>, u64) {
-        let mut g = Guard::new(std::io::Cursor::new(input), cap);
+        drain(Guard::new(std::io::Cursor::new(input), cap), chunk).await
+    }
+
+    /// Everything a guard hands on from where it stands.
+    async fn drain(mut g: Guard<std::io::Cursor<Vec<u8>>>, chunk: usize) -> (Vec<u8>, u64) {
         let dropped = g.dropped();
         let mut out = Vec::new();
         let mut buf = vec![0u8; chunk];
@@ -461,11 +497,26 @@ mod tests {
         f
     }
 
+    /// A guard past the header check, deciding `long` with `held` held: the
+    /// second layer, which the check keeps any client's bytes from reaching.
+    fn past_the_check(held: &[u8], long: &[u8], tail: Vec<u8>, cap: usize) -> Guard<std::io::Cursor<Vec<u8>>> {
+        let mut g = Guard::new(std::io::Cursor::new(tail), cap);
+        if !held.is_empty() {
+            let h = header(held).unwrap();
+            g.hold.extend_from_slice(held);
+            g.msg = Msg::Holding { len: h.len };
+        }
+        g.buf.extend_from_slice(long);
+        let h = header(&g.buf).unwrap();
+        g.decide(h);
+        g
+    }
+
     #[tokio::test]
     async fn a_continuation_whose_length_wraps_the_message_total_is_over_the_cap() {
         let first = frame(0x1, false, b"12345");
-        let input = [first, long_header(0x0, true, u64::MAX - 4)].concat();
-        let (out, dropped) = through(input, 100, 16).await;
+        let g = past_the_check(&first, &long_header(0x0, true, u64::MAX - 4), Vec::new(), 100);
+        let (out, dropped) = drain(g, 16).await;
         assert!(out.is_empty(), "nothing of the message is handed on");
         assert_eq!(dropped, 1);
     }
@@ -474,18 +525,100 @@ mod tests {
     async fn a_header_and_length_that_wrap_are_passed_on_never_taken_for_a_short_frame() {
         let held = frame(0x1, false, b"12345");
         let cases = [
-            ("control", vec![long_header(0x9, true, u64::MAX)]),
-            ("stray continuation", vec![long_header(0x0, true, u64::MAX)]),
-            ("a new message while one is held", vec![held, long_header(0x1, true, u64::MAX)]),
+            ("control", Vec::new(), long_header(0x9, true, u64::MAX)),
+            ("stray continuation", Vec::new(), long_header(0x0, true, u64::MAX)),
+            ("a new message while one is held", held, long_header(0x1, true, u64::MAX)),
         ];
-        for (name, frames) in cases {
+        for (name, held, long) in cases {
             // The bytes after the header are the frame's payload, however
             // long it claims to be: never read as a header of their own.
             let tail = frame(0x1, true, &vec![b'x'; 2000]);
-            let input = [frames.concat(), tail].concat();
-            let (out, dropped) = through(input.clone(), 100, 16).await;
+            let input = [held.clone(), long.clone(), tail.clone()].concat();
+            let g = past_the_check(&held, &long, tail, 100);
+            let (out, dropped) = drain(g, 16).await;
             assert_eq!(dropped, 0, "{name}");
             assert!(out == input, "{name}: the stream changed");
         }
+    }
+
+    /// What a guard hands on until its read fails, and that failure.
+    async fn to_the_refusal(g: &mut Guard<std::io::Cursor<Vec<u8>>>, chunk: usize) -> (Vec<u8>, Option<io::Error>) {
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; chunk];
+        loop {
+            match g.read(&mut buf).await {
+                Ok(0) => return (out, None),
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(e) => return (out, Some(e)),
+            }
+        }
+    }
+
+    const TOP_BIT: u64 = 1 << 63;
+
+    #[tokio::test]
+    async fn a_length_with_its_top_bit_set_is_refused_before_anything_is_buffered() {
+        let held = frame(0x1, false, b"12345");
+        let dropping = frame(0x1, false, &vec![b'y'; 200]);
+        let cases = [
+            ("a new message", Vec::new(), 0x1, true, 0),
+            ("the first of a fragmented message", Vec::new(), 0x2, false, 0),
+            ("a continuation of a held message", held, 0x0, true, 0),
+            ("a continuation, more to come", frame(0x1, false, b"x"), 0x0, false, 0),
+            ("a continuation of a dropped message", dropping, 0x0, true, 1),
+            ("a stray continuation", Vec::new(), 0x0, true, 0),
+            ("a control frame", Vec::new(), 0x9, true, 0),
+        ];
+        for (name, before, op, fin, dropped) in cases {
+            for len in [TOP_BIT, TOP_BIT | 5, u64::MAX] {
+                let tail = frame(0x1, true, b"{}");
+                let input = [before.clone(), long_header(op, fin, len), tail].concat();
+                let mut g = Guard::new(std::io::Cursor::new(input), 100);
+                let count = g.dropped();
+                let (out, error) = to_the_refusal(&mut g, 16).await;
+                let error = error.unwrap_or_else(|| panic!("{name}, {len:#x}: not refused"));
+                assert!(is_refused(&error), "{name}, {len:#x}: {error}");
+                assert!(out.is_empty(), "{name}, {len:#x}: handed on");
+                assert_eq!(g.state, In::Header, "{name}, {len:#x}: went on into the frame");
+                assert!(g.hold.is_empty() && g.ready.is_empty(), "{name}, {len:#x}: kept");
+                assert_eq!(count.count(), dropped, "{name}, {len:#x}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_length_with_its_top_bit_set_is_refused_at_its_first_byte() {
+        // The rest of the length and the mask never arrive.
+        let mut g = Guard::new(std::io::Cursor::new(vec![0x81, 0x80 | 127, 0x80]), 100);
+        let (out, error) = to_the_refusal(&mut g, 16).await;
+        assert!(out.is_empty());
+        assert!(is_refused(&error.expect("refused")));
+    }
+
+    #[tokio::test]
+    async fn a_refused_frame_stays_refused_and_what_came_before_it_is_handed_on() {
+        let small = frame(0x1, true, b"{}");
+        let input = [small.clone(), long_header(0x1, true, TOP_BIT)].concat();
+        let mut g = Guard::new(std::io::Cursor::new(input), 100);
+        let (out, error) = to_the_refusal(&mut g, 16).await;
+        assert_eq!(out, small);
+        assert!(is_refused(&error.expect("refused")));
+        let (out, error) = to_the_refusal(&mut g, 16).await;
+        assert!(out.is_empty());
+        assert!(is_refused(&error.expect("refused again")));
+    }
+
+    #[tokio::test]
+    async fn the_largest_legal_length_is_left_to_the_cap() {
+        let largest = TOP_BIT - 1;
+        let (out, dropped) = through(long_header(0x1, true, largest), 100, 16).await;
+        assert_eq!((out, dropped), (Vec::new(), 1), "a new message");
+        let held = frame(0x1, false, b"12345");
+        let (out, dropped) = through([held, long_header(0x0, true, largest)].concat(), 100, 16).await;
+        assert_eq!((out, dropped), (Vec::new(), 1), "a continuation");
+        let mut g = Guard::new(std::io::Cursor::new(long_header(0x2, false, largest)), 100);
+        let (_, error) = to_the_refusal(&mut g, 16).await;
+        assert!(error.is_none());
+        assert_eq!(g.state, In::Skip(largest));
     }
 }

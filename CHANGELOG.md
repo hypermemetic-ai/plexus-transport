@@ -3,7 +3,7 @@
 All notable changes to plexus-transport are documented here. This file starts
 at 0.6.0; earlier changes are in the git history.
 
-## [0.7.0] — unreleased (RETURNS-36)
+## [0.7.0]
 
 ### Breaking
 
@@ -11,8 +11,6 @@ at 0.6.0; earlier changes are in the git history.
   `RemoteError` and a status by kind (404 · 400 · 401 · 403 · 501 · 500, and
   429 · 503 · 504 for `too_many_calls`, `child_unavailable`,
   `child_timeout`); SSE and MCP carry typed progress and error frames.
-
-## [Unreleased]
 
 ### Added
 
@@ -36,6 +34,10 @@ at 0.6.0; earlier changes are in the git history.
   (spec/11). Lines ready together go out in one write, at most 64 KiB gathered.
   `StdioConfig::subscription_buffer_size` also sizes that queue. At the end of
   stdin every call ends, as spec/11 says, and what was queued has 5 s to go out.
+- TRANSPORT-22: a WebSocket frame whose 64-bit payload length has its top bit set is refused
+  at its header and the socket closes with `1002`, on any frame of a message
+  (RFC 6455 section 5.2). It was treated as a message over the cap: answered
+  `-32007` with the socket kept, and every later byte discarded as its payload.
 
 ## [0.6.0]
 

@@ -14,7 +14,7 @@ use futures::{SinkExt, StreamExt};
 use jsonrpsee::{PendingSubscriptionSink, RpcModule};
 use plexus_transport::websocket::{Connection, UpgradeOptions};
 use serde_json::json;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::tungstenite::Message;
@@ -176,4 +176,54 @@ async fn a_stray_continuation_is_refused() {
     let mut s = raw_upgrade(port).await;
     s.write_all(&client_frame(0x0, true, b"stray")).await.unwrap();
     assert!(closed_within(&mut s, Duration::from_secs(3)).await, "a stray continuation closes the socket");
+}
+
+/// The close code the server sends, reading its frames until one comes.
+async fn close_code(s: &mut tokio::net::TcpStream, within: Duration) -> Option<u16> {
+    let mut got = Vec::new();
+    let read = async {
+        loop {
+            let mut at = 0;
+            while let [first, len @ 0..=125, rest @ ..] = &got[at..] {
+                let len = *len as usize;
+                if *first & 0x0f == 0x8 && len >= 2 && rest.len() >= 2 {
+                    return Some(u16::from_be_bytes([rest[0], rest[1]]));
+                }
+                if rest.len() < len {
+                    break;
+                }
+                at += 2 + len;
+            }
+            let mut buf = [0u8; 1024];
+            match s.read(&mut buf).await {
+                Ok(0) | Err(_) => return None,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+            }
+        }
+    };
+    tokio::time::timeout(within, read).await.ok().flatten()
+}
+
+/// A masked header naming a 64-bit length, with no payload.
+fn long_header(op: u8, fin: bool, len: u64) -> Vec<u8> {
+    let mut f = vec![if fin { 0x80 } else { 0 } | op, 0x80 | 127];
+    f.extend_from_slice(&len.to_be_bytes());
+    f.extend_from_slice(&[7, 9, 11, 13]);
+    f
+}
+
+/// RFC 6455 section 5.2: the top bit of a 64-bit length must be 0. A frame
+/// that sets it is a protocol error, on a message's first frame or a later one.
+#[tokio::test]
+async fn a_length_with_its_top_bit_set_closes_the_socket_1002() {
+    let cases = [
+        ("a new message", Vec::new(), 0x1),
+        ("a continuation of a held message", client_frame(0x1, false, b"{}"), 0x0),
+    ];
+    for (name, before, op) in cases {
+        let port = serve(module(Default::default(), Default::default()), UpgradeOptions::default()).await;
+        let mut s = raw_upgrade(port).await;
+        s.write_all(&[before, long_header(op, true, 1 << 63)].concat()).await.unwrap();
+        assert_eq!(close_code(&mut s, Duration::from_secs(3)).await, Some(1002), "{name}");
+    }
 }
