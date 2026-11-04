@@ -94,6 +94,9 @@ pub fn remote_error_status(error: &RemoteError) -> StatusCode {
         RemoteError::TooManyCalls { .. } => StatusCode::TOO_MANY_REQUESTS,
         RemoteError::ChildUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
         RemoteError::ChildTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
+        // A kind this build does not know: the call failed, how is the
+        // body's to say.
+        RemoteError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
