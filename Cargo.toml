@@ -68,6 +68,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
 [dev-dependencies]
+# RETURNS-36: the conformance fixture's service, served for `tests/synapse_reads.rs`
+conformance = { path = "../plexus-macros/fixtures/conformance" }
 # BIDIR-8: the duplex gate's test builds a gate in plexus-auth-core's terms.
 plexus-auth-core = { path = "../plexus-auth-core" }
 # TRANSPORT-16: an rmcp 3.x client for the mounted bridge's test; aliased,
