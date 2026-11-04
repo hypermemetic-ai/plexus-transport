@@ -2,11 +2,30 @@
 //!
 //! This module implements the MCP protocol using the rmcp crate,
 //! bridging MCP tool calls to activation methods.
+//!
+//! ## Frames (plexus 0.7, RETURNS-11)
+//!
+//! Every frame of a call's stream goes out as a logging notification (logger
+//! = the tool name); the tool result is built when the stream ends. The bridge
+//! never inspects `content` — it forwards `content` and `error` whole.
+//!
+//! | frame | logging notification `data` | tool result |
+//! | -- | -- | -- |
+//! | data | `{"type": "data", "content_type", "data": <content>}` | buffered into the success result |
+//! | progress | `{"type": "progress", "content_type", "content": <P>}` (plus `notifications/progress` when the caller sent a progress token) | — |
+//! | error | `{"type": "error", "error": <RemoteError>, "recoverable"}` | a non-recoverable one makes it an error result: text = `RemoteError`'s `Display`, structured content = the `RemoteError` JSON |
+//!
+//! A call rejected before its stream starts answers a JSON-RPC error built
+//! by `plexus_error_to_jsonrpc`: `{code, message: <Display>, data:
+//! <RemoteError>}`.
 
 use std::sync::Arc;
 
 use futures::StreamExt;
-use plexus_core::plexus::{types::PlexusStreamItem, Activation, PlexusError, PluginSchema};
+use plexus_core::plexus::{
+    plexus_error_to_jsonrpc, types::PlexusStreamItem, Activation, PlexusError, PluginSchema,
+    RemoteError,
+};
 use rmcp::{
     model::*,
     service::{RequestContext, RoleServer},
@@ -69,33 +88,45 @@ fn schemas_to_rmcp_tools(schemas: Vec<PluginSchema>) -> Vec<Tool> {
 // Error Mapping
 // =============================================================================
 
-/// Convert PlexusError to McpError
+/// Convert a `PlexusError` (the call was rejected before its stream started)
+/// to an MCP JSON-RPC error: plexus-core's semantic `code`, the
+/// `RemoteError`'s `Display` as `message`, the typed `RemoteError` in `data`.
 fn plexus_to_mcp_error(e: PlexusError) -> McpError {
-    match e {
-        PlexusError::ActivationNotFound(name) => {
-            McpError::invalid_params(format!("Unknown activation: {}", name), None)
-        }
-        PlexusError::MethodNotFound { activation, method } => McpError::invalid_params(
-            format!("Unknown method: {}.{}", activation, method),
-            None,
+    let rejection = plexus_error_to_jsonrpc(&e);
+    let data = rejection
+        .data()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.get()).ok());
+    McpError::new(
+        ErrorCode(rejection.code()),
+        rejection.message().to_owned(),
+        data,
+    )
+}
+
+/// An MCP progress notification's `(message, percentage)` from a progress
+/// frame's `content`: the default `Note` (`{message, percentage?}`) maps field
+/// for field; any other progress type travels as its JSON text, no
+/// percentage. (The typed `content` itself goes out whole on the logging
+/// notification.)
+fn progress_note(content: &serde_json::Value) -> (String, Option<f64>) {
+    match content.get("message").and_then(|m| m.as_str()) {
+        Some(message) => (
+            message.to_owned(),
+            content.get("percentage").and_then(|p| p.as_f64()),
         ),
-        PlexusError::InvalidParams(reason) => McpError::invalid_params(reason, None),
-        PlexusError::ExecutionError(error) => McpError::internal_error(error, None),
-        PlexusError::HandleNotSupported(activation) => McpError::invalid_params(
-            format!("Handle resolution not supported: {}", activation),
-            None,
-        ),
-        PlexusError::TransportError(kind) => {
-            McpError::internal_error(format!("Transport error: {:?}", kind), None)
-        }
-        PlexusError::Unauthenticated(reason) => {
-            McpError::invalid_request(format!("Authentication required: {}", reason), None)
-        }
-        // R-5 scope gate (plexus-core). The Display impl names only the
-        // unmet scope (no-enumeration posture, AUTHZ-CORE-1/5).
-        forbidden @ PlexusError::Forbidden { .. } => {
-            McpError::invalid_request(forbidden.to_string(), None)
-        }
+        None => (content.to_string(), None),
+    }
+}
+
+/// The tool result of a call whose stream carried a non-recoverable error
+/// frame: `RemoteError`'s `Display` as its text, the `RemoteError` JSON as its
+/// structured content.
+fn remote_error_tool_result(error: &RemoteError) -> CallToolResult {
+    CallToolResult {
+        content: vec![Content::text(error.to_string())],
+        structured_content: serde_json::to_value(error).ok(),
+        is_error: Some(true),
+        meta: None,
     }
 }
 
@@ -321,9 +352,8 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
         };
 
         // Stream events via notifications AND buffer for final result
-        let mut had_error = false;
+        let mut fatal: Option<RemoteError> = None;
         let mut buffered_data: Vec<serde_json::Value> = Vec::new();
-        let mut error_messages: Vec<String> = Vec::new();
 
         tokio::pin!(stream);
         while let Some(item) = stream.next().await {
@@ -334,19 +364,34 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
 
             match &item {
                 PlexusStreamItem::Progress {
-                    message,
-                    percentage,
+                    content_type,
+                    content,
                     ..
                 } => {
-                    // Only send progress if client provided token
+                    // The typed progress value, whole, for every consumer
+                    let _ = ctx
+                        .peer
+                        .notify_logging_message(LoggingMessageNotificationParam {
+                            level: LoggingLevel::Info,
+                            logger: Some(logger.clone()),
+                            data: json!({
+                                "type": "progress",
+                                "content_type": content_type,
+                                "content": content,
+                            }),
+                        })
+                        .await;
+
+                    // MCP-native progress only if the client provided a token
                     if let Some(ref token) = progress_token {
+                        let (message, percentage) = progress_note(content);
                         let _ = ctx
                             .peer
                             .notify_progress(ProgressNotificationParam {
                                 progress_token: token.clone(),
-                                progress: percentage.unwrap_or(0.0) as f64,
+                                progress: percentage.unwrap_or(0.0),
                                 total: None,
-                                message: Some(message.clone()),
+                                message: Some(message),
                             })
                             .await;
                     }
@@ -376,13 +421,10 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                 }
 
                 PlexusStreamItem::Error {
-                    message,
+                    error,
                     recoverable,
                     ..
                 } => {
-                    // Buffer errors for final result
-                    error_messages.push(message.clone());
-
                     let _ = ctx
                         .peer
                         .notify_logging_message(LoggingMessageNotificationParam {
@@ -390,14 +432,15 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                             logger: Some(logger.clone()),
                             data: json!({
                                 "type": "error",
-                                "error": message,
+                                "error": error,
                                 "recoverable": recoverable,
                             }),
                         })
                         .await;
 
-                    if !recoverable {
-                        had_error = true;
+                    // The first non-recoverable error is why the call failed
+                    if !recoverable && fatal.is_none() {
+                        fatal = Some(error.clone());
                     }
                 }
 
@@ -430,13 +473,8 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
         }
 
         // Return buffered data in the final result
-        if had_error {
-            let error_content = if error_messages.is_empty() {
-                "Stream completed with errors".to_string()
-            } else {
-                error_messages.join("\n")
-            };
-            Ok(CallToolResult::error(vec![Content::text(error_content)]))
+        if let Some(error) = fatal {
+            Ok(remote_error_tool_result(&error))
         } else {
             // Convert buffered data to content
             let text_content = if buffered_data.is_empty() {

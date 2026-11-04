@@ -5,13 +5,20 @@
 //! `oneshot`, covering the full dispatch path that unit tests of
 //! `handle_method_call` cannot reach:
 //!
-//! - unary method → 200 with the documented `{"data": [...]}` JSON structure
-//! - streaming method → `text/event-stream`, events delivered promptly while
-//!   the stream is still open (not buffered until close)
+//! - cardinality-one method → 200 with the documented `{"data": [...]}` JSON
+//!   structure
+//! - cardinality-many method → `text/event-stream`, events delivered promptly
+//!   while the stream is still open (not buffered until close)
 //! - unknown method/namespace → 404
 //! - malformed params → 400
 //! - HTTP verb mismatch → 405 (with `Allow` header)
 //! - `PlexusError::Unauthenticated` → 401
+//!
+//! RETURNS-11 (plexus 0.7 frames): every `RemoteError` kind → its status, the
+//! typed error in the body, whether the call is rejected before its stream
+//! starts or fails on an error frame; typed progress in the unary body; an
+//! `{"err": …}` item is data and stays 200; SSE `progress` / `error` events
+//! byte-compared against the documented JSON.
 
 #![cfg(feature = "http-gateway")]
 
@@ -29,7 +36,8 @@ use plexus_core::plexus::{
     auth::AuthContext,
     schema::{HttpMethod, MethodSchema},
     types::{PlexusStreamItem, StreamMetadata},
-    Activation, MethodEnumSchema, PlexusError, PlexusStream, PluginSchema,
+    Activation, AuthzDenyReason, Cardinality, MethodEnumSchema, ParamProblem, PlexusError,
+    PlexusStream, PluginSchema, RemoteError,
 };
 use plexus_core::request::RawRequestContext;
 use serde_json::{json, Value};
@@ -57,7 +65,9 @@ impl plexus_core::__schemars::JsonSchema for TestMethods {
 
 impl MethodEnumSchema for TestMethods {
     fn method_names() -> &'static [&'static str] {
-        &["echo", "watch", "stats", "locked"]
+        &[
+            "echo", "watch", "stats", "locked", "reject", "fail", "progress", "refuse", "import",
+        ]
     }
 
     fn schema_with_consts() -> Value {
@@ -69,11 +79,47 @@ fn metadata() -> StreamMetadata {
     StreamMetadata::new(vec!["test".into()], "hash".into())
 }
 
+/// The `PlexusError` the `reject` / `fail` fixture methods provoke, by the
+/// `RemoteError` kind it maps to — one per row of RETURNS-11's status table.
+fn provoke(kind: &str) -> PlexusError {
+    match kind {
+        "activation_not_found" => PlexusError::ActivationNotFound("ghosts".into()),
+        "method_not_found" => PlexusError::MethodNotFound {
+            activation: "test".into(),
+            method: "frob".into(),
+        },
+        "invalid_params" => PlexusError::InvalidParams {
+            param: Some("id".into()),
+            problem: ParamProblem::Missing,
+        },
+        "unauthenticated" => PlexusError::Unauthenticated("token required".into()),
+        "forbidden" => PlexusError::Forbidden {
+            reason: AuthzDenyReason::TenantBoundary,
+        },
+        "handle_not_supported" => PlexusError::HandleNotSupported("test".into()),
+        "execution" => PlexusError::ExecutionError("disk full".into()),
+        other => panic!("fixture has no kind {other}"),
+    }
+}
+
+fn kind_param(params: &Value) -> String {
+    params["kind"].as_str().expect("fixture needs a 'kind'").to_owned()
+}
+
 /// Leaf activation exposing:
-/// - `echo`   (POST, unary): echoes `params.msg`, InvalidParams when missing
-/// - `watch`  (POST, streaming): 2 data events promptly, then stays open ~forever
-/// - `stats`  (GET, unary): fixed payload
-/// - `locked` (POST, unary): always PlexusError::Unauthenticated
+/// - `echo`     (POST, one): echoes `params.msg`, InvalidParams when missing
+/// - `watch`    (POST, many): 2 data events promptly, then stays open ~forever
+/// - `stats`    (GET, one): fixed payload
+/// - `locked`   (POST, one): always PlexusError::Unauthenticated
+/// - `reject`   (POST, one): rejected before its stream starts with the
+///   `PlexusError` for `params.kind`
+/// - `fail`     (POST, one): one data item, then an error frame carrying the
+///   `RemoteError` for `params.kind`
+/// - `progress` (POST, one): a `Note` progress frame, a typed progress frame,
+///   then an `{"ok": …}` item
+/// - `refuse`   (POST, one): an `{"err": …}` item — the activation said no
+/// - `import`   (POST, many): a progress frame, a data item, then a
+///   non-recoverable error frame; rejected up front when `params.reject`
 struct TestActivation;
 
 #[async_trait]
@@ -89,7 +135,9 @@ impl Activation for TestActivation {
     }
 
     fn methods(&self) -> Vec<&str> {
-        vec!["echo", "watch", "stats", "locked"]
+        vec![
+            "echo", "watch", "stats", "locked", "reject", "fail", "progress", "refuse", "import",
+        ]
     }
 
     async fn call(
@@ -105,8 +153,11 @@ impl Activation for TestActivation {
                     .get("msg")
                     .and_then(|v| v.as_str())
                     .map(str::to_owned)
-                    .ok_or_else(|| {
-                        PlexusError::InvalidParams("expected string field 'msg'".into())
+                    .ok_or_else(|| PlexusError::InvalidParams {
+                        param: Some("msg".into()),
+                        problem: ParamProblem::Malformed {
+                            detail: "expected a string".into(),
+                        },
                     })?;
                 Ok(Box::pin(stream! {
                     yield PlexusStreamItem::Data {
@@ -144,6 +195,62 @@ impl Activation for TestActivation {
                 yield PlexusStreamItem::Done { metadata: metadata() };
             })),
             "locked" => Err(PlexusError::Unauthenticated("token required".into())),
+            "reject" => Err(provoke(&kind_param(&params))),
+            "fail" => {
+                let error = RemoteError::from(&provoke(&kind_param(&params)));
+                Ok(Box::pin(stream! {
+                    yield PlexusStreamItem::data(metadata(), "test.fail".into(), json!({"n": 1}));
+                    yield PlexusStreamItem::error(metadata(), error, false);
+                }))
+            }
+            "progress" => Ok(Box::pin(stream! {
+                yield PlexusStreamItem::progress(
+                    metadata(),
+                    "test.progress".into(),
+                    json!({"message": "halfway", "percentage": 50.0}),
+                );
+                yield PlexusStreamItem::progress(
+                    metadata(),
+                    "test.progress".into(),
+                    json!({"type": "chunk", "done": 1, "of": 2}),
+                );
+                yield PlexusStreamItem::data(
+                    metadata(),
+                    "test.progress".into(),
+                    json!({"ok": {"loaded": 2}}),
+                );
+                yield PlexusStreamItem::done(metadata());
+            })),
+            "refuse" => Ok(Box::pin(stream! {
+                yield PlexusStreamItem::data(
+                    metadata(),
+                    "test.refuse".into(),
+                    json!({"err": {"type": "not_found", "id": "MNG-999"}}),
+                );
+                yield PlexusStreamItem::done(metadata());
+            })),
+            "import" => {
+                if params.get("reject").is_some() {
+                    return Err(provoke("invalid_params"));
+                }
+                Ok(Box::pin(stream! {
+                    yield PlexusStreamItem::progress(
+                        metadata(),
+                        "test.import".into(),
+                        json!({"message": "halfway", "percentage": 50.0}),
+                    );
+                    yield PlexusStreamItem::data(
+                        metadata(),
+                        "test.import".into(),
+                        json!({"ok": {"row": 1}}),
+                    );
+                    yield PlexusStreamItem::error(
+                        metadata(),
+                        RemoteError::Execution { message: "disk full".into() },
+                        false,
+                    );
+                }))
+            }
             other => Err(PlexusError::MethodNotFound {
                 activation: "test".into(),
                 method: other.into(),
@@ -162,10 +269,17 @@ impl Activation for TestActivation {
             "Router test activation",
             vec![
                 MethodSchema::new("echo", "Echo a message", "h-echo"),
-                MethodSchema::new("watch", "Stream events", "h-watch").with_streaming(true),
+                MethodSchema::new("watch", "Stream events", "h-watch")
+                    .with_cardinality(Cardinality::Many),
                 MethodSchema::new("stats", "Read stats", "h-stats")
                     .with_http_method(HttpMethod::Get),
                 MethodSchema::new("locked", "Always unauthenticated", "h-locked"),
+                MethodSchema::new("reject", "Rejected up front", "h-reject"),
+                MethodSchema::new("fail", "Fails on an error frame", "h-fail"),
+                MethodSchema::new("progress", "Reports progress", "h-progress"),
+                MethodSchema::new("refuse", "Says no", "h-refuse"),
+                MethodSchema::new("import", "Streams with progress", "h-import")
+                    .with_cardinality(Cardinality::Many),
             ],
         )
     }
@@ -193,6 +307,15 @@ async fn body_json(response: axum::response::Response) -> Value {
         .await
         .unwrap();
     serde_json::from_slice(&bytes).unwrap()
+}
+
+fn content_type(response: &axum::response::Response) -> String {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned()
 }
 
 // =============================================================================
@@ -243,7 +366,7 @@ async fn get_mapped_method_dispatches_on_get() {
 // =============================================================================
 
 #[tokio::test]
-async fn streaming_method_returns_sse_and_delivers_events_promptly() {
+async fn cardinality_many_method_returns_sse_and_delivers_events_promptly() {
     let response = router()
         .oneshot(json_request("POST", "/test/watch", "{}"))
         .await
@@ -258,7 +381,7 @@ async fn streaming_method_returns_sse_and_delivers_events_promptly() {
         .to_owned();
     assert!(
         content_type.starts_with("text/event-stream"),
-        "streaming method must respond with SSE, got {content_type}"
+        "cardinality-many method must respond with SSE, got {content_type}"
     );
 
     // The activation stream never completes (sleeps for an hour after the
@@ -295,8 +418,9 @@ async fn unknown_method_returns_404() {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = body_json(response).await;
-    assert!(
-        body["error"].as_str().unwrap().contains("Method not found"),
+    assert_eq!(
+        body["error"],
+        json!({"kind": "method_not_found", "activation": "test", "method": "nope"}),
         "body: {body}"
     );
 }
@@ -309,6 +433,12 @@ async fn unknown_namespace_returns_404() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = body_json(response).await;
+    assert_eq!(
+        body["error"],
+        json!({"kind": "activation_not_found", "activation": "ghosts"}),
+        "body: {body}"
+    );
 }
 
 #[tokio::test]
@@ -319,6 +449,9 @@ async fn malformed_json_body_returns_400() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(response).await;
+    assert_eq!(body["error"]["kind"], "invalid_params", "body: {body}");
+    assert_eq!(body["error"]["problem"], "malformed", "body: {body}");
 }
 
 #[tokio::test]
@@ -331,8 +464,14 @@ async fn invalid_params_returns_400() {
 
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let body = body_json(response).await;
-    assert!(
-        body["error"].as_str().unwrap().contains("Invalid parameters"),
+    assert_eq!(
+        body["error"],
+        json!({
+            "kind": "invalid_params",
+            "param": "msg",
+            "problem": "malformed",
+            "detail": "expected a string",
+        }),
         "body: {body}"
     );
 }
@@ -378,11 +517,184 @@ async fn unauthenticated_error_maps_to_401() {
 
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     let body = body_json(response).await;
+    assert_eq!(body["error"], json!({"kind": "unauthenticated"}), "body: {body}");
+}
+
+// =============================================================================
+// RETURNS-11: RemoteError kind → HTTP status (one test per row)
+// =============================================================================
+
+/// Provoke `kind` both ways a call fails and assert the status and the typed
+/// error each time:
+/// - `reject`: the call is refused before its stream starts →
+///   `{"error": <RemoteError>}`;
+/// - `fail`: the stream yields one item, then an error frame →
+///   `{"data": [<item>], "error": <RemoteError>}`.
+async fn assert_kind_maps_to(kind: &str, status: StatusCode) {
+    let body = format!(r#"{{"kind":"{kind}"}}"#);
+    let expected = serde_json::to_value(RemoteError::from(&provoke(kind))).unwrap();
+
+    let response = router()
+        .oneshot(json_request("POST", "/test/reject", &body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), status, "reject {kind}");
+    assert!(content_type(&response).starts_with("application/json"));
+    let json = body_json(response).await;
+    assert_eq!(json["error"]["kind"], kind, "reject {kind}: {json}");
+    assert_eq!(json["error"], expected, "reject {kind}: {json}");
+
+    let response = router()
+        .oneshot(json_request("POST", "/test/fail", &body))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), status, "fail {kind}");
+    let json = body_json(response).await;
+    assert_eq!(json["error"]["kind"], kind, "fail {kind}: {json}");
+    assert_eq!(json["error"], expected, "fail {kind}: {json}");
+    assert_eq!(json["data"], json!([{"n": 1}]), "fail {kind}: {json}");
+}
+
+#[tokio::test]
+async fn status_activation_not_found_and_method_not_found_are_404() {
+    assert_kind_maps_to("activation_not_found", StatusCode::NOT_FOUND).await;
+    assert_kind_maps_to("method_not_found", StatusCode::NOT_FOUND).await;
+}
+
+#[tokio::test]
+async fn status_invalid_params_is_400() {
+    assert_kind_maps_to("invalid_params", StatusCode::BAD_REQUEST).await;
+}
+
+#[tokio::test]
+async fn status_unauthenticated_is_401() {
+    assert_kind_maps_to("unauthenticated", StatusCode::UNAUTHORIZED).await;
+}
+
+#[tokio::test]
+async fn status_forbidden_is_403() {
+    assert_kind_maps_to("forbidden", StatusCode::FORBIDDEN).await;
+}
+
+#[tokio::test]
+async fn status_handle_not_supported_is_501() {
+    assert_kind_maps_to("handle_not_supported", StatusCode::NOT_IMPLEMENTED).await;
+}
+
+#[tokio::test]
+async fn status_execution_is_500() {
+    assert_kind_maps_to("execution", StatusCode::INTERNAL_SERVER_ERROR).await;
+}
+
+// =============================================================================
+// RETURNS-11: unary bodies carry typed progress; an err item is data
+// =============================================================================
+
+#[tokio::test]
+async fn unary_body_carries_typed_progress_whole() {
+    let response = router()
+        .oneshot(json_request("POST", "/test/progress", "{}"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(
+        body,
+        json!({
+            "data": [{"ok": {"loaded": 2}}],
+            "progress": [
+                {"message": "halfway", "percentage": 50.0},
+                {"type": "chunk", "done": 1, "of": 2},
+            ],
+        })
+    );
+}
+
+#[tokio::test]
+async fn err_item_is_data_and_stays_200() {
+    let response = router()
+        .oneshot(json_request("POST", "/test/refuse", "{}"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(
+        body,
+        json!({"data": [{"err": {"type": "not_found", "id": "MNG-999"}}]}),
+        "an err item is data, not a failed call"
+    );
+}
+
+// =============================================================================
+// RETURNS-11: SSE progress / error events, byte-compared
+// =============================================================================
+
+#[tokio::test]
+async fn sse_carries_typed_progress_and_error_events() {
+    let response = router()
+        .oneshot(json_request("POST", "/test/import", "{}"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(content_type(&response).starts_with("text/event-stream"));
+
+    // The stream ends after the error frame, so the body completes.
+    let bytes = tokio::time::timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), usize::MAX),
+    )
+    .await
+    .expect("SSE body completes when the stream ends")
+    .unwrap();
+    let sse = std::str::from_utf8(&bytes).unwrap();
+
+    assert_eq!(
+        sse,
+        concat!(
+            "event: progress\n",
+            r#"data: {"content_type":"test.import","content":{"message":"halfway","percentage":50.0}}"#,
+            "\n\n",
+            "event: data\n",
+            r#"data: {"content":{"ok":{"row":1}}}"#,
+            "\n\n",
+            "event: error\n",
+            r#"data: {"recoverable":false,"error":{"kind":"execution","message":"disk full"}}"#,
+            "\n\n",
+        )
+    );
+}
+
+#[tokio::test]
+async fn cardinality_many_rejected_up_front_answers_json_with_status() {
+    let response = router()
+        .oneshot(json_request("POST", "/test/import", r#"{"reject":true}"#))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(content_type(&response).starts_with("application/json"));
+    let body = body_json(response).await;
+    assert_eq!(
+        body,
+        json!({"error": {"kind": "invalid_params", "param": "id", "problem": "missing"}})
+    );
+}
+
+#[tokio::test]
+async fn cardinality_one_method_answers_one_json_body() {
+    // Progress frames and a data item, as `import` sends them, but on a
+    // cardinality-one method: one JSON body, not SSE.
+    let response = router()
+        .oneshot(json_request("POST", "/test/progress", "{}"))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
     assert!(
-        body["error"]
-            .as_str()
-            .unwrap()
-            .contains("Authentication required"),
-        "body: {body}"
+        content_type(&response).starts_with("application/json"),
+        "cardinality-one method must answer one JSON body"
     );
 }
