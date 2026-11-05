@@ -16,7 +16,6 @@ use http::{header, HeaderMap, HeaderValue, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use jsonrpsee::Methods;
-use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 
 use super::{Hooks, Negotiated, SocketLimits, StopHandle};
@@ -177,12 +176,13 @@ impl<B> tower::Service<Request<B>> for Upgrade {
     }
 }
 
-/// Serve one accepted TCP connection: HTTP/1.1 with upgrades, its headers
+/// Serve one accepted connection (TCP, or TLS over it: TRANSPORT-26): HTTP/1.1 with upgrades, its headers
 /// within `header_timeout` (RPC-4), every request carrying `conn` and going
 /// through `svc` (the checks, then the upgrade). Ends when the connection
 /// does, or — gracefully — when the server or the connection is stopped.
-pub(crate) async fn serve_http<S, B>(sock: TcpStream, conn: Arc<Connection>, svc: S, stop: StopHandle, header_timeout: Duration)
+pub(crate) async fn serve_http<I, S, B>(sock: I, conn: Arc<Connection>, svc: S, stop: StopHandle, header_timeout: Duration)
 where
+    I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     S: tower::Service<Request<Incoming>, Response = Response<B>, Error = BoxError> + Clone + Send + 'static,
     S::Future: Send + 'static,
     B: http_body::Body<Data = Bytes> + From<&'static str> + Send + 'static,

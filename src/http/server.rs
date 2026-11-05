@@ -224,7 +224,15 @@ pub async fn serve_rest_http_as<A: Activation>(
     // Start server
     let listener = tokio::net::TcpListener::bind(config.addr).await?;
     tracing::info!("REST HTTP server listening on {}", config.addr);
+    #[cfg(feature = "tls")]
+    if config.tls.is_some() {
+        tracing::info!("REST HTTP: TLS at https://{}/rest", config.addr);
+    }
 
+    // TRANSPORT-26: https when the config names a pair.
+    #[cfg(feature = "tls")]
+    let handle = crate::tls::serve_axum(listener, app, config.tls.as_ref()).await?;
+    #[cfg(not(feature = "tls"))]
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
             .await

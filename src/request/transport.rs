@@ -7,6 +7,10 @@
 //! peer is secure (local development); behind a proxy, loopback proves
 //! nothing — the proxy may itself be on loopback — and only the proxy's
 //! word counts. See [`crate::proxy`].
+//!
+//! TRANSPORT-26: a connection over TLS that the transport itself terminated
+//! (feature `tls`, a listener given a `TlsConfig`) is secure with no
+//! forwarded header — unless its peer is a trusted proxy, whose word stands.
 
 use std::sync::OnceLock;
 
@@ -30,7 +34,9 @@ pub fn init_require_secure_transport(require: bool) {
 /// - Enforcement is disabled (dev mode), OR
 /// - the peer is a trusted proxy whose `X-Forwarded-Proto` is `https` or
 ///   `wss`, OR
-/// - no proxy is in front and the peer is loopback (local dev).
+/// - no proxy is in front and the peer is loopback (local dev), OR
+/// - the peer, not a trusted proxy, is the far end of a TLS connection one
+///   of this process's listeners terminated (TRANSPORT-26, feature `tls`).
 #[derive(Debug, Clone)]
 pub struct SecureTransport;
 
@@ -42,6 +48,10 @@ impl SecureTransport {
         };
         let client = proxies.resolve(peer.ip(), &ctx.headers);
         if client.secure {
+            return Ok(SecureTransport);
+        }
+        #[cfg(feature = "tls")]
+        if !client.via_proxy && crate::tls::is_tls_peer(peer) {
             return Ok(SecureTransport);
         }
         let why = if client.via_proxy {

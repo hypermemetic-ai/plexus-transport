@@ -8,6 +8,12 @@
 //!   jsonrpsee-server's plain-HTTP JSON-RPC catch-all is gone.
 //!
 //! Both transports share one `TcpListener` bound to the configured address.
+//!
+//! TRANSPORT-26: [`serve_combined_with`] takes [`CombinedOptions`] — TLS on
+//! the port (feature `tls`: `https://…/mcp`, `https://…/rest`, `wss://` for
+//! the socket), and a host's own routes beside them ([`HostRoutes`]: the
+//! socket then at its path, `/ws` by default, and every other path the
+//! host's), so a page, its socket and the bridges are one origin.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,6 +31,7 @@ use futures::FutureExt;
 use tokio::net::TcpListener;
 use tower::ServiceExt;
 
+use crate::websocket::HostRoutes;
 use crate::ws::ServerHandle;
 
 use axum::extract::State;
@@ -110,6 +117,41 @@ pub async fn serve_combined_with_allowed_hosts<A>(
 where
     A: Activation + Send + Sync + 'static,
 {
+    let options = CombinedOptions { allowed_hosts, ..CombinedOptions::default() };
+    serve_combined_with(module, activation, flat_schemas, route_fn, addr, api_key, enable_rest, options).await
+}
+
+/// TRANSPORT-26: what the combined port is beyond its bridges. `Default`:
+/// as before — plain TCP, the socket on every path but `/mcp` and `/rest`.
+#[derive(Debug, Clone, Default)]
+pub struct CombinedOptions {
+    /// The `Host` values `/mcp` answers to (see
+    /// [`serve_combined_with_allowed_hosts`]).
+    pub allowed_hosts: Vec<String>,
+    /// TLS on the port.
+    #[cfg(feature = "tls")]
+    pub tls: Option<crate::tls::TlsConfig>,
+    /// A host's own routes beside `/mcp` and `/rest`; the socket at their
+    /// [`HostRoutes::socket_path`], behind the port's key as before.
+    pub routes: Option<HostRoutes>,
+}
+
+/// [`serve_combined`] with [`CombinedOptions`] (TRANSPORT-26).
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_combined_with<A>(
+    module: RpcModule<()>,
+    activation: Arc<A>,
+    flat_schemas: Option<Vec<PluginSchema>>,
+    route_fn: Option<RouteFn>,
+    addr: SocketAddr,
+    api_key: Option<String>,
+    enable_rest: bool,
+    options: CombinedOptions,
+) -> Result<ServerHandle>
+where
+    A: Activation + Send + Sync + 'static,
+{
+    let allowed_hosts = options.allowed_hosts;
     // ── MCP side ────────────────────────────────────────────────────────────
     let mut bridge = ActivationMcpBridge::with_server_info_and_schemas(
         activation.clone(),
@@ -189,6 +231,18 @@ where
     // Pre-compute the expected Authorization header value for WebSocket path checks.
     let ws_auth_header: Option<String> = api_key.map(|k| format!("Bearer {}", k));
 
+    // TRANSPORT-26: the port's TLS, read now (a pair that does not load
+    // refuses the start), and the host's routes with the socket's path.
+    #[cfg(feature = "tls")]
+    let tls = match &options.tls {
+        Some(t) => {
+            tracing::info!("Combined port: TLS at https://{addr} (certificate {})", t.cert.display());
+            Some(crate::tls::Tls::load(t)?)
+        }
+        None => None,
+    };
+    let host_routes: Option<(Router, Arc<str>)> = options.routes.map(|r| (r.router, Arc::from(r.socket_path)));
+
     tokio::spawn(async move {
         let shutdown = stop_handle.clone().shutdown();
         tokio::pin!(shutdown);
@@ -207,12 +261,15 @@ where
             if let Err(e) = sock.set_nodelay(true) {
                 tracing::debug!("combined set_nodelay: {e}");
             }
-            let conn = Arc::new(crate::websocket::Connection::new(peer, crate::CALLS_PER_CONNECTION, None));
-            let (mcp, upgrade, ws_auth) = (mcp_router.clone(), upgrade.clone(), ws_auth_header.clone());
+            let conn = crate::websocket::Connection::new(peer, crate::CALLS_PER_CONNECTION, None);
+            #[cfg(feature = "tls")]
+            let conn = conn.over_tls(tls.is_some());
+            let conn = Arc::new(conn);
+            let (mcp, upgrade, ws_auth, host) = (mcp_router.clone(), upgrade.clone(), ws_auth_header.clone(), host_routes.clone());
 
             // Per-connection service — routes each request by path.
             let svc = tower::service_fn(move |req: http::Request<Incoming>| {
-                let (mcp, upgrade, ws_auth) = (mcp.clone(), upgrade.clone(), ws_auth.clone());
+                let (mcp, upgrade, ws_auth, host) = (mcp.clone(), upgrade.clone(), ws_auth.clone(), host.clone());
                 async move {
                     if req.uri().path().starts_with("/mcp") || req.uri().path().starts_with("/rest") {
                         // Axum expects Request<AxumBody>; wrap Incoming.
@@ -220,6 +277,19 @@ where
                         let axum_req = http::Request::from_parts(parts, AxumBody::new(body));
                         // Router<()> returns Response<AxumBody> with Infallible error.
                         return mcp.oneshot(axum_req).await.map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) });
+                    }
+                    // TRANSPORT-26: with the host's routes, the socket is at
+                    // its path and every other path is the host's.
+                    if let Some((routes, socket_path)) = host {
+                        if req.uri().path() != &*socket_path {
+                            let mut req = req;
+                            if let Some(conn) = req.extensions().get::<Arc<crate::websocket::Connection>>().cloned() {
+                                let client = crate::websocket::client_of(&Default::default(), &conn, req.headers());
+                                req.extensions_mut().insert(client);
+                            }
+                            let r = routes.oneshot(req.map(AxumBody::new)).await;
+                            return Ok(r.unwrap_or_else(|never| match never {}));
+                        }
                     }
                     // Everything else is the WebSocket: the auth header
                     // checked first, then the upgrade (or 426).
@@ -248,6 +318,17 @@ where
                 }
                 .boxed()
             });
+            #[cfg(feature = "tls")]
+            if let Some(tls) = tls.clone() {
+                // TRANSPORT-26: the handshake in the connection's own task.
+                let (stop, timeout) = (stop_handle.clone(), limits.header_timeout);
+                tokio::spawn(async move {
+                    if let Some(io) = tls.accept(sock, peer, timeout).await {
+                        crate::ws::serve_http(io, conn, svc, stop, timeout).await;
+                    }
+                });
+                continue;
+            }
             tokio::spawn(crate::ws::serve_http(sock, conn, svc, stop_handle.clone(), limits.header_timeout));
         }
     });

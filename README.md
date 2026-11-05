@@ -345,6 +345,58 @@ TransportServer::builder(hub, converter)
   which `serve()` calls); `init_trust_proxy_headers` (any peer) is
   deprecated.
 
+## TLS: https and wss with no proxy
+
+TRANSPORT-26, feature `tls` (default off; it compiles nothing new — the
+rustls 0.23 / tokio-rustls 0.26 / ring that jsonrpsee's client already
+brings). The transport terminates TLS itself, rustls on the ring provider:
+
+```rust
+use plexus_transport::TlsConfig;
+
+TransportServer::builder(hub, converter)
+    .with_websocket(4455)
+    .bind([0, 0, 0, 0])
+    .with_tls(TlsConfig::new("/etc/plexus/host.crt", "/etc/plexus/host.key")) // PEM chain + key
+    .with_routes(shell_router)                       // the host's pages; the socket at /ws
+    .with_allowed_origins(["https://host.example:4455"])
+    .with_allowed_hosts(["host.example:4455"])
+```
+
+- **Every listener the builder opens** serves TLS with the pair: the
+  WebSocket (`wss://`), the REST bridge and MCP HTTP (`https://…/rest`,
+  `https://…/mcp`), and the mounted MCP bridge (`with_mcp`). A listener's
+  own config may name its own pair (`WebSocketConfig::with_tls`,
+  `RestHttpConfig::with_tls`, `McpHttpConfig::with_tls`); the combined port
+  takes one in `CombinedOptions` (`serve_combined_with`).
+- **The pair**: a PEM certificate chain (leaf first) and its key — RSA,
+  ECDSA or Ed25519, PKCS#8/PKCS#1/SEC1. One that does not load refuses the
+  start, naming the file. TLS 1.3 and 1.2; ALPN `http/1.1`.
+- **Renewal** (`tailscale cert`, certbot): each handshake compares both
+  files' size, mtime and inode; a change is read and the next connection
+  presents it, no restart. A pair that fails to load (half written, a key
+  that is not the certificate's) keeps the one before, says why once, and is
+  tried again when a file changes. Open connections go on.
+- **Refusals**: a plain `http://` request or a bad handshake is refused at
+  the handshake, logged once per peer address; the listener goes on. The
+  handshake runs in the connection's own task within the header timeout.
+- **Secure**: a connection over this TLS is secure with no forwarded header
+  — `Connection::is_tls()`, `ForwardedClient::secure`, and `SecureTransport`
+  for its peer — unless its peer is a trusted proxy, whose word stands.
+- **One origin** (`with_routes(router)` / `with_host_routes(HostRoutes::new(r).socket_at("/rpc"))`):
+  the host's axum routes on the WebSocket's port, TLS or not. The socket
+  (and RFC 9728's metadata) at its path, `/ws` by default, through every
+  check it has; every other path to the host's router after the port's
+  `Host` check, with the request's `ForwardedClient` and `Connection` in its
+  extensions. Without routes the port is the socket's on every path, as
+  before.
+- **Origins**: an `https://` page's origin is admitted only when named —
+  `with_allowed_origins`, or plexus-login's `public_url` / `allowed_origins`
+  (its `shell_origins` adds the https `public_url`'s origin, and its
+  `resource_url` already names that origin's `/ws`).
+- No `TlsConfig`: every listener is what it was — the same accept loop on
+  the same `TcpStream`.
+
 ## Examples
 
 See `examples/` directory:

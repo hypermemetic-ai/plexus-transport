@@ -61,6 +61,12 @@ tokio-stream = { version = "0.1", optional = true }
 # TRANSPORT-7: the trusted proxies' networks (CIDRs).
 ipnet = "2"
 
+# TRANSPORT-26: TLS served by the transport itself (feature `tls`): rustls
+# on the ring provider, the rustls 0.23 / tokio-rustls 0.26 / ring that
+# jsonrpsee's ws-client already brings into every build, so the feature
+# compiles nothing new.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"], optional = true }
+
 # Utilities
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -99,9 +105,22 @@ plexus-core = { path = "../plexus-core", version = "0.8.0" }
 duplex-fixture = { path = "tests/duplex_fixture" }
 # RETURNS-47: activations that read their caller, for tests/returns47_bridges.rs.
 returns47-fixture = { path = "tests/returns47_fixture" }
+# TRANSPORT-26: a test CA and its certificates, made in each test.
+rcgen = "0.14"
 
 # TRANSPORT-17: each is its own child, `serve_stdio` on its own stdout, so
 # libtest's lines stay off that stdout.
+# TRANSPORT-26: the listeners over TLS.
+[[test]]
+name = "tls"
+required-features = ["tls"]
+
+# TRANSPORT-26's perf row: plain against TLS on the socket (ignored; run in
+# release with --ignored --nocapture).
+[[test]]
+name = "tls_cost"
+required-features = ["tls"]
+
 [[test]]
 name = "stdio_pipes"
 harness = false
@@ -120,6 +139,10 @@ mcp = ["dep:rmcp", "dep:plexus-transport-mcp"]
 __mcp-test-client = ["mcp", "rmcp/client", "rmcp/transport-streamable-http-client-reqwest", "rmcp/reqwest"]
 mcp-gateway = ["mcp"]
 http-gateway = []
+# TRANSPORT-26: every listener serves TLS when given a certificate
+# (`TransportServerBuilder::with_tls`). Default-OFF; without it nothing
+# changes and `with_tls` is not there.
+tls = ["dep:tokio-rustls"]
 sqlite-sessions = ["mcp", "sqlx", "tokio-stream"]
 
 # PERF-6 (PLEXUS/PERF-6): the one build perf runs and releases use, PERF-1's
