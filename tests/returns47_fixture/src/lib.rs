@@ -53,7 +53,7 @@ pub struct ProbeActivation {
 }
 
 /// Reads `reach: Reach`.
-#[plexus_macros::activation(auth = "required", request = Req, roles(viewer = ["reach", "open"]))]
+#[plexus_macros::activation(auth = "required", request = Req, roles(viewer = ["reach", "open", "touch"]))]
 impl ProbeActivation {
     /// Who, within what.
     #[plexus_macros::method]
@@ -66,7 +66,17 @@ impl ProbeActivation {
     pub async fn open(&self, reach: Reach) -> String {
         format!("anyone {}", held(&reach))
     }
+
+    /// Anyone: counts that it ran (`TOUCHED`), and says who called.
+    #[plexus_macros::method(public)]
+    pub async fn touch(&self) -> String {
+        TOUCHED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        seen()
+    }
 }
+
+/// How many times `probe.touch` ran.
+pub static TOUCHED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 pub mod whom {
     /// Reads `caller()`.
