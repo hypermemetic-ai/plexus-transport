@@ -253,6 +253,10 @@ where
 
     // Start MCP HTTP server
     let listener = tokio::net::TcpListener::bind(config.addr).await?;
+    // TRANSPORT-26: https when the config names a pair.
+    #[cfg(feature = "tls")]
+    let handle = crate::tls::serve_axum(listener, mcp_app, config.tls.as_ref()).await?;
+    #[cfg(not(feature = "tls"))]
     let handle = tokio::spawn(async move { axum::serve(listener, mcp_app).await });
 
     Ok(handle)

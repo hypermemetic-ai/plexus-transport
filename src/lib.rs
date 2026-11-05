@@ -49,6 +49,9 @@ pub mod proxy;
 pub mod registry;
 pub mod server;
 pub mod stdio;
+/// TRANSPORT-26: TLS served by the transport itself.
+#[cfg(feature = "tls")]
+pub mod tls;
 pub mod websocket;
 /// PERF-20: the WebSocket connection loop, plexus-transport's own.
 pub mod ws;
@@ -62,7 +65,7 @@ pub mod http;
 // Re-export main API
 pub use calls::{ConnectionCalls, TooManyCalls, CALLS_PER_CONNECTION};
 #[cfg(feature = "mcp-gateway")]
-pub use combined::{serve_combined, serve_combined_with_allowed_hosts};
+pub use combined::{serve_combined, serve_combined_with, serve_combined_with_allowed_hosts, CombinedOptions};
 pub use config::{
     ConnectionQuotas, McpHttpConfig, SessionStorage, StdioConfig, TransportConfig, WebSocketConfig,
     DEFAULT_API_KEY_HEADER,
@@ -75,7 +78,9 @@ pub use registry::{RegistryRegistration, DEFAULT_REGISTRY_URL, NO_REGISTRY_ENV, 
 pub use server::{RegistryOptions, TransportServer, TransportServerBuilder};
 pub use protected_resource::ProtectedResource;
 pub use proxy::{init_trusted_proxies, ForwardedClient, IpNet, TrustedProxies};
-pub use websocket::UpgradeOptions;
+pub use websocket::{HostRoutes, UpgradeOptions};
+#[cfg(feature = "tls")]
+pub use tls::TlsConfig;
 // PERF-20: the socket's loop — its handle, its limits, the hook and the
 // writer (BIDIR-12), the encoding fixed at the upgrade (PERF-9).
 pub use ws::{ConnectionHook, ConnectionWriter, Encoding, Hooks, Outbound, ServerHandle, SocketLimits};

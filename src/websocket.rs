@@ -107,6 +107,8 @@ pub struct Connection {
     /// RPC-4: its place among its IP's sockets not yet upgraded, given back
     /// at the upgrade.
     pending: Mutex<Option<PendingPlace>>,
+    /// TRANSPORT-26: it came over TLS, terminated here.
+    tls: bool,
 }
 
 impl Connection {
@@ -118,7 +120,22 @@ impl Connection {
             calls: crate::calls::ConnectionCalls::new(max_calls),
             upgraded: OnceLock::new(),
             pending: Mutex::new(pending),
+            tls: false,
         }
+    }
+
+    /// TRANSPORT-26: this connection is TLS, terminated by the transport.
+    #[cfg(feature = "tls")]
+    pub(crate) fn over_tls(mut self, tls: bool) -> Self {
+        self.tls = tls;
+        self
+    }
+
+    /// TRANSPORT-26: whether this connection came over TLS that the
+    /// transport itself terminated (a listener given a `TlsConfig`). A TLS
+    /// edge in front says so in `X-Forwarded-Proto` instead (TRANSPORT-7).
+    pub fn is_tls(&self) -> bool {
+        self.tls
     }
 
     /// The peer's address, as accepted (no proxy headers; the client a
@@ -414,6 +431,10 @@ pub struct UpgradeOptions {
     /// PERF-20 → BIDIR-12: each upgraded connection's hook over its inbound
     /// frames.
     pub hooks: Option<Hooks>,
+    /// TRANSPORT-26: the host's own routes on this port, the socket at their
+    /// [`HostRoutes::socket_path`]. `None` (the default): the port is the
+    /// socket's alone, on every path, as before.
+    pub routes: Option<HostRoutes>,
 }
 
 /// [`serve_websocket`] with the full [`UpgradeOptions`] (AUTH-6, PERF-20).
@@ -470,6 +491,168 @@ pub async fn serve_websocket_with(
         proxies,
     };
 
+    #[cfg(feature = "tls")]
+    let tls = match &config.tls {
+        Some(t) => {
+            tracing::info!("WebSocket: TLS at wss://{local_addr} (certificate {})", t.cert.display());
+            Some(crate::tls::Tls::load(t)?)
+        }
+        None => None,
+    };
+    let bounds = (per_ip, per_proxy);
+    let header_timeout = limits.header_timeout;
+    match options.routes.clone() {
+        None => spawn_accept_loop(
+            listener, middleware, stop, pending, proxies_seen, bounds, max_calls, header_timeout,
+            #[cfg(feature = "tls")]
+            tls,
+        ),
+        Some(routes) => {
+            tracing::info!("WebSocket: the socket at {}, the host's routes beside it", routes.socket_path);
+            let routed = Routed {
+                socket: middleware,
+                routes: routes.router,
+                socket_path: routes.socket_path.into(),
+                hosts: crate::host::normalized(&config.allowed_hosts),
+                proxies: proxies_seen.clone(),
+            };
+            spawn_accept_loop(
+                listener, routed, stop, pending, proxies_seen, bounds, max_calls, header_timeout,
+                #[cfg(feature = "tls")]
+                tls,
+            )
+        }
+    }
+
+    Ok((server_handle, local_addr))
+}
+
+/// TRANSPORT-7 + TRANSPORT-26: who a request on `conn` comes from. A
+/// connection that came over TLS the transport terminated is secure from
+/// its peer, with no forwarded header; through a trusted proxy, the proxy's
+/// word stands (the leg before it is the proxy's to say).
+pub(crate) fn client_of(proxies: &crate::proxy::TrustedProxies, conn: &Connection, headers: &http::HeaderMap) -> crate::proxy::ForwardedClient {
+    let mut client = proxies.resolve(conn.peer().ip(), headers);
+    if conn.is_tls() && !client.via_proxy {
+        client.secure = true;
+    }
+    client
+}
+
+/// TRANSPORT-26: a host's own routes on the WebSocket's port — a page shell,
+/// plexus-ui's `UiRoutes`, plexus-login's pages — so the page and its socket
+/// are one origin (one `https://` origin under TLS). The socket answers at
+/// [`Self::socket_path`] (default `/ws`; its query, a `batch` offer, as
+/// ever) and RFC 9728's metadata at its well-known path, through every
+/// check the socket has; any other request goes to [`Self::router`], after
+/// the port's `Host` check (ACCESS-25) and with the request's
+/// [`ForwardedClient`](crate::proxy::ForwardedClient) and
+/// [`Connection`] in its extensions. The socket's checks — origin, key,
+/// session, quotas — are the socket's: the host's routes run their own.
+#[derive(Clone)]
+pub struct HostRoutes {
+    /// The host's routes.
+    pub router: axum::Router,
+    /// Where the socket is upgraded; `/ws` by default.
+    pub socket_path: String,
+}
+
+impl HostRoutes {
+    /// `router`, with the socket at `/ws`.
+    pub fn new(router: axum::Router) -> Self {
+        Self { router, socket_path: "/ws".to_string() }
+    }
+
+    /// The socket at `path` (`/socket`, `/rpc`, …) instead of `/ws`.
+    pub fn socket_at(mut self, path: impl Into<String>) -> Self {
+        self.socket_path = path.into();
+        self
+    }
+}
+
+impl std::fmt::Debug for HostRoutes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HostRoutes").field("socket_path", &self.socket_path).finish_non_exhaustive()
+    }
+}
+
+/// The port's service with [`HostRoutes`]: the socket's path (and the
+/// metadata's) to `socket`, the rest to the host's router.
+#[derive(Clone)]
+pub(crate) struct Routed<S> {
+    pub(crate) socket: S,
+    pub(crate) routes: axum::Router,
+    pub(crate) socket_path: Arc<str>,
+    pub(crate) hosts: Arc<Vec<String>>,
+    pub(crate) proxies: Arc<crate::proxy::TrustedProxies>,
+}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+impl<S, B> tower::Service<http::Request<hyper::body::Incoming>> for Routed<S>
+where
+    S: tower::Service<http::Request<hyper::body::Incoming>, Response = http::Response<B>, Error = BoxError> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    B: http_body::Body<Data = bytes::Bytes> + Send + 'static,
+    B::Error: Into<BoxError>,
+{
+    type Response = http::Response<axum::body::Body>;
+    type Error = BoxError;
+    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, BoxError>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, mut req: http::Request<hyper::body::Incoming>) -> Self::Future {
+        use tower::ServiceExt;
+        let path = req.uri().path();
+        if path == &*self.socket_path || path.starts_with(crate::protected_resource::WELL_KNOWN_PATH) {
+            let socket = self.socket.clone();
+            return Box::pin(async move { socket.oneshot(req).await.map(|r| r.map(axum::body::Body::new)) });
+        }
+        if let Some(host) = crate::host::refused(&self.hosts, &req) {
+            tracing::warn!(host = %host, uri = %req.uri(), "request refused: host not allowed");
+            let r = http::Response::builder()
+                .status(http::StatusCode::MISDIRECTED_REQUEST)
+                .header(http::header::CONTENT_TYPE, "text/plain")
+                .body(axum::body::Body::from(crate::host::REFUSAL))
+                .expect("static response is valid");
+            return Box::pin(async move { Ok(r) });
+        }
+        if let Some(conn) = req.extensions().get::<Arc<Connection>>().cloned() {
+            let client = client_of(&self.proxies, &conn, req.headers());
+            req.extensions_mut().insert(client);
+        }
+        let routes = self.routes.clone();
+        Box::pin(async move {
+            let r = routes.oneshot(req.map(axum::body::Body::new)).await;
+            Ok(r.unwrap_or_else(|never| match never {}))
+        })
+    }
+}
+
+/// Accept on `listener` until the server stops: each connection bounded by
+/// its IP's sockets not yet upgraded (RPC-4), then served by `svc` in its
+/// own task — after its TLS handshake when the port has TLS (TRANSPORT-26),
+/// within the header timeout.
+#[allow(clippy::too_many_arguments)]
+fn spawn_accept_loop<S, B>(
+    listener: TcpListener,
+    svc: S,
+    stop: crate::ws::StopHandle,
+    pending: Arc<Pending>,
+    proxies_seen: Arc<crate::proxy::TrustedProxies>,
+    (per_ip, per_proxy): (u32, u32),
+    max_calls: usize,
+    header_timeout: Duration,
+    #[cfg(feature = "tls")] tls: Option<crate::tls::Tls>,
+) where
+    S: tower::Service<http::Request<hyper::body::Incoming>, Response = http::Response<B>, Error = BoxError> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    B: http_body::Body<Data = bytes::Bytes> + From<&'static str> + Send + 'static,
+    B::Error: Into<BoxError>,
+{
     // AUTH-11: the accept loop is ours, so each connection has its own close
     // and its peer address rides into the checks.
     tokio::spawn(async move {
@@ -501,12 +684,23 @@ pub async fn serve_websocket_with(
                 tracing::debug!(%peer, "WebSocket: dropped — its address holds too many sockets not yet upgraded");
                 continue;
             };
+            #[cfg(feature = "tls")]
+            if let Some(tls) = tls.clone() {
+                // TRANSPORT-26: the handshake in the connection's own task,
+                // within the header timeout; a refused one ends here.
+                let conn = Arc::new(Connection::new(peer, max_calls, Some(place)).over_tls(true));
+                let (svc, stop) = (svc.clone(), stop.clone());
+                tokio::spawn(async move {
+                    if let Some(io) = tls.accept(sock, peer, header_timeout).await {
+                        crate::ws::serve_http(io, conn, svc, stop, header_timeout).await;
+                    }
+                });
+                continue;
+            }
             let conn = Arc::new(Connection::new(peer, max_calls, Some(place)));
-            tokio::spawn(crate::ws::serve_http(sock, conn, middleware.clone(), stop.clone(), limits.header_timeout));
+            tokio::spawn(crate::ws::serve_http(sock, conn, svc.clone(), stop.clone(), header_timeout));
         }
     });
-
-    Ok((server_handle, local_addr))
 }
 
 // ---------------------------------------------------------------------------
@@ -766,8 +960,8 @@ pub(crate) mod auth {
             // ── TRANSPORT-7: who this comes from, behind the proxies ──────
             // Resolved once, from the accepted peer: what every later step
             // (the quotas) and the application read.
-            if let Some(peer) = request.extensions().get::<Arc<super::Connection>>().map(|c| c.peer().ip()) {
-                let client = self.proxies.resolve(peer, request.headers());
+            if let Some(conn) = request.extensions().get::<Arc<super::Connection>>().cloned() {
+                let client = super::client_of(&self.proxies, &conn, request.headers());
                 request.extensions_mut().insert(client);
             }
 

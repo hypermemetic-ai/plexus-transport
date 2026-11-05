@@ -73,6 +73,10 @@ pub struct WebSocketConfig {
     /// they forward, not the proxy (see [`crate::proxy`]). Default: none;
     /// no forwarded header is believed.
     pub trusted_proxies: crate::proxy::TrustedProxies,
+    /// TRANSPORT-26: serve TLS on this listener with this pair (`None`: plain
+    /// TCP, as before).
+    #[cfg(feature = "tls")]
+    pub tls: Option<crate::tls::TlsConfig>,
 }
 
 /// AUTH-12: connection quotas on the WebSocket port, so no one caller —
@@ -130,6 +134,8 @@ impl WebSocketConfig {
             allowed_hosts: Vec::new(),
             quotas: ConnectionQuotas::default(),
             trusted_proxies: Default::default(),
+            #[cfg(feature = "tls")]
+            tls: None,
         }
     }
 
@@ -137,6 +143,13 @@ impl WebSocketConfig {
     /// behind a proxy) rather than `127.0.0.1:<port>`.
     pub fn with_addr(mut self, addr: SocketAddr) -> Self {
         self.addr = addr;
+        self
+    }
+
+    /// TRANSPORT-26: serve TLS on this listener with this pair.
+    #[cfg(feature = "tls")]
+    pub fn with_tls(mut self, tls: crate::tls::TlsConfig) -> Self {
+        self.tls = Some(tls);
         self
     }
 
@@ -198,6 +211,10 @@ pub struct McpHttpConfig {
     /// default): the loopback names, plus the literal listen address when it
     /// is neither loopback nor unspecified. Any other `Host` is refused 403.
     pub allowed_hosts: Vec<String>,
+    /// TRANSPORT-26: serve TLS on this listener with this pair (`None`: plain
+    /// TCP, as before).
+    #[cfg(feature = "tls")]
+    pub tls: Option<crate::tls::TlsConfig>,
 }
 
 impl McpHttpConfig {
@@ -211,6 +228,8 @@ impl McpHttpConfig {
             server_version: None,
             api_key: None,
             allowed_hosts: Vec::new(),
+            #[cfg(feature = "tls")]
+            tls: None,
         }
     }
 
@@ -235,6 +254,13 @@ impl McpHttpConfig {
     /// Override the server version reported in MCP server info
     pub fn with_server_version(mut self, version: String) -> Self {
         self.server_version = Some(version);
+        self
+    }
+
+    /// TRANSPORT-26: serve TLS on this listener with this pair.
+    #[cfg(feature = "tls")]
+    pub fn with_tls(mut self, tls: crate::tls::TlsConfig) -> Self {
+        self.tls = Some(tls);
         self
     }
 
@@ -271,6 +297,10 @@ pub struct RestHttpConfig {
     /// [`crate::host`]). Empty (the default) checks nothing; otherwise any
     /// other host is refused 421 before routing.
     pub allowed_hosts: Vec<String>,
+    /// TRANSPORT-26: serve TLS on this listener with this pair (`None`: plain
+    /// TCP, as before).
+    #[cfg(feature = "tls")]
+    pub tls: Option<crate::tls::TlsConfig>,
 }
 
 impl RestHttpConfig {
@@ -282,6 +312,8 @@ impl RestHttpConfig {
             server_name: "plexus-rest".to_string(),
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             allowed_hosts: Vec::new(),
+            #[cfg(feature = "tls")]
+            tls: None,
         }
     }
 
@@ -305,6 +337,13 @@ impl RestHttpConfig {
     /// Override the server version
     pub fn with_server_version(mut self, version: String) -> Self {
         self.server_version = version;
+        self
+    }
+
+    /// TRANSPORT-26: serve TLS on this listener with this pair.
+    #[cfg(feature = "tls")]
+    pub fn with_tls(mut self, tls: crate::tls::TlsConfig) -> Self {
+        self.tls = Some(tls);
         self
     }
 }

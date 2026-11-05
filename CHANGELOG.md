@@ -5,6 +5,28 @@ at 0.6.0; earlier changes are in the git history.
 
 ## [Unreleased]
 
+TRANSPORT-26: the transport serves https itself.
+
+### Added
+
+- Feature `tls` (default off): `TlsConfig { cert, key }` (PEM), and
+  `TransportServerBuilder::with_tls` — every listener the builder opens (the
+  WebSocket, the REST bridge, MCP HTTP, the mounted MCP bridge) serves TLS
+  with rustls on the ring provider; `WebSocketConfig`, `RestHttpConfig` and
+  `McpHttpConfig` take one each (`with_tls`, a `tls` field under the
+  feature). The pair is read again on the next handshake after either file
+  changes; one that fails to load keeps the last good pair. A plain request
+  to a TLS port is refused at the handshake and logged once per peer.
+  `Connection::is_tls`; `ForwardedClient::secure` and `SecureTransport` are
+  true on such a connection without any forwarded header (not through a
+  trusted proxy, whose word stands); `tls::is_tls_peer`.
+- `HostRoutes` and `TransportServerBuilder::with_routes` /
+  `with_host_routes`: a host's own axum routes on the WebSocket's port, the
+  socket at `/ws` (or the path named) — one origin for a page and its
+  socket, under TLS or not. `UpgradeOptions::routes`.
+- `serve_combined_with` and `CombinedOptions` (allowed hosts, TLS, the
+  host's routes) for the combined port.
+
 RETURNS-47, on plexus-core's call context (`plexus_core::call`): the bridges
 answer as the WebSocket does.
 

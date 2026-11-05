@@ -125,6 +125,11 @@ pub struct TransportServer<A: Activation> {
     /// TRANSPORT-16: the mounted bridge, when `with_mcp` was called.
     #[cfg(feature = "mcp")]
     mcp: Option<McpMount>,
+    /// TRANSPORT-26: the pair every listener serves TLS with (the configs
+    /// carry it; the mounted MCP bridge reads it here).
+    #[cfg(feature = "tls")]
+    #[cfg_attr(not(feature = "mcp"), allow(dead_code))]
+    tls: Option<crate::tls::TlsConfig>,
 }
 
 impl<A: Activation> TransportServer<A> {
@@ -318,7 +323,12 @@ impl<A: Activation> TransportServer<A> {
                 let router = (mount.make)(self.session_validator.clone(), mount.config.clone());
                 let listener = tokio::net::TcpListener::bind(listen).await?;
                 tracing::info!("Starting MCP at http://{}{}", listener.local_addr()?, mount.config.path);
-                Some(tokio::spawn(async move { axum::serve(listener, router).await }))
+                // TRANSPORT-26: https when the builder has TLS.
+                #[cfg(feature = "tls")]
+                let handle = crate::tls::serve_axum(listener, router, self.tls.as_ref()).await?;
+                #[cfg(not(feature = "tls"))]
+                let handle = tokio::spawn(async move { axum::serve(listener, router).await });
+                Some(handle)
             }
             None => None,
         };
@@ -475,6 +485,9 @@ pub struct TransportServerBuilder<A: Activation> {
     /// TRANSPORT-16: set by `.with_mcp()`.
     #[cfg(feature = "mcp")]
     mcp: Option<McpMount>,
+    /// TRANSPORT-26: set by `.with_tls()`.
+    #[cfg(feature = "tls")]
+    tls: Option<crate::tls::TlsConfig>,
 }
 
 #[cfg(feature = "mcp")]
@@ -531,6 +544,8 @@ impl<A: Activation> TransportServerBuilder<A> {
             registry: RegistryOptions::default(),
             #[cfg(feature = "mcp")]
             mcp: None,
+            #[cfg(feature = "tls")]
+            tls: None,
         }
     }
 
@@ -872,6 +887,38 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
+    /// TRANSPORT-26: serve TLS on every listener this builder opens — the
+    /// WebSocket (`wss://`), the REST bridge and MCP HTTP (`https://`), and
+    /// the mounted MCP bridge ([`Self::with_mcp`]) — with this PEM pair,
+    /// read again whenever either file changes ([`crate::tls`]). A
+    /// listener's own config that already names a pair keeps it. The pair is
+    /// read when [`TransportServer::serve`] opens the listeners; one that
+    /// does not load refuses the start.
+    ///
+    /// A browser page on another origin than the socket's still needs that
+    /// origin named: [`Self::with_allowed_origins`] with the `https://`
+    /// origin, and `Host` names with [`Self::with_allowed_hosts`].
+    #[cfg(feature = "tls")]
+    pub fn with_tls(mut self, tls: crate::tls::TlsConfig) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
+    /// TRANSPORT-26: the host's own routes (an axum `Router`: a page shell,
+    /// plexus-ui's `UiRoutes`, plexus-login's pages) on the WebSocket's port,
+    /// with the socket at `/ws` — one origin for the page and its socket,
+    /// `https://` under [`Self::with_tls`]. See [`crate::HostRoutes`];
+    /// [`Self::with_host_routes`] puts the socket elsewhere.
+    pub fn with_routes(self, router: axum::Router) -> Self {
+        self.with_host_routes(crate::websocket::HostRoutes::new(router))
+    }
+
+    /// TRANSPORT-26: [`Self::with_routes`] with the socket's path named.
+    pub fn with_host_routes(mut self, routes: crate::websocket::HostRoutes) -> Self {
+        self.upgrade.routes = Some(routes);
+        self
+    }
+
     /// RED-4: opt out of the build-time auth-configuration check.
     ///
     /// Normally, [`Self::build`] inspects the registered activation's
@@ -961,6 +1008,20 @@ impl<A: Activation> TransportServerBuilder<A> {
                 registry.host = Some(ip.to_string());
             }
         }
+        // TRANSPORT-26: one pair for every listener that names none.
+        #[cfg(feature = "tls")]
+        if let Some(tls) = self.tls.as_ref() {
+            if let Some(ws) = config.websocket.as_mut() {
+                ws.tls.get_or_insert_with(|| tls.clone());
+            }
+            if let Some(mcp) = config.mcp_http.as_mut() {
+                mcp.tls.get_or_insert_with(|| tls.clone());
+            }
+            #[cfg(feature = "http-gateway")]
+            if let Some(rest) = config.rest_http.as_mut() {
+                rest.tls.get_or_insert_with(|| tls.clone());
+            }
+        }
         // TRANSPORT-16: the mounted bridge takes the bind address too.
         #[cfg(feature = "mcp")]
         let mcp = self.mcp.map(|mut m| {
@@ -987,6 +1048,8 @@ impl<A: Activation> TransportServerBuilder<A> {
             registry,
             #[cfg(feature = "mcp")]
             mcp,
+            #[cfg(feature = "tls")]
+            tls: self.tls,
         })
     }
 }
