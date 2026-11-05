@@ -100,6 +100,7 @@ fn schemas_to_rest_routes<A>(
     route_fn: Option<RouteFn>,
     route_as: Option<RouteAsFn>,
     validator: Option<Arc<dyn SessionValidator>>,
+    api_key: Option<String>,
 ) -> Router
 where
     A: Activation + 'static,
@@ -110,6 +111,7 @@ where
         route_fn,
         route_as,
         validator,
+        api_key,
         registry: registry.clone(),
     });
 
@@ -118,6 +120,13 @@ where
     // enforces the schema's HTTP verb (405 on mismatch). Literal per-method
     // paths cannot be combined with the `Path` extractor: axum rejects `Path`
     // extraction on routes without captures (every request would 500).
+    // CSRF: a cookie names the caller here, so a cross-origin page could
+    // send one along. Only `application/json` is read (anything else is 415
+    // before the method runs), which a browser sends cross-origin only after
+    // a CORS preflight — and this router answers none (no CORS headers).
+    // A CORS layer added here must come with a CSRF check (an Origin
+    // allowlist, or a token): it would let other origins' pages call as the
+    // cookie's caller. Pinned by tests/returns47_review2.rs.
     Router::new()
         .route("/{namespace}/{method}", any(rest_method_handler))
         .with_state(state)
@@ -133,6 +142,7 @@ struct RestBridgeState<A: Activation> {
     route_fn: Option<RouteFn>,
     route_as: Option<RouteAsFn>,
     validator: Option<Arc<dyn SessionValidator>>,
+    api_key: Option<String>,
     registry: MethodRegistry,
 }
 
@@ -142,8 +152,14 @@ struct RestBridgeState<A: Activation> {
 /// the caller. A `Bearer` it refuses (and no cookie it accepts) is a 401,
 /// typed `unauthenticated`; no `Bearer` and no accepted cookie is the
 /// anonymous caller. Without a validator every caller is anonymous.
+///
+/// A `Bearer` equal to the static api key the bridge is served behind
+/// (`api_key`) is the admission key, never a session token: it is not handed
+/// to the validator, so with no cookie the caller is anonymous — as every
+/// REST call was before RETURNS-47 — and with a valid cookie the cookie's.
 async fn identify(
     validator: Option<&Arc<dyn SessionValidator>>,
+    api_key: Option<&str>,
     headers: &axum::http::HeaderMap,
 ) -> Result<Option<AuthContext>, Response> {
     let Some(validator) = validator else { return Ok(None) };
@@ -156,7 +172,8 @@ async fn identify(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
-        .map(str::trim);
+        .map(str::trim)
+        .filter(|token| api_key != Some(*token));
     match bearer {
         Some(token) => match validator.validate(token).await {
             Some(ctx) => Ok(Some(ctx)),
@@ -221,7 +238,7 @@ where
     }
 
     // RETURNS-47: who is calling, before anything of the call is read.
-    let auth = match identify(state.validator.as_ref(), request.headers()).await {
+    let auth = match identify(state.validator.as_ref(), state.api_key.as_deref(), request.headers()).await {
         Ok(auth) => auth,
         Err(refused) => return refused,
     };
@@ -301,6 +318,7 @@ pub struct ActivationRestBridge<A: Activation> {
     route_fn: Option<RouteFn>,
     route_as: Option<RouteAsFn>,
     validator: Option<Arc<dyn SessionValidator>>,
+    api_key: Option<String>,
     #[allow(dead_code)]
     server_name: Option<String>,
     #[allow(dead_code)]
@@ -317,6 +335,7 @@ impl<A: Activation> ActivationRestBridge<A> {
             route_fn: None,
             route_as: None,
             validator: None,
+            api_key: None,
             server_name: None,
             server_version: None,
         }
@@ -339,6 +358,7 @@ impl<A: Activation> ActivationRestBridge<A> {
             route_fn: None,
             route_as: None,
             validator: None,
+            api_key: None,
             server_name,
             server_version,
         }
@@ -365,16 +385,25 @@ impl<A: Activation> ActivationRestBridge<A> {
     /// RETURNS-47: name each request's caller with `validator` — its
     /// `Cookie`, then its `Authorization: Bearer` token, as the WebSocket's
     /// upgrade does (the same validator names the same caller on both). A
-    /// `Bearer` it refuses is a 401; none is the anonymous caller. The static
-    /// api key of `serve_rest_http` also rides `Authorization`, so a service
-    /// that uses both names its REST callers by cookie.
+    /// `Bearer` it refuses is a 401; none is the anonymous caller. Behind a
+    /// static api key ([`Self::with_api_key`]) the `Bearer` carries the key,
+    /// so the caller is the cookie's, or anonymous.
     pub fn with_session_validator(mut self, validator: Arc<dyn SessionValidator>) -> Self {
         self.validator = Some(validator);
         self
     }
 
+    /// RETURNS-47: the static api key the bridge is served behind
+    /// (`serve_rest_http`'s `api_key`, checked before the bridge). A
+    /// `Bearer` equal to it is the admission key, not a session token: the
+    /// session validator is not asked of it.
+    pub fn with_api_key(mut self, api_key: Option<String>) -> Self {
+        self.api_key = api_key;
+        self
+    }
+
     /// Convert this bridge into an Axum router
     pub fn into_router(self) -> Router {
-        schemas_to_rest_routes(self.activation, self.schemas, self.route_fn, self.route_as, self.validator)
+        schemas_to_rest_routes(self.activation, self.schemas, self.route_fn, self.route_as, self.validator, self.api_key)
     }
 }

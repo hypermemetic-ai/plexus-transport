@@ -29,9 +29,21 @@ answer as the WebSocket does.
 - `ActivationRestBridge::with_session_validator`: the REST bridge names each
   request's caller as the WebSocket's upgrade does — its `Cookie`, then its
   `Authorization: Bearer` token, to the session validator. A `Bearer` it
-  refuses is a 401 (`unauthenticated`); none is the anonymous caller. The
-  static api key (`serve_rest_http`'s `api_key`) rides `Authorization` too,
-  so a service using both names its REST callers by cookie.
+  refuses is a 401 (`unauthenticated`); none is the anonymous caller.
+- **The api key and the validator together** (`ActivationRestBridge::with_api_key`,
+  set by `serve_rest_http` / `serve_rest_http_as` from their `api_key`): a
+  `Bearer` that matched the api key is the admission key, not a session
+  token, and is never handed to the validator. With no cookie the caller is
+  anonymous — as every REST call was before RETURNS-47, so an api-key
+  deployment answers as it did after `TransportServer` hands REST the
+  socket's validator — and with a valid cookie the cookie's caller. A
+  session token sent as the `Bearer` with no api key is refused by the key
+  (401), as any request without it is.
+- **CSRF, pinned:** the REST router reads only `application/json` (a form,
+  `text/plain` or multipart POST is 415 before the method runs, cookie or
+  not) and answers a CORS preflight with no CORS headers, so a page on
+  another origin cannot call as a cookie's caller. A CORS layer added there
+  must come with a CSRF check; the router says so.
 - `RouteAsFn` and `ActivationRestBridge::with_router_as`: a route with the
   caller (`hub.route_with_ctx(&method, params, auth.as_ref(), None)`), so a
   REST call over a service is admitted by its gate and runs in its context:

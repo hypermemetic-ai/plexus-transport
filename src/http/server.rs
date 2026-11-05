@@ -204,6 +204,9 @@ pub async fn serve_rest_http_as<A: Activation>(
         Some(v) => bridge.with_session_validator(v),
         None => bridge,
     };
+    // RETURNS-47: the key `auth_middleware` checks rides `Authorization`;
+    // the bridge does not take it for a session token.
+    let bridge = bridge.with_api_key(api_key.clone());
 
     // Build router
     let rest_router = bridge.into_router();
