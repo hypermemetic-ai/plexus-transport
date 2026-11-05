@@ -35,6 +35,18 @@ pub type RouteFn = Arc<
         + Sync,
 >;
 
+/// RETURNS-47: [`RouteFn`] with the caller — the `AuthContext` the bridge
+/// named from the request (none: anonymous), handed to the service's route
+/// (`hub.route_with_ctx(&method, params, auth.as_ref(), None)`), so a call
+/// through the bridge is admitted, gated and run in its context as one over
+/// the WebSocket is. A [`RouteFn`] names no caller: every call through it is
+/// anonymous.
+pub type RouteAsFn = Arc<
+    dyn Fn(String, Value, Option<plexus_core::plexus::AuthContext>) -> Pin<Box<dyn Future<Output = Result<PlexusStream, PlexusError>> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Z2H-6: builder-level configuration for boot-time registry
 /// self-registration. All fields are overrides; `Default` means
 /// "registration ON, endpoint from `PLEXUS_REGISTRY_URL` (default
@@ -86,6 +98,9 @@ pub struct TransportServer<A: Activation> {
     /// calls via hub.route().
     #[cfg_attr(not(any(feature = "mcp", feature = "http-gateway")), allow(dead_code))]
     route_fn: Option<RouteFn>,
+    /// RETURNS-47: the REST bridge's route with the caller.
+    #[cfg_attr(not(feature = "http-gateway"), allow(dead_code))]
+    route_as_fn: Option<RouteAsFn>,
     /// Optional session validator for cookie-based authentication.
     /// When set, validates cookies from HTTP upgrade requests.
     session_validator: Option<Arc<dyn SessionValidator>>,
@@ -273,7 +288,18 @@ impl<A: Activation> TransportServer<A> {
         let rest_handle: Option<JoinHandle<std::result::Result<(), std::io::Error>>> =
             if let Some(rest_config) = self.config.rest_http {
                 let api_key = self.config.api_key.clone();
-                Some(crate::http::serve_rest_http(self.activation.clone(), self.flat_schemas.clone(), self.route_fn.clone(), rest_config, api_key).await?)
+                Some(
+                    crate::http::server::serve_rest_http_as(
+                        self.activation.clone(),
+                        self.flat_schemas.clone(),
+                        self.route_fn.clone(),
+                        self.route_as_fn.clone(),
+                        self.session_validator.clone(),
+                        rest_config,
+                        api_key,
+                    )
+                    .await?,
+                )
             } else {
                 None
             };
@@ -420,6 +446,8 @@ pub struct TransportServerBuilder<A: Activation> {
     rpc_converter: Option<RpcConverter<A>>,
     flat_schemas: Option<Vec<PluginSchema>>,
     route_fn: Option<RouteFn>,
+    /// RETURNS-47: set by `.with_route_as_fn()`.
+    route_as_fn: Option<RouteAsFn>,
     session_validator: Option<Arc<dyn SessionValidator>>,
     /// RED-4: opt-out of the build-time check that refuses to start the
     /// server when activations declare auth-gated methods but no auth
@@ -490,6 +518,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             rpc_converter: Some(Box::new(rpc_converter)),
             flat_schemas: None,
             route_fn: None,
+            route_as_fn: None,
             session_validator: None,
             allow_missing_auth: false,
             reject_upgrade_on_auth_failure: false,
@@ -592,6 +621,16 @@ impl<A: Activation> TransportServerBuilder<A> {
     /// namespaced tool calls (e.g., "loopback.permit") reach the correct child.
     pub fn with_route_fn(mut self, route_fn: RouteFn) -> Self {
         self.route_fn = Some(route_fn);
+        self
+    }
+
+    /// RETURNS-47: the REST bridge's route with the caller — a closure
+    /// wrapping `hub.route_with_ctx(&method, params, auth.as_ref(), None)` —
+    /// and its callers named by [`Self::with_session_validator`], so a REST
+    /// call is admitted, gated and run in its context as a WebSocket call is.
+    /// Preferred over [`Self::with_route_fn`] for REST, which names no caller.
+    pub fn with_route_as_fn(mut self, route_as_fn: RouteAsFn) -> Self {
+        self.route_as_fn = Some(route_as_fn);
         self
     }
 
@@ -937,6 +976,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             rpc_converter: self.rpc_converter,
             flat_schemas: self.flat_schemas,
             route_fn: self.route_fn,
+            route_as_fn: self.route_as_fn,
             session_validator: self.session_validator,
             reject_upgrade_on_auth_failure: self.reject_upgrade_on_auth_failure,
             allowed_origins: self.allowed_origins,

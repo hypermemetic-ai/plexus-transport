@@ -15,8 +15,8 @@ use axum::{
     Json,
 };
 use plexus_core::plexus::{
-    schema::HttpMethod, Activation, Cardinality, ParamProblem, PlexusError, PluginSchema,
-    RemoteError,
+    schema::HttpMethod, Activation, AuthContext, Cardinality, ParamProblem, PlexusError, PluginSchema,
+    RemoteError, SessionValidator,
 };
 use serde_json::Value;
 
@@ -28,6 +28,7 @@ use crate::http::handler::{handle_method_call, remote_error_response, MethodInfo
 /// Canonical definition lives in [`crate::server`] so it is available with or
 /// without the `mcp` feature.
 pub use crate::server::RouteFn;
+pub use crate::server::RouteAsFn;
 
 // =============================================================================
 // Schema → REST Routes Transformation
@@ -97,6 +98,8 @@ fn schemas_to_rest_routes<A>(
     activation: Arc<A>,
     schemas: Vec<PluginSchema>,
     route_fn: Option<RouteFn>,
+    route_as: Option<RouteAsFn>,
+    validator: Option<Arc<dyn SessionValidator>>,
 ) -> Router
 where
     A: Activation + 'static,
@@ -105,6 +108,8 @@ where
     let state = Arc::new(RestBridgeState {
         activation,
         route_fn,
+        route_as,
+        validator,
         registry: registry.clone(),
     });
 
@@ -126,7 +131,39 @@ where
 struct RestBridgeState<A: Activation> {
     activation: Arc<A>,
     route_fn: Option<RouteFn>,
+    route_as: Option<RouteAsFn>,
+    validator: Option<Arc<dyn SessionValidator>>,
     registry: MethodRegistry,
+}
+
+/// RETURNS-47: the caller a request names, as the WebSocket's upgrade names
+/// one (AUTHZ-BEARER-1): its `Cookie` header, then its `Authorization:
+/// Bearer` token, each to the session validator; the first it accepts is
+/// the caller. A `Bearer` it refuses (and no cookie it accepts) is a 401,
+/// typed `unauthenticated`; no `Bearer` and no accepted cookie is the
+/// anonymous caller. Without a validator every caller is anonymous.
+async fn identify(
+    validator: Option<&Arc<dyn SessionValidator>>,
+    headers: &axum::http::HeaderMap,
+) -> Result<Option<AuthContext>, Response> {
+    let Some(validator) = validator else { return Ok(None) };
+    if let Some(cookies) = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()) {
+        if let Some(ctx) = validator.validate(cookies).await {
+            return Ok(Some(ctx));
+        }
+    }
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .map(str::trim);
+    match bearer {
+        Some(token) => match validator.validate(token).await {
+            Some(ctx) => Ok(Some(ctx)),
+            None => Err(remote_error_response(RemoteError::Unauthenticated)),
+        },
+        None => Ok(None),
+    }
 }
 
 // =============================================================================
@@ -183,6 +220,12 @@ where
         ).into_response();
     }
 
+    // RETURNS-47: who is calling, before anything of the call is read.
+    let auth = match identify(state.validator.as_ref(), request.headers()).await {
+        Ok(auth) => auth,
+        Err(refused) => return refused,
+    };
+
     // Parse the JSON body after the 404/405 checks so verb mismatches are
     // reported even without a body. A body that is not JSON → 400 with a
     // typed `invalid_params`; any other rejection (e.g. a missing
@@ -205,15 +248,24 @@ where
         cardinality: rest_method_info.cardinality,
     };
 
-    // Call the method via activation or route_fn
-    let stream_result = if let Some(route_fn) = &state.route_fn {
-        // Hub activation: use route_fn to dispatch
+    // Call the method: through the service's route (the gate first, the
+    // caller handed over), through a caller-less route, or — one activation
+    // and no service — as a service with no gate dispatches it.
+    let stream_result = if let Some(route_as) = &state.route_as {
+        // RETURNS-47: the service's route, as the caller the request names.
+        route_as(format!("{}.{}", namespace, method), params, auth).await
+    } else if let Some(route_fn) = &state.route_fn {
+        // Hub activation: use route_fn to dispatch (it names no caller: the
+        // call is anonymous).
         let full_method = format!("{}.{}", namespace, method);
         route_fn(full_method, params).await
     } else {
-        // Leaf activation: call directly (no auth / raw-request context in the
-        // REST bridge; matches the MCP bridge's call shape)
-        state.activation.call(&method, params, None, None).await
+        // RETURNS-47: the leaf path. The bridge is the whole dispatch — no
+        // service, so no gate — and it runs the call as a service with no
+        // gate runs one: in a context admitting the caller everywhere
+        // (`call::ungated`). `Activation::call` alone runs in no context, where
+        // a method reading `reach` or `caller()` is refused.
+        plexus_core::call::ungated(&*state.activation, &method, params, auth.as_ref(), None).await
     };
 
     // Handle the result
@@ -247,6 +299,8 @@ pub struct ActivationRestBridge<A: Activation> {
     activation: Arc<A>,
     schemas: Vec<PluginSchema>,
     route_fn: Option<RouteFn>,
+    route_as: Option<RouteAsFn>,
+    validator: Option<Arc<dyn SessionValidator>>,
     #[allow(dead_code)]
     server_name: Option<String>,
     #[allow(dead_code)]
@@ -261,6 +315,8 @@ impl<A: Activation> ActivationRestBridge<A> {
             activation,
             schemas,
             route_fn: None,
+            route_as: None,
+            validator: None,
             server_name: None,
             server_version: None,
         }
@@ -281,6 +337,8 @@ impl<A: Activation> ActivationRestBridge<A> {
             activation,
             schemas,
             route_fn: None,
+            route_as: None,
+            validator: None,
             server_name,
             server_version,
         }
@@ -294,8 +352,29 @@ impl<A: Activation> ActivationRestBridge<A> {
         self
     }
 
+    /// RETURNS-47: route calls through the service as the caller each
+    /// request names (`hub.route_with_ctx(&method, params, auth.as_ref(),
+    /// None)`): the gate decides first, and the call runs in its context, as
+    /// over the WebSocket. Preferred over [`Self::with_router`], which names
+    /// no caller.
+    pub fn with_router_as(mut self, route_as: RouteAsFn) -> Self {
+        self.route_as = Some(route_as);
+        self
+    }
+
+    /// RETURNS-47: name each request's caller with `validator` — its
+    /// `Cookie`, then its `Authorization: Bearer` token, as the WebSocket's
+    /// upgrade does (the same validator names the same caller on both). A
+    /// `Bearer` it refuses is a 401; none is the anonymous caller. The static
+    /// api key of `serve_rest_http` also rides `Authorization`, so a service
+    /// that uses both names its REST callers by cookie.
+    pub fn with_session_validator(mut self, validator: Arc<dyn SessionValidator>) -> Self {
+        self.validator = Some(validator);
+        self
+    }
+
     /// Convert this bridge into an Axum router
     pub fn into_router(self) -> Router {
-        schemas_to_rest_routes(self.activation, self.schemas, self.route_fn)
+        schemas_to_rest_routes(self.activation, self.schemas, self.route_fn, self.route_as, self.validator)
     }
 }

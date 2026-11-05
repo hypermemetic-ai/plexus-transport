@@ -157,6 +157,23 @@ pub async fn serve_rest_http<A: Activation>(
     config: RestHttpConfig,
     api_key: Option<String>,
 ) -> Result<JoinHandle<std::result::Result<(), std::io::Error>>> {
+    serve_rest_http_as(activation, flat_schemas, route_fn, None, None, config, api_key).await
+}
+
+/// RETURNS-47: [`serve_rest_http`] naming each request's caller with
+/// `validator` and routing through `route_as` with it (see
+/// [`ActivationRestBridge::with_router_as`] and
+/// [`ActivationRestBridge::with_session_validator`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn serve_rest_http_as<A: Activation>(
+    activation: Arc<A>,
+    flat_schemas: Option<Vec<PluginSchema>>,
+    route_fn: Option<RouteFn>,
+    route_as: Option<crate::server::RouteAsFn>,
+    validator: Option<Arc<dyn plexus_core::plexus::SessionValidator>>,
+    config: RestHttpConfig,
+    api_key: Option<String>,
+) -> Result<JoinHandle<std::result::Result<(), std::io::Error>>> {
     tracing::info!(
         "Starting REST HTTP server at http://{} (server: {}, version: {})",
         config.addr,
@@ -177,6 +194,15 @@ pub async fn serve_rest_http<A: Activation>(
         bridge.with_router(rf)
     } else {
         bridge
+    };
+    // RETURNS-47: the route with the caller, and who the caller is.
+    let bridge = match route_as {
+        Some(ra) => bridge.with_router_as(ra),
+        None => bridge,
+    };
+    let bridge = match validator {
+        Some(v) => bridge.with_session_validator(v),
+        None => bridge,
     };
 
     // Build router
