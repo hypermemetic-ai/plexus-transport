@@ -95,7 +95,8 @@ pub use mcp::{bridge::ActivationMcpBridge, session::SqliteSessionManager};
 pub use mcp::bridge::ActivationMcpBridge;
 
 // RouteFn feeds both the MCP and REST bridges; always available.
-pub use server::RouteFn;
+// RETURNS-47: RouteAsFn is the REST bridge's, with the caller.
+pub use server::{RouteAsFn, RouteFn};
 
 // Re-export REST HTTP bridge for advanced usage
 #[cfg(feature = "http-gateway")]

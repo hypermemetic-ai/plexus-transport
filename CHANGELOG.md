@@ -3,6 +3,57 @@
 All notable changes to plexus-transport are documented here. This file starts
 at 0.6.0; earlier changes are in the git history.
 
+## [Unreleased]
+
+RETURNS-47, on plexus-core's call context (`plexus_core::call`): the bridges
+answer as the WebSocket does.
+
+### Changed
+
+- **The leaf path runs in a call context.** With one activation and no
+  route, the REST bridge and the legacy `ActivationMcpBridge` call
+  `plexus_core::call::ungated` instead of `Activation::call`: the bridge is
+  the whole dispatch — no service, so no gate — and runs the call as a
+  service with no gate runs one, its caller admitted everywhere. (Called
+  alone, `Activation::call` runs in no context, where a method reading
+  `reach: Reach` or `call::caller()` is refused.) `ungated` names exactly
+  that: a call that passes through a gate goes through the service's route
+  (`with_router_as`, `with_route_fn`, the mounted MCP bridge), never through
+  it.
+- The legacy `ActivationMcpBridge` names no caller: every call through it is
+  anonymous, as before. The bridge that names one is the mounted bridge
+  (`with_mcp`, TRANSPORT-16), through the service's route.
+
+### Added
+
+- `ActivationRestBridge::with_session_validator`: the REST bridge names each
+  request's caller as the WebSocket's upgrade does — its `Cookie`, then its
+  `Authorization: Bearer` token, to the session validator. A `Bearer` it
+  refuses is a 401 (`unauthenticated`); none is the anonymous caller.
+- **The api key and the validator together** (`ActivationRestBridge::with_api_key`,
+  set by `serve_rest_http` / `serve_rest_http_as` from their `api_key`): a
+  `Bearer` that matched the api key is the admission key, not a session
+  token, and is never handed to the validator. With no cookie the caller is
+  anonymous — as every REST call was before RETURNS-47, so an api-key
+  deployment answers as it did after `TransportServer` hands REST the
+  socket's validator — and with a valid cookie the cookie's caller. A
+  session token sent as the `Bearer` with no api key is refused by the key
+  (401), as any request without it is.
+- **CSRF, pinned:** the REST router reads only `application/json` (a form,
+  `text/plain` or multipart POST is 415 before the method runs, cookie or
+  not) and answers a CORS preflight with no CORS headers, so a page on
+  another origin cannot call as a cookie's caller. A CORS layer added there
+  must come with a CSRF check; the router says so.
+- `RouteAsFn` and `ActivationRestBridge::with_router_as`: a route with the
+  caller (`hub.route_with_ctx(&method, params, auth.as_ref(), None)`), so a
+  REST call over a service is admitted by its gate and runs in its context:
+  an admitted caller answered within its reach, an anonymous one 401, one
+  without the grant 403. `with_router` (`RouteFn`) names no caller: its calls
+  are anonymous.
+- `TransportServerBuilder::with_route_as_fn`, and
+  `http::server::serve_rest_http_as`: the builder's REST bridge takes the
+  route with the caller and the builder's session validator.
+
 ## [0.7.0]
 
 ### Breaking

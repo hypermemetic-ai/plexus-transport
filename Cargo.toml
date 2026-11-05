@@ -97,6 +97,8 @@ schemars = { path = "../plexus-macros", package = "plexus-macros", features = ["
 plexus-core = { path = "../plexus-core", version = "0.8.0" }
 # BIDIR-6: tests/duplex_wire.rs's activation; a crate of its own, see its manifest.
 duplex-fixture = { path = "tests/duplex_fixture" }
+# RETURNS-47: activations that read their caller, for tests/returns47_bridges.rs.
+returns47-fixture = { path = "tests/returns47_fixture" }
 
 # TRANSPORT-17: each is its own child, `serve_stdio` on its own stdout, so
 # libtest's lines stay off that stdout.

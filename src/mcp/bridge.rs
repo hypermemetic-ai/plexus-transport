@@ -353,8 +353,12 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
             } else {
                 method_name
             };
-            self.activation
-                .call(method, arguments_value, None, None)
+            // RETURNS-47: the leaf path. This bridge names no caller, and
+            // with no service there is no gate: the call runs as a service
+            // with no gate runs one, anonymous and admitted everywhere
+            // (`call::ungated`). `Activation::call` alone runs in no context,
+            // where a method reading `reach` or `caller()` is refused.
+            plexus_core::call::ungated(&*self.activation, method, arguments_value, None, None)
                 .await
                 .map_err(plexus_to_mcp_error)?
         };
