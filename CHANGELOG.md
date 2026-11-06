@@ -5,6 +5,21 @@ at 0.6.0; earlier changes are in the git history.
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-11-06
+
+PLEXUS-46: on plexus-core 0.9 (RETURNS-47's call context, PLEXUS-45's wasm32
+core) and, under `mcp`, plexus-transport-mcp 0.3 (plexus-client 0.9) —
+a new minor because plexus-core's types are in this crate's API. Carries
+TRANSPORT-26 and RETURNS-47 below.
+
+### Changed
+
+- plexus-core 0.8 → **0.9**; plexus-transport-mcp 0.2 → **0.3** (feature
+  `mcp`). A service moves its plexus-core (or plexus-rpc) to 0.9 with it.
+- `scripts/check-rmcp.sh` (TRANSPORT-23's guard) holds `mcp` to one rmcp 3.x
+  at or above the 3.8 the manifests ask for, not to 3.8.x: rmcp 3.9.0 is out
+  and a fresh resolve takes it.
+
 TRANSPORT-26: the transport serves https itself.
 
 ### Added
