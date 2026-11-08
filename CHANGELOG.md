@@ -5,6 +5,34 @@ at 0.6.0; earlier changes are in the git history.
 
 ## [Unreleased]
 
+## [0.9.0] — unreleased
+
+ASK-5: on plexus-core 0.10 (ASK-2: bidir out, a method that asks
+proposes) and, under `mcp`, plexus-transport-mcp 0.4 (plexus-client 0.10) —
+a new minor because plexus-core's types (`PlexusStreamItem`) are in this
+crate's API.
+
+### Breaking
+
+| Change | Before (0.8.0) | After | What to do |
+|---|---|---|---|
+| plexus-core | 0.9 | 0.10 | Move a service's plexus-core (or plexus-rpc) to 0.10 with it |
+| plexus-transport-mcp (feature `mcp`) | 0.3 | 0.4 | Nothing beyond plexus-client 0.10 |
+| `PlexusStreamItem::Request` (bidir's in-call question) | the REST bridge logged it, SSE sent `event: warning`, the MCP activation bridge sent it as a logging notification | gone: plexus-core 0.10 has no such item and no `{ns}.respond` | A method that needs its caller's yes is marked `asks` and proposes (`needs_input`) |
+
+### Added
+
+- A `needs_input` item (a proposal) on either MCP bridge is a successful
+  tool result saying nothing was done, what would happen (summary,
+  effects, fields), and that calling the same tool again with the same
+  arguments plus `confirm: <token>` (and each field's value) carries it
+  out — plexus-transport-mcp's `proposal::result`; no elicitation. The
+  WebSocket and REST carry it as any `data` item.
+- `tests/ask_wire.rs`: a method that asks, proposing then confirming, over
+  the WebSocket, MCP mounted over the service and the legacy activation
+  bridge. Spec/10's input half (`DuplexGate`, the duplex fixture) and
+  spec/14's symmetric connection are unchanged.
+
 ## [0.8.0] — 2026-11-06
 
 PLEXUS-46: on plexus-core 0.9 (RETURNS-47's call context, PLEXUS-45's wasm32

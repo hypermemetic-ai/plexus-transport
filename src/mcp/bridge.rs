@@ -14,6 +14,7 @@
 //! | data | `{"type": "data", "content_type", "data": <content>}` | buffered into the success result |
 //! | progress | `{"type": "progress", "content_type", "content": <P>}` (plus `notifications/progress` when the caller sent a progress token) | — |
 //! | error | `{"type": "error", "error": <RemoteError>, "recoverable"}` | a non-recoverable one makes it an error result: text = `RemoteError`'s `Display`, structured content = the `RemoteError` JSON |
+//! | data that is a proposal (`needs_input`, ASK-5) | as any data | plexus-transport-mcp's [`proposal::result`](plexus_transport_mcp::proposal::result): nothing was done, what would happen, and the same tool again with `confirm` to carry it out |
 //!
 //! A call rejected before its stream starts answers a JSON-RPC error built
 //! by `plexus_error_to_jsonrpc`: `{code, message: <Display>, data:
@@ -296,6 +297,9 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
             .unwrap_or_else(|| serde_json::Map::new());
 
         tracing::debug!("Calling tool: {} with args: {:?}", method_name, arguments_map);
+        // ASK-5: the arguments as the caller sent them, before any connection
+        // metadata is added — what a proposal's confirming call repeats.
+        let sent = serde_json::Value::Object(arguments_map.clone());
 
         // Extract HTTP connection metadata from extensions and inject into arguments.
         // This makes the gateway transparent: all HTTP-level metadata (query params, headers)
@@ -442,30 +446,16 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                 PlexusStreamItem::Done { .. } => {
                     break;
                 }
-
-                PlexusStreamItem::Request {
-                    request_id,
-                    request_data,
-                    timeout_ms,
-                } => {
-                    // Send bidirectional request to client via logging notification
-                    // Client should respond via _plexus_respond tool
-                    let _ = ctx
-                        .peer
-                        .notify_logging_message(log_param(LoggingLevel::Info, &logger, json!({
-                                "type": "request",
-                                "request_id": request_id,
-                                "request_data": request_data,
-                                "timeout_ms": timeout_ms,
-                            })))
-                        .await;
-                }
             }
         }
 
         // Return buffered data in the final result
         if let Some(error) = fatal {
             Ok(remote_error_tool_result(&error).into())
+        } else if let Some(p) = buffered_data.iter().find_map(plexus_transport_mcp::proposal::needs_input).cloned() {
+            // ASK-5: a proposal — what would happen, and the same tool again
+            // with `confirm` to carry it out (plexus-transport-mcp's result).
+            Ok(plexus_transport_mcp::proposal::result(method_name, &sent, &p, buffered_data).into())
         } else {
             // Convert buffered data to content
             let text_content = if buffered_data.is_empty() {

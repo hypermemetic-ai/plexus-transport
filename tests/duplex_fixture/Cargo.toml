@@ -11,9 +11,9 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-plexus-core = { path = "../../../plexus-core", version = "0.9.0" }
-plexus-macros = { path = "../../../plexus-macros", version = "0.9.0" }
-plexus-client = { path = "../../../plexus-macros/plexus-client", version = "0.9.0", features = ["ws-native"] }
+plexus-core = { path = "../../../plexus-core", version = "0.10.0" }
+plexus-macros = { path = "../../../plexus-macros", version = "0.10.0" }
+plexus-client = { path = "../../../plexus-macros/plexus-client", version = "0.10.0", features = ["ws-native"] }
 async-stream = "0.3"
 bytes = "1"
 async-trait = "0.1"

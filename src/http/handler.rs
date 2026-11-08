@@ -219,11 +219,6 @@ async fn collect_and_respond(mut stream: PlexusStream) -> Response {
             PlexusStreamItem::Done { .. } => {
                 break;
             }
-            PlexusStreamItem::Request { .. } => {
-                // Bidirectional requests not supported in REST HTTP
-                // This would require WebSocket or long-polling
-                tracing::warn!("Ignoring bidirectional request in REST HTTP transport");
-            }
         }
     }
 
@@ -305,17 +300,6 @@ async fn stream_sse_response(stream: PlexusStream) -> Response {
                 Ok(Event::default()
                     .event("done")
                     .data("{}"))
-            }
-            PlexusStreamItem::Request { request_id, .. } => {
-                // Bidirectional requests not supported in REST HTTP
-                tracing::warn!(
-                    "Ignoring bidirectional request in REST HTTP transport (id: {})",
-                    request_id
-                );
-                // Send a warning event
-                Ok(Event::default()
-                    .event("warning")
-                    .data("Bidirectional requests not supported in REST HTTP transport"))
             }
         }
     });
