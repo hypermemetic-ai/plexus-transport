@@ -1,6 +1,6 @@
 [package]
 name = "plexus-transport"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 license = "MIT"
 description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
@@ -11,7 +11,7 @@ include = ["src/**", "README.md", "LICENSE", "Cargo.toml"]
 
 [dependencies]
 # Core dependencies
-plexus-core = { path = "../plexus-core", version = "0.9.0" }
+plexus-core = { path = "../plexus-core", version = "0.10.0" }
 tokio = { version = "1.53", features = ["full"] }
 futures = "0.3"
 async-stream = "0.3"
@@ -45,7 +45,7 @@ log = "0.4"
 rmcp = { version = "3.8", default-features = false, features = ["server", "transport-streamable-http-server"], optional = true }
 # TRANSPORT-16: the bridge as a client of the RPC, mounted in-process over
 # HubTransport (`TransportServerBuilder::with_mcp`).
-plexus-transport-mcp = { path = "../plexus-transport-mcp", version = "0.3", default-features = false, optional = true }
+plexus-transport-mcp = { path = "../plexus-transport-mcp", version = "0.4", default-features = false, optional = true }
 
 # HTTP server
 axum = "0.8.9"
@@ -100,7 +100,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 # depending on the same crate under two names, so tests import PlexusRequest
 # through the alias too: `use schemars::PlexusRequest;`.)
 schemars = { path = "../plexus-macros", package = "plexus-macros", features = ["schemars-compat"] }
-plexus-core = { path = "../plexus-core", version = "0.9.0" }
+plexus-core = { path = "../plexus-core", version = "0.10.0" }
 # BIDIR-6: tests/duplex_wire.rs's activation; a crate of its own, see its manifest.
 duplex-fixture = { path = "tests/duplex_fixture" }
 # RETURNS-47: activations that read their caller, for tests/returns47_bridges.rs.

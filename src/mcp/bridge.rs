@@ -442,24 +442,6 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
                 PlexusStreamItem::Done { .. } => {
                     break;
                 }
-
-                PlexusStreamItem::Request {
-                    request_id,
-                    request_data,
-                    timeout_ms,
-                } => {
-                    // Send bidirectional request to client via logging notification
-                    // Client should respond via _plexus_respond tool
-                    let _ = ctx
-                        .peer
-                        .notify_logging_message(log_param(LoggingLevel::Info, &logger, json!({
-                                "type": "request",
-                                "request_id": request_id,
-                                "request_data": request_data,
-                                "timeout_ms": timeout_ms,
-                            })))
-                        .await;
-                }
             }
         }
 
