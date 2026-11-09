@@ -3,7 +3,18 @@
 All notable changes to plexus-transport are documented here. This file starts
 at 0.6.0; earlier changes are in the git history.
 
-## [Unreleased]
+## [0.10.0] — unreleased
+
+NEST-24: on plexus-core 0.11 (NEST-15, NEST-16, DYNAUTH-5..8, NEST-21) and,
+under `mcp`, plexus-transport-mcp 0.5 (plexus-client 0.11) — a new minor
+because plexus-core's types are in this crate's API.
+
+### Breaking
+
+| Change | Before (0.9.0) | After | What to do |
+|---|---|---|---|
+| plexus-core | 0.10 | 0.11 | Move a service's plexus-core (or plexus-rpc) to 0.11 with it |
+| plexus-transport-mcp (`mcp`) | 0.4 | 0.5 | Nothing beyond the plexus-client move |
 
 DYNAUTH-8 (TM-2): **no credential in a log.** The stdio transport's frame
 logs (`Received request`, `Sending response`, `Forwarding notification`, at

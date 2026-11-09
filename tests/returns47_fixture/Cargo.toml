@@ -12,9 +12,9 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-plexus-core = { path = "../../../plexus-core", version = "0.10.0" }
-plexus-macros = { path = "../../../plexus-macros", version = "0.10.0" }
-plexus-client = { path = "../../../plexus-macros/plexus-client", version = "0.10.0" }
+plexus-core = { path = "../../../plexus-core", version = "0.11.0" }
+plexus-macros = { path = "../../../plexus-macros", version = "0.11.0" }
+plexus-client = { path = "../../../plexus-macros/plexus-client", version = "0.11.0" }
 plexus-auth-core = { path = "../../../plexus-auth-core" }
 async-trait = "0.1"
 futures = "0.3"
