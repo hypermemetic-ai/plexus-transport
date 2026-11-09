@@ -24,6 +24,8 @@ use ws_support::*;
 
 const TOKEN: &str = "mgs_secretSessionToken0123456789";
 const MINTED: &str = "mgs_mintedByTheCall9876543210";
+/// DYNAUTH-8: an outside credential a call carries in its params.
+const CARRIED: &str = "mgs_carriedInTheParams55555";
 
 #[derive(Clone, Default)]
 struct Captured(Arc<Mutex<Vec<u8>>>);
@@ -69,6 +71,7 @@ async fn a_trace_run_logs_no_credential() {
 
     let mut module = RpcModule::new(());
     module.register_method("ping", |_, _, _| "pong").unwrap();
+    module.register_method("echo", |p, _, _| p.parse::<serde_json::Value>().unwrap_or_default()).unwrap();
     // As `session.login` does: a call whose answer carries a credential.
     module
         .register_subscription("mint", "mint", "unmint", |_, pending: PendingSubscriptionSink, _, _| async move {
@@ -98,6 +101,8 @@ async fn a_trace_run_logs_no_credential() {
         let call = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": []}).to_string();
         s.write_all(&client_frame(0x1, true, call.as_bytes())).await.unwrap();
     }
+    let call = json!({"jsonrpc": "2.0", "id": 3, "method": "echo", "params": {"credential": {"token": CARRIED}, "authorization": format!("Bearer {CARRIED}")}}).to_string();
+    s.write_all(&client_frame(0x1, true, call.as_bytes())).await.unwrap();
     let mut minted = false;
     for _ in 0..4 {
         match raw_next_text(&mut s, Duration::from_secs(5)).await {
@@ -117,7 +122,7 @@ async fn a_trace_run_logs_no_credential() {
 
     let text = String::from_utf8_lossy(&log.0.lock().unwrap()).to_string();
     assert!(!text.is_empty(), "trace is on: something is logged");
-    let leaks: Vec<&str> = ["Bearer", "mgs_", TOKEN, MINTED]
+    let leaks: Vec<&str> = ["Bearer", "mgs_", TOKEN, MINTED, CARRIED]
         .into_iter()
         .filter(|w| text.contains(w))
         .chain([hex(TOKEN), hex(MINTED), hex("mgs_")].iter().filter(|h| text.contains(h.as_str())).map(|_| "a credential as hex"))

@@ -44,7 +44,7 @@ async fn auth_middleware(
         if !ok {
             tracing::warn!(
                 "MCP HTTP auth rejected: missing or invalid Authorization header (uri={})",
-                request.uri()
+                plexus_core::plexus::redact::redact_str(&request.uri().to_string())
             );
             return (
                 StatusCode::UNAUTHORIZED,
@@ -68,10 +68,10 @@ async fn log_request_middleware(request: Request, next: Next) -> Response {
 
     tracing::info!("▶▶▶ MCP HTTP REQUEST ▶▶▶");
     tracing::info!("  Method: {}", method);
-    tracing::info!("  URI: {}", uri);
+    tracing::info!("  URI: {}", plexus_core::plexus::redact::redact_str(&uri.to_string()));
     tracing::info!("  Headers:");
     for (name, value) in headers.iter() {
-        tracing::info!("    {}: {:?}", name, value);
+        tracing::info!("    {}", plexus_core::plexus::redact::redact_str(&format!("{name}: {value:?}")));
     }
 
     let response = next.run(request).await;
@@ -93,12 +93,12 @@ async fn fallback_handler(request: Request) -> impl IntoResponse {
     tracing::error!("║  UNMATCHED REQUEST - NO ROUTE FOUND                      ║");
     tracing::error!("╚══════════════════════════════════════════════════════════╝");
     tracing::error!("  Method: {}", method);
-    tracing::error!("  URI: {}", uri);
+    tracing::error!("  URI: {}", plexus_core::plexus::redact::redact_str(&uri.to_string()));
     tracing::error!("  Path: {}", uri.path());
-    tracing::error!("  Query: {:?}", uri.query());
+    tracing::error!("  Query: {}", plexus_core::plexus::redact::redact_str(&format!("{:?}", uri.query())));
     tracing::error!("  Headers:");
     for (name, value) in headers.iter() {
-        tracing::error!("    {}: {:?}", name, value);
+        tracing::error!("    {}", plexus_core::plexus::redact::redact_str(&format!("{name}: {value:?}")));
     }
 
     let body_hint = if method == axum::http::Method::POST {

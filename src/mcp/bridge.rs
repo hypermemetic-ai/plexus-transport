@@ -295,21 +295,21 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
             .arguments
             .unwrap_or_else(|| serde_json::Map::new());
 
-        tracing::debug!("Calling tool: {} with args: {:?}", method_name, arguments_map);
+        tracing::debug!("Calling tool: {} with args: {}", method_name, plexus_core::plexus::redact::redact_str(&format!("{arguments_map:?}")));
 
         // Extract HTTP connection metadata from extensions and inject into arguments.
         // This makes the gateway transparent: all HTTP-level metadata (query params, headers)
         // is forwarded to the backend without the gateway needing to know what it means.
         tracing::debug!("[MCP BRIDGE] call_tool: method={}, checking for HTTP metadata...", method_name);
         if let Some(parts) = ctx.extensions.get::<http::request::Parts>() {
-            tracing::debug!("[MCP BRIDGE] Found HTTP Parts! URI: {}", parts.uri);
+            tracing::debug!("[MCP BRIDGE] Found HTTP Parts! URI: {}", plexus_core::plexus::redact::redact_str(&parts.uri.to_string()));
             let mut connection_meta = serde_json::Map::new();
 
             // Forward ALL query parameters
             if let Some(query) = parts.uri.query() {
-                tracing::debug!("[MCP BRIDGE] Query string: {}", query);
+                tracing::debug!("[MCP BRIDGE] Query string: {}", plexus_core::plexus::redact::redact_str(query));
                 for (key, value) in form_urlencoded::parse(query.as_bytes()) {
-                    tracing::debug!("[MCP BRIDGE] Query param: {}={}", key, value);
+                    tracing::debug!("[MCP BRIDGE] Query param: {}", plexus_core::plexus::redact::redact_str(&format!("{key}={value}")));
                     connection_meta.insert(
                         format!("query.{}", key),
                         json!(value.to_string()),
@@ -322,8 +322,8 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
             // If we extracted any connection metadata, inject it
             if !connection_meta.is_empty() {
                 arguments_map.insert("_connection".to_string(), json!(connection_meta));
-                tracing::debug!("[MCP BRIDGE] Injected connection metadata: {:?}", connection_meta);
-                tracing::debug!("Injected connection metadata: {:?}", connection_meta);
+                tracing::debug!("[MCP BRIDGE] Injected connection metadata: {}", plexus_core::plexus::redact::redact_str(&format!("{connection_meta:?}")));
+                tracing::debug!("Injected connection metadata: {}", plexus_core::plexus::redact::redact_str(&format!("{connection_meta:?}")));
             } else {
                 tracing::debug!("[MCP BRIDGE] No connection metadata to inject");
             }
