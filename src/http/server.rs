@@ -61,7 +61,7 @@ async fn host_middleware(
     next: Next,
 ) -> Response {
     if let Some(host) = crate::host::refused(&hosts, &request) {
-        tracing::warn!(host = %host, uri = %request.uri(), "REST HTTP refused: host not allowed");
+        tracing::warn!(host = %host, uri = %plexus_core::plexus::redact::redact_str(&request.uri().to_string()), "REST HTTP refused: host not allowed");
         return (StatusCode::MISDIRECTED_REQUEST, crate::host::REFUSAL).into_response();
     }
     next.run(request).await
@@ -72,12 +72,12 @@ async fn log_request_middleware(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
 
-    tracing::debug!("REST HTTP {} {}", method, uri);
+    tracing::debug!("REST HTTP {} {}", method, plexus_core::plexus::redact::redact_str(&uri.to_string()));
 
     let response = next.run(request).await;
     let status = response.status();
 
-    tracing::debug!("REST HTTP {} {} -> {}", method, uri, status);
+    tracing::debug!("REST HTTP {} {} -> {}", method, plexus_core::plexus::redact::redact_str(&uri.to_string()), status);
 
     response
 }

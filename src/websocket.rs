@@ -612,7 +612,7 @@ where
             return Box::pin(async move { socket.oneshot(req).await.map(|r| r.map(axum::body::Body::new)) });
         }
         if let Some(host) = crate::host::refused(&self.hosts, &req) {
-            tracing::warn!(host = %host, uri = %req.uri(), "request refused: host not allowed");
+            tracing::warn!(host = %host, uri = %plexus_core::plexus::redact::redact_str(&req.uri().to_string()), "request refused: host not allowed");
             let r = http::Response::builder()
                 .status(http::StatusCode::MISDIRECTED_REQUEST)
                 .header(http::header::CONTENT_TYPE, "text/plain")
@@ -969,7 +969,7 @@ pub(crate) mod auth {
             // A page that rebinds its own name to this address names its
             // own host: it gets nothing, not even the metadata.
             if let Some(host) = crate::host::refused(&self.allowed_hosts, &request) {
-                tracing::warn!(host = %host, uri = %request.uri(), "WS request refused: host not allowed");
+                tracing::warn!(host = %host, uri = %plexus_core::plexus::redact::redact_str(&request.uri().to_string()), "WS request refused: host not allowed");
                 return Box::pin(async move { Ok(misdirected()) });
             }
 
@@ -982,7 +982,7 @@ pub(crate) mod auth {
             // Before any credential is read: a page from another origin on
             // the same host would otherwise carry the person's cookies.
             if let Some(origin) = origin_refused(&self.allowed_origins, request.headers()) {
-                tracing::warn!(origin = %origin, uri = %request.uri(), "WS upgrade rejected: origin not allowed");
+                tracing::warn!(origin = %origin, uri = %plexus_core::plexus::redact::redact_str(&request.uri().to_string()), "WS upgrade rejected: origin not allowed");
                 return Box::pin(async move { Ok(forbidden("Forbidden: origin not allowed")) });
             }
 
@@ -1010,7 +1010,7 @@ pub(crate) mod auth {
                         // Header present but value mismatched. Per AUTHZ-BEARER-1
                         // §"Required behavior" step 1: reject with "api key invalid".
                         tracing::warn!(
-                            uri = %request.uri(),
+                            uri = %plexus_core::plexus::redact::redact_str(&request.uri().to_string()),
                             header = %self.api_key_header,
                             "WS upgrade rejected: api key invalid"
                         );
@@ -1046,7 +1046,7 @@ pub(crate) mod auth {
                             // api_key header had matched. Fall through.
                         } else {
                             tracing::warn!(
-                                uri = %request.uri(),
+                                uri = %plexus_core::plexus::redact::redact_str(&request.uri().to_string()),
                                 header = %self.api_key_header,
                                 "WS upgrade rejected: api key required"
                             );
@@ -1140,7 +1140,7 @@ pub(crate) mod auth {
                             // AUTH-6: a credential was presented and is bad:
                             // only its absence is the anonymous view.
                             tracing::warn!(
-                                uri = %request.uri(),
+                                uri = %plexus_core::plexus::redact::redact_str(&request.uri().to_string()),
                                 "WS upgrade rejected: presented credential invalid"
                             );
                             Ok(policy.session_unauthorized(
@@ -1153,7 +1153,7 @@ pub(crate) mod auth {
                             // AuthContext; the hub's gate shows the
                             // anonymous view.
                             tracing::debug!(
-                                uri = %request.uri(),
+                                uri = %plexus_core::plexus::redact::redact_str(&request.uri().to_string()),
                                 "WS upgrade: no credential presented; admitted anonymous"
                             );
                             // AUTH-12: within the anonymous quotas.
@@ -1172,7 +1172,7 @@ pub(crate) mod auth {
                                 "Unauthorized: session cookie or bearer required"
                             };
                             tracing::warn!(
-                                uri = %request.uri(),
+                                uri = %plexus_core::plexus::redact::redact_str(&request.uri().to_string()),
                                 attempted_input,
                                 "WS upgrade rejected: SessionValidator produced no AuthContext"
                             );
@@ -1183,13 +1183,13 @@ pub(crate) mod auth {
                             // #[from_auth] still fail-closes at dispatch.
                             if attempted_input {
                                 tracing::warn!(
-                                    uri = %request.uri(),
+                                    uri = %plexus_core::plexus::redact::redact_str(&request.uri().to_string()),
                                     "WS upgrade: credentials present but \
                                      SessionValidator returned None; proceeding without auth"
                                 );
                             } else {
                                 tracing::debug!(
-                                    uri = %request.uri(),
+                                    uri = %plexus_core::plexus::redact::redact_str(&request.uri().to_string()),
                                     "WS upgrade: no Cookie or Bearer present; \
                                      proceeding without auth"
                                 );

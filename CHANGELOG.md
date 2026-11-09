@@ -5,6 +5,17 @@ at 0.6.0; earlier changes are in the git history.
 
 ## [Unreleased]
 
+DYNAUTH-8 (TM-2): **no credential in a log.** The stdio transport's frame
+logs (`Received request`, `Sending response`, `Forwarding notification`, at
+debug) go through plexus-core's redactor (`plexus::redact`): the values of
+`credential`, `authorization`, `token`, `refresh_token`, `client_secret`,
+`code` and their kin become `"…"`. jsonrpsee-core's own whole-request traces
+(`[Methods::raw_json_request] Request: …`, at trace) are dropped around the
+calls the stdio transport makes; every other record goes on to the
+subscriber. The URIs, headers and arguments the REST, MCP and WebSocket
+paths log are redacted the same way (an `Authorization` header, a
+`?token=` or `?code=`). Needs the plexus-core after 0.10.1.
+
 ## [0.9.0] — unreleased
 
 ASK-5 / ASK-1: on plexus-core 0.10 (ASK-2: bidir out, and nothing in its

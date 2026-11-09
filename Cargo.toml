@@ -18,6 +18,9 @@ async-stream = "0.3"
 anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
+# DYNAUTH-8: the stdio transport hides jsonrpsee-core's whole-request traces
+# behind a forwarding subscriber (`span::Current`, which tracing does not re-export).
+tracing-core = "0.1"
 
 # JSON-RPC and WebSocket
 # server-core: jsonrpsee-core's method table (RpcModule, Methods), which
