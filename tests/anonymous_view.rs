@@ -86,8 +86,12 @@ fn anonymous() -> UpgradeOptions {
     }
 }
 
+/// The shell's origin, listed as menger lists it: KEEL-29 refuses a page's
+/// origin on a server that names none.
+const SHELL: &str = "http://127.0.0.1:4456";
+
 fn middleware(options: &UpgradeOptions, v: &Validator, inner: &Inner) -> CombinedAuthMiddleware<Inner> {
-    combined_auth_middleware_with_options(inner.clone(), Some(Arc::new(v.clone())), &[], options)
+    combined_auth_middleware_with_options(inner.clone(), Some(Arc::new(v.clone())), &[SHELL.to_string()], options)
 }
 
 struct Reply {
@@ -283,6 +287,10 @@ fn upgrade_request(extra: &str) -> String {
 async fn on_the_wire() {
     let mut config = WebSocketConfig::new(0);
     config.addr = "127.0.0.1:0".parse().unwrap();
+    // KEEL-29: the shell's origin and the `Host` these requests name, listed
+    // (a default server refuses both).
+    config.allowed_origins = vec![SHELL.into()];
+    config.allowed_hosts = vec!["127.0.0.1".into()];
     let (handle, addr) = serve_websocket_with(
         jsonrpsee::RpcModule::new(()),
         config,
