@@ -449,6 +449,9 @@ pub async fn serve_websocket_with(
         tracing::info!(proxies = ?config.trusted_proxies.nets, "WebSocket: forwarded headers believed from these proxies only");
     }
     crate::ws::cap_frame_logs();
+    // KEEL-29: `*` in a list is no wildcard; only the calls open a listener.
+    crate::host::refuse_star(&config.allowed_origins, "origin")?;
+    crate::host::refuse_star(&config.allowed_hosts, "host")?;
 
     // The middleware is always in: with nothing configured it passes every
     // request through to the upgrade.
@@ -477,8 +480,17 @@ pub async fn serve_websocket_with(
     let listener = TcpListener::bind(config.addr).await?;
     let local_addr = listener.local_addr()?;
     // KEEL-29: no Host list set — on loopback, the loopback names for the
-    // port that was bound; beyond it, none (warned).
-    let allowed_hosts = crate::host::normalized(&crate::host::listener_hosts(&config.allowed_hosts, local_addr));
+    // port that was bound; beyond it, none for the socket (warned), and for
+    // the pages and the own origin the loopback names and the bound address.
+    // `allow_any_host()`: no check, and no origin is the listener's own.
+    let (allowed_hosts, own_hosts) = if config.opened.any_host {
+        (Arc::new(Vec::new()), Arc::new(Vec::new()))
+    } else {
+        (
+            crate::host::normalized(&crate::host::listener_hosts(&config.allowed_hosts, local_addr)),
+            crate::host::normalized(&crate::host::page_hosts(&config.allowed_hosts, local_addr)),
+        )
+    };
     let (stop, server_handle) = crate::ws::stop_channel();
     let middleware = CombinedAuthMiddleware {
         service: crate::ws::Upgrade { shared, stop: stop.clone() },
@@ -487,7 +499,9 @@ pub async fn serve_websocket_with(
         session_validator,
         reject_on_session_failure: options.reject_on_session_failure,
         allowed_origins,
-        allowed_hosts: allowed_hosts.clone(),
+        any_origin: config.opened.any_origin,
+        allowed_hosts,
+        own_hosts: own_hosts.clone(),
         policy,
         quotas: Some(quotas),
         proxies,
@@ -515,7 +529,7 @@ pub async fn serve_websocket_with(
                 socket: middleware,
                 routes: routes.router,
                 socket_path: routes.socket_path.into(),
-                hosts: allowed_hosts,
+                hosts: own_hosts,
                 proxies: proxies_seen.clone(),
             };
             spawn_accept_loop(
@@ -539,6 +553,23 @@ pub(crate) fn client_of(proxies: &crate::proxy::TrustedProxies, conn: &Connectio
         client.secure = true;
     }
     client
+}
+
+/// KEEL-29: the scheme a request on `conn` came by, as the page's origin
+/// would carry it: with no proxy, `https` over this transport's TLS, else
+/// `http`; through a trusted proxy, its `X-Forwarded-Proto` (`https`/`wss`
+/// or `http`/`ws`). `None`: not known — the proxy said nothing or something
+/// else.
+pub(crate) fn scheme_of(proxies: &crate::proxy::TrustedProxies, conn: &Connection, headers: &http::HeaderMap) -> Option<&'static str> {
+    let (client, proto) = proxies.resolve_with_proto(conn.peer().ip(), headers);
+    if !client.via_proxy {
+        return Some(if conn.is_tls() { "https" } else { "http" });
+    }
+    match proto?.to_ascii_lowercase().as_str() {
+        "https" | "wss" => Some("https"),
+        "http" | "ws" => Some("http"),
+        _ => None,
+    }
 }
 
 /// TRANSPORT-26: a host's own routes on the WebSocket's port — a page shell,
@@ -755,11 +786,16 @@ pub(crate) mod auth {
         /// dispatch.
         pub(super) reject_on_session_failure: bool,
         /// IDENTITY-20: normalized allowed origins. KEEL-29: empty admits
-        /// only the listener's own origin; [`crate::host::ANY`] admits any.
+        /// only the listener's own origin.
         pub(super) allowed_origins: Arc<Vec<String>>,
+        /// KEEL-29: `allow_any_origin()` was called.
+        pub(super) any_origin: bool,
         /// ACCESS-25: normalized allowed `Host` values; empty checks nothing
         /// (the listener resolves an unset list first, KEEL-29).
         pub(super) allowed_hosts: Arc<Vec<String>>,
+        /// KEEL-29: the hosts a page of this listener is reached by — an
+        /// origin is the listener's own only on one of them; empty: none is.
+        pub(super) own_hosts: Arc<Vec<String>>,
         /// AUTH-6: the anonymous view, credential cookies, RFC 9728.
         pub(super) policy: Arc<Policy>,
         /// AUTH-12: the connection quotas; `None` counts nothing (the
@@ -890,13 +926,19 @@ pub(crate) mod auth {
     /// service, a CLI — a browser always sends one) is never refused here.
     ///
     /// KEEL-29: with no list, an `Origin` is admitted only when it is the
-    /// listener's own — `http(s)://` and the very `Host` the request names,
-    /// that `Host` on the listener's own (checked) host list: a page this
-    /// port serves. Every other page is refused, so a default server is
-    /// closed to the web. [`crate::host::ANY`] on the list admits any origin.
-    fn origin_refused<B>(allowed: &[String], hosts: &[String], request: &HttpRequest<B>) -> Option<String> {
+    /// listener's own — the scheme the request came by and the very `Host`
+    /// it names, that `Host` on the listener's own hosts: a page this port
+    /// serves. Every other page is refused, so a default server is closed to
+    /// the web. `any` (`allow_any_origin()`) admits any origin.
+    fn origin_refused<B>(
+        allowed: &[String],
+        any: bool,
+        hosts: &[String],
+        scheme: Option<&str>,
+        request: &HttpRequest<B>,
+    ) -> Option<String> {
         let origin = request.headers().get(http::header::ORIGIN)?;
-        if allowed.iter().any(|a| a == crate::host::ANY) {
+        if any {
             return None;
         }
         let Ok(origin) = origin.to_str() else {
@@ -906,21 +948,23 @@ pub(crate) mod auth {
         if allowed.contains(&normalized) {
             return None;
         }
-        if allowed.is_empty() && own_origin(&normalized, hosts, request) {
+        if allowed.is_empty() && own_origin(&normalized, hosts, scheme, request) {
             return None;
         }
         Some(origin.to_string())
     }
 
-    /// KEEL-29: `origin` (normalized) is this listener's own: its authority
-    /// is the `Host` the request names, and that host is on a real host list
-    /// — not an empty or [`crate::host::ANY`] one, where the `Host` is the
-    /// page's own word (DNS rebinding).
-    fn own_origin<B>(origin: &str, hosts: &[String], request: &HttpRequest<B>) -> bool {
-        if hosts.is_empty() || hosts.iter().any(|h| h == crate::host::ANY) {
+    /// KEEL-29: `origin` (normalized) is this listener's own: its scheme is
+    /// the one the request came by (`scheme`, [`super::scheme_of`]; not
+    /// known: not its own), its authority the `Host` the request names, and
+    /// that host on the listener's own hosts — never an empty list, where the
+    /// `Host` would be the page's own word (DNS rebinding).
+    fn own_origin<B>(origin: &str, hosts: &[String], scheme: Option<&str>, request: &HttpRequest<B>) -> bool {
+        let Some(scheme) = scheme else { return false };
+        if hosts.is_empty() {
             return false;
         }
-        let Some(authority) = origin.strip_prefix("http://").or_else(|| origin.strip_prefix("https://")) else {
+        let Some(authority) = origin.strip_prefix(scheme).and_then(|rest| rest.strip_prefix("://")) else {
             return false;
         };
         let Ok(named) = crate::host::named(request) else { return false };
@@ -992,9 +1036,11 @@ pub(crate) mod auth {
             // ── TRANSPORT-7: who this comes from, behind the proxies ──────
             // Resolved once, from the accepted peer: what every later step
             // (the quotas) and the application read.
+            let mut scheme = None;
             if let Some(conn) = request.extensions().get::<Arc<super::Connection>>().cloned() {
                 let client = super::client_of(&self.proxies, &conn, request.headers());
                 request.extensions_mut().insert(client);
+                scheme = super::scheme_of(&self.proxies, &conn, request.headers());
             }
 
             // ── ACCESS-25: the host, before anything is answered ──────────
@@ -1013,7 +1059,7 @@ pub(crate) mod auth {
             // ── Step 0: the origin (IDENTITY-20) ───────────────────────────
             // Before any credential is read: a page from another origin on
             // the same host would otherwise carry the person's cookies.
-            if let Some(origin) = origin_refused(&self.allowed_origins, &self.allowed_hosts, &request) {
+            if let Some(origin) = origin_refused(&self.allowed_origins, self.any_origin, &self.own_hosts, scheme, &request) {
                 tracing::warn!(origin = %origin, uri = %plexus_core::plexus::redact::redact_str(&request.uri().to_string()), "WS upgrade rejected: origin not allowed");
                 return Box::pin(async move { Ok(forbidden("Forbidden: origin not allowed")) });
             }
@@ -1275,7 +1321,9 @@ pub mod testing {
             session_validator,
             reject_on_session_failure,
             allowed_origins: Arc::new(Vec::new()),
+            any_origin: false,
             allowed_hosts: Arc::new(Vec::new()),
+            own_hosts: Arc::new(Vec::new()),
             policy: Default::default(),
             quotas: None,
             proxies: Default::default(),
@@ -1297,7 +1345,9 @@ pub mod testing {
             session_validator,
             reject_on_session_failure: options.reject_on_session_failure,
             allowed_origins: super::auth::normalized_origins(allowed_origins),
+            any_origin: false,
             allowed_hosts: Arc::new(Vec::new()),
+            own_hosts: Arc::new(Vec::new()),
             policy: options.into(),
             quotas: None,
             proxies: Default::default(),
@@ -1318,7 +1368,9 @@ pub mod testing {
             session_validator,
             reject_on_session_failure,
             allowed_origins: super::auth::normalized_origins(allowed_origins),
+            any_origin: false,
             allowed_hosts: Arc::new(Vec::new()),
+            own_hosts: Arc::new(Vec::new()),
             policy: Default::default(),
             quotas: None,
             proxies: Default::default(),

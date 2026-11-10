@@ -180,8 +180,8 @@ async fn a_server_bound_beyond_loopback_keeps_answering_any_host() {
 async fn the_builder_s_defaults_are_the_same() {
     async fn start(open: bool) -> u16 {
         let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
-        let hub = Arc::new(plexus_core::plexus::DynamicHub::new("t"));
-        let mut b = plexus_transport::TransportServer::builder(hub, |h| {
+        let service = Arc::new(plexus_core::plexus::DynamicHub::new("t"));
+        let mut b = plexus_transport::TransportServer::builder(service, |h| {
             plexus_core::plexus::DynamicHub::arc_into_rpc_module(h).map_err(|e| anyhow::anyhow!("{e}"))
         })
         .without_registry()
@@ -204,4 +204,134 @@ async fn the_builder_s_defaults_are_the_same() {
     assert_eq!(upgrade_status(port, &format!("127.0.0.1:{port}"), None).await, 101);
     let port = start(true).await;
     assert_eq!(upgrade_status(port, "evil.example", Some(EVIL)).await, 101);
+}
+
+// ── KEEL-29 follow-up ───────────────────────────────────────────────────────
+
+/// `*` is not a wildcard anyone can write: an operator's `--allowed-origin
+/// '*'` or `--allowed-host '*'` arriving as a list entry is refused when the
+/// listener starts, naming the call that does open it.
+#[tokio::test]
+async fn a_star_in_a_list_is_refused_at_start() {
+    for cfg in [
+        WebSocketConfig::new(0).with_allowed_origins([" * "]),
+        WebSocketConfig::new(0).with_allowed_origins(["http://ok.example", "*"]),
+    ] {
+        match serve_websocket_with(module(), cfg, None, UpgradeOptions::default()).await {
+            Ok((handle, addr)) => {
+                let opened = upgrade_status(addr.port(), &format!("127.0.0.1:{}", addr.port()), Some(EVIL)).await;
+                std::mem::forget(handle);
+                panic!("a `*` origin entry started a server; {EVIL} got {opened}");
+            }
+            Err(e) => assert!(e.to_string().contains("allow_any_origin()"), "{e}"),
+        }
+    }
+    match serve_websocket_with(module(), WebSocketConfig::new(0).with_allowed_hosts(["*"]), None, UpgradeOptions::default()).await {
+        Ok((handle, addr)) => {
+            let opened = upgrade_status(addr.port(), "evil.example", None).await;
+            std::mem::forget(handle);
+            panic!("a `*` host entry started a server; Host evil.example got {opened}");
+        }
+        Err(e) => assert!(e.to_string().contains("allow_any_host()"), "{e}"),
+    }
+}
+
+/// The builder refuses the same at `build()`.
+#[tokio::test]
+async fn the_builder_refuses_a_star_at_build() {
+    for (origins, hosts, call) in [(vec!["*"], vec![], "allow_any_origin()"), (vec![], vec!["*"], "allow_any_host()")] {
+        let service = Arc::new(plexus_core::plexus::DynamicHub::new("t"));
+        let built = plexus_transport::TransportServer::builder(service, |h| {
+            plexus_core::plexus::DynamicHub::arc_into_rpc_module(h).map_err(|e| anyhow::anyhow!("{e}"))
+        })
+        .without_registry()
+        .with_websocket(0)
+        .with_allowed_origins(origins)
+        .with_allowed_hosts(hosts)
+        .build()
+        .await;
+        match built {
+            Ok(_) => panic!("a `*` entry built a server"),
+            Err(e) => assert!(e.to_string().contains(call), "{e}"),
+        }
+    }
+}
+
+/// The REST bridge's host list refuses `*` at start too (before KEEL-29 it
+/// matched no host; it never meant every host).
+#[cfg(feature = "http-gateway")]
+#[tokio::test]
+async fn the_rest_bridge_refuses_a_star() {
+    let cfg = plexus_transport::RestHttpConfig::new(0).with_allowed_hosts(["*"]);
+    let service = Arc::new(plexus_core::plexus::DynamicHub::new("t"));
+    let started = plexus_transport::serve_rest_http(service, None, None, cfg, None).await;
+    assert!(started.as_ref().is_err_and(|e| e.to_string().contains("`*`")), "{:?}", started.map(|_| ()));
+}
+
+/// The listener's own origin has its scheme: a plain listener's page is
+/// `http://`, never `https://`.
+#[tokio::test]
+async fn the_own_origin_has_the_listener_s_scheme() {
+    let port = serve(WebSocketConfig::new(0)).await;
+    let host = format!("127.0.0.1:{port}");
+    assert_eq!(upgrade_status(port, &host, Some(&format!("http://{host}"))).await, 101);
+    assert_eq!(upgrade_status(port, &host, Some(&format!("https://{host}"))).await, 403);
+}
+
+/// Behind a trusted proxy the scheme is the proxy's `X-Forwarded-Proto`;
+/// with none, it is not known and no origin is the listener's own.
+#[tokio::test]
+async fn behind_a_proxy_the_own_origin_s_scheme_is_the_proxy_s_word() {
+    let mut cfg = WebSocketConfig::new(0).with_allowed_hosts(["app.example"]);
+    cfg.trusted_proxies = plexus_transport::proxy::TrustedProxies::new(["127.0.0.1/32".parse().unwrap()]);
+    let port = serve(cfg).await;
+    let with = |proto: &'static str| async move {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let req = format!(
+            "GET / HTTP/1.1\r\nHost: app.example\r\nOrigin: https://app.example\r\nX-Forwarded-For: 203.0.113.9\r\n{proto}\
+             Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n"
+        );
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap().unwrap();
+        String::from_utf8_lossy(&buf[..n]).split(' ').nth(1).and_then(|c| c.parse::<u16>().ok()).unwrap_or(0)
+    };
+    assert_eq!(with("X-Forwarded-Proto: https\r\n").await, 101);
+    assert_eq!(with("X-Forwarded-Proto: http\r\n").await, 403, "the page came over http: another origin");
+    assert_eq!(with("").await, 403, "no word on the scheme: not known, so not its own");
+}
+
+/// Bound beyond loopback with no Host list, the page routes answer only the
+/// loopback names and the bound address's literal — a rebound name gets 421
+/// — while the socket answers any `Host` for clients that send no Origin.
+#[tokio::test]
+async fn beyond_loopback_the_routes_answer_only_names_the_listener_knows() {
+    let router = axum::Router::new().route("/page", axum::routing::get(|| async { "page" }));
+    let options = UpgradeOptions { routes: Some(plexus_transport::websocket::HostRoutes::new(router)), ..UpgradeOptions::default() };
+    let cfg = WebSocketConfig::new(0).with_addr("0.0.0.0:0".parse().unwrap());
+    let (handle, addr) = serve_websocket_with(module(), cfg, None, options).await.unwrap();
+    std::mem::forget(handle);
+    let port = addr.port();
+    let get = |host: String| async move {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        s.write_all(format!("GET /page HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+        let mut out = String::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), s.read_to_string(&mut out)).await;
+        out.split(' ').nth(1).and_then(|c| c.parse::<u16>().ok()).unwrap_or(0)
+    };
+    assert_eq!(get(format!("evil.example:{port}")).await, 421, "a rebound page");
+    assert_eq!(get(format!("127.0.0.1:{port}")).await, 200);
+    assert_eq!(get(format!("localhost:{port}")).await, 200);
+    let socket = |host: String, origin: Option<String>| async move {
+        let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let origin = origin.map(|o| format!("Origin: {o}\r\n")).unwrap_or_default();
+        s.write_all(format!("GET /ws HTTP/1.1\r\nHost: {host}\r\n{origin}Upgrade: websocket\r\nConnection: Upgrade\r\n\
+             Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").as_bytes()).await.unwrap();
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf)).await.unwrap().unwrap();
+        String::from_utf8_lossy(&buf[..n]).split(' ').nth(1).and_then(|c| c.parse::<u16>().ok()).unwrap_or(0)
+    };
+    assert_eq!(socket("box.lan:1234".into(), None).await, 101, "a client with no Origin, any name: as before");
+    assert_eq!(socket(format!("127.0.0.1:{port}"), Some(format!("http://127.0.0.1:{port}"))).await, 101, "the page's own socket");
+    assert_eq!(socket(format!("evil.example:{port}"), Some(format!("http://evil.example:{port}"))).await, 403, "a rebound page's socket");
 }

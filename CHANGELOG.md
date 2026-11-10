@@ -10,23 +10,28 @@ to web pages.** Before, `WebSocketConfig::new` (and the builder's
 `.with_websocket`) checked neither `Origin` nor `Host`, so any page a person
 had open could open `ws://127.0.0.1:<port>/` and call every method of a
 loopback service (cross-site WebSocket hijacking), and a page that rebound
-its own name to 127.0.0.1 could do the same (DNS rebinding). No API changes;
-the defaults change.
+its own name to 127.0.0.1 could do the same (DNS rebinding). The defaults
+change; the API only grows (one exception, below).
 
 ### Breaking (behaviour) — for a browser client of an unconfigured server
 
 | Change | Before (0.10.0) | After | What to do |
 |---|---|---|---|
-| No Origin list | any `Origin` admitted | an upgrade carrying an `Origin` is refused 403, unless it is the listener's own origin (`http(s)://` + the request's `Host`, that `Host` on the listener's host list) | name a UI on another port or site: `.with_allowed_origins(["http://127.0.0.1:5173"])`; or open on purpose: `.allow_any_origin()` |
+| No Origin list | any `Origin` admitted | an upgrade carrying an `Origin` is refused 403, unless it is the listener's own origin (the scheme the request came by — this listener's TLS or not, or a trusted proxy's `X-Forwarded-Proto`; none said: not its own — and the request's `Host`, that `Host` on the listener's own hosts) | name a UI on another port or site: `.with_allowed_origins(["http://127.0.0.1:5173"])`; or open on purpose: `.allow_any_origin()` |
 | No Host list, bound to loopback | any `Host` answered | only `127.0.0.1:<port>`, `localhost:<port>` (and `[::1]:<port>` on IPv6) for the bound port; any other refused 421 | name other names: `.with_allowed_hosts([...])`; or `.allow_any_host()` |
-| No Host list, bound beyond loopback (`0.0.0.0`) | any `Host` answered | the same, and a warning logged at start | name the hosts: `.with_allowed_hosts([...])` |
+| No Host list, bound beyond loopback (`0.0.0.0`) | any `Host` answered | the socket the same, and a warning logged at start; the pages on its port (`HostRoutes`) only the loopback names and the bound address (421 otherwise) | name the hosts: `.with_allowed_hosts([...])` |
+| An entry `*` in an Origin or Host list (WebSocket, builder, REST bridge) | matched nothing | the listener refuses to start (`build()` / `serve_*` errs, naming `allow_any_origin()` / `allow_any_host()`) | drop it, or call the opt-out in code |
 
 A client that sends no `Origin` — synapse, a service-to-service link, a CLI,
 a test — connects exactly as before. With a list set, the check is as
 before. New: `WebSocketConfig::allow_any_origin`, `allow_any_host` and
 `with_allowed_origins`; `TransportServerBuilder::allow_any_origin` and
-`allow_any_host`; `host::ANY` (`"*"`, the entry they write). The REST
-bridge, `/mcp` and `serve_combined` are unchanged.
+`allow_any_host`; `host::Opened`, the state those calls set — never a list
+value, so no flag, environment variable or file can open a listener — kept in
+a new public field `WebSocketConfig::opened`. That field is the one API
+exception: a `WebSocketConfig { .. }` literal naming every field must add it
+(`..WebSocketConfig::new(port)` is unaffected). `/mcp` and `serve_combined`
+are unchanged (rmcp's host list has no wildcard).
 
 ## [0.10.0] — unreleased
 

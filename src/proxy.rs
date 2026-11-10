@@ -121,6 +121,13 @@ impl TrustedProxies {
     /// Who a request from `peer` carrying `headers` comes from, and whether
     /// it came securely. See the module docs.
     pub fn resolve(&self, peer: IpAddr, headers: &http::HeaderMap) -> ForwardedClient {
+        self.resolve_with_proto(peer, headers).0
+    }
+
+    /// KEEL-29: [`Self::resolve`], and — when a trusted proxy forwarded the
+    /// request — the `X-Forwarded-Proto` entry it read (`None`: the proxy
+    /// said nothing, or the peer is no proxy).
+    pub(crate) fn resolve_with_proto(&self, peer: IpAddr, headers: &http::HeaderMap) -> (ForwardedClient, Option<String>) {
         let peer = canonical(peer);
         if !self.contains(&peer) {
             if headers.contains_key("x-forwarded-for") || headers.contains_key("x-forwarded-proto") {
@@ -131,7 +138,7 @@ impl TrustedProxies {
                 );
             }
             let secure = !self.behind_proxy() && peer.is_loopback();
-            return ForwardedClient { ip: peer, peer, via_proxy: false, secure };
+            return (ForwardedClient { ip: peer, peer, via_proxy: false, secure }, None);
         }
         let hops = list(headers, "x-forwarded-for");
         // Walk from the hop nearest us; `at` is the client's index in `hops`
@@ -155,7 +162,7 @@ impl TrustedProxies {
             _ => protos.last(),
         };
         let secure = proto.is_some_and(|p| p.eq_ignore_ascii_case("https") || p.eq_ignore_ascii_case("wss"));
-        ForwardedClient { ip, peer, via_proxy: true, secure }
+        (ForwardedClient { ip, peer, via_proxy: true, secure }, proto.map(|p| p.to_string()))
     }
 }
 

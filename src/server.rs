@@ -114,6 +114,8 @@ pub struct TransportServer<A: Activation> {
     allowed_origins: Vec<String>,
     /// ACCESS-25: the `Host` values the WebSocket answers to.
     allowed_hosts: Vec<String>,
+    /// KEEL-29: what `allow_any_origin()` / `allow_any_host()` opened.
+    opened: crate::host::Opened,
     /// AUTH-12: the WebSocket's connection quotas, when not the default.
     connection_quotas: Option<ConnectionQuotas>,
     /// TRANSPORT-7: the proxies in front, when named.
@@ -203,6 +205,9 @@ impl<A: Activation> TransportServer<A> {
             if ws_config.allowed_hosts.is_empty() {
                 ws_config.allowed_hosts = self.allowed_hosts.clone();
             }
+            // KEEL-29: the builder's opt-outs, as said.
+            ws_config.opened.any_origin |= self.opened.any_origin;
+            ws_config.opened.any_host |= self.opened.any_host;
             // AUTH-12: the builder's quotas, when set.
             if let Some(q) = self.connection_quotas.clone() {
                 ws_config.quotas = q;
@@ -471,6 +476,8 @@ pub struct TransportServerBuilder<A: Activation> {
     allowed_origins: Vec<String>,
     /// ACCESS-25: set by `.with_allowed_hosts()`.
     allowed_hosts: Vec<String>,
+    /// KEEL-29: set by `.allow_any_origin()` / `.allow_any_host()`.
+    opened: crate::host::Opened,
     /// AUTH-12: set by `.with_connection_quotas()`.
     connection_quotas: Option<ConnectionQuotas>,
     /// TRANSPORT-7: set by `.trusted_proxies()` / `.with_trusted_proxies()`.
@@ -537,6 +544,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             reject_upgrade_on_auth_failure: false,
             allowed_origins: Vec::new(),
             allowed_hosts: Vec::new(),
+            opened: Default::default(),
             connection_quotas: None,
             trusted_proxies: None,
             bind: None,
@@ -768,14 +776,14 @@ impl<A: Activation> TransportServerBuilder<A> {
     /// WebSocket and call this service with the visitor's browser
     /// ([`WebSocketConfig::allow_any_origin`]).
     pub fn allow_any_origin(mut self) -> Self {
-        self.allowed_origins = vec![crate::host::ANY.to_string()];
+        self.opened.any_origin = true;
         self
     }
 
     /// KEEL-29: the opt-out — the WebSocket answers any `Host`, DNS
     /// rebinding included ([`WebSocketConfig::allow_any_host`]).
     pub fn allow_any_host(mut self) -> Self {
-        self.allowed_hosts = vec![crate::host::ANY.to_string()];
+        self.opened.any_host = true;
         self
     }
 
@@ -963,6 +971,17 @@ impl<A: Activation> TransportServerBuilder<A> {
     /// api_key is set and the [`Self::with_mcp`] mount admits anonymous
     /// callers, which that opt-out does not excuse.
     pub async fn build(self) -> Result<TransportServer<A>> {
+        // KEEL-29: `*` in a list is no wildcard — refused here, naming the
+        // call that opens a listener on purpose.
+        crate::host::refuse_star(&self.allowed_origins, "origin")?;
+        crate::host::refuse_star(&self.allowed_hosts, "host")?;
+        if let Some(ws) = &self.config.websocket {
+            crate::host::refuse_star(&ws.allowed_origins, "origin")?;
+            crate::host::refuse_star(&ws.allowed_hosts, "host")?;
+        }
+        if let Some(rest) = &self.config.rest_http {
+            crate::host::refuse_star(&rest.allowed_hosts, "host")?;
+        }
         // RED-4: verify auth configuration before starting the server.
         let has_api_key = self.config.api_key.is_some();
         let has_session_validator = self.session_validator.is_some();
@@ -1061,6 +1080,7 @@ impl<A: Activation> TransportServerBuilder<A> {
             reject_upgrade_on_auth_failure: self.reject_upgrade_on_auth_failure,
             allowed_origins: self.allowed_origins,
             allowed_hosts: self.allowed_hosts,
+            opened: self.opened,
             connection_quotas: self.connection_quotas,
             trusted_proxies: self.trusted_proxies,
             upgrade: self.upgrade,
