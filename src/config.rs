@@ -57,14 +57,20 @@ pub struct WebSocketConfig {
     /// Header name carrying the api_key on the upgrade request.
     /// Defaults to `X-Plexus-API-Key`.
     pub api_key_header: http::HeaderName,
-    /// IDENTITY-20: the origins a browser page may open a socket from. Empty
-    /// (the default) checks nothing. Otherwise an upgrade whose `Origin` is
-    /// anything else — `null` included — is refused 403 before any
-    /// credential is read; one with no `Origin` (a CLI, a server) proceeds.
+    /// IDENTITY-20: the origins a browser page may open a socket from. An
+    /// upgrade whose `Origin` is not admitted — `null` included — is refused
+    /// 403 before any credential is read; one with no `Origin` (a CLI, a
+    /// server, synapse) always proceeds. KEEL-29: empty (the default) admits
+    /// only the listener's own origin (a page served on this very port and
+    /// `Host`), so no other web page can call the service;
+    /// [`Self::allow_any_origin`] (an entry [`crate::host::ANY`]) admits any.
     pub allowed_origins: Vec<String>,
     /// ACCESS-25: the `Host` values the upgrade answers to (see
-    /// [`crate::host`]). Empty (the default) checks nothing; otherwise any
-    /// other host is refused 421 before anything else is read.
+    /// [`crate::host`]); any other host is refused 421 before anything else
+    /// is read. KEEL-29: empty (the default) is resolved at bind — bound to
+    /// loopback, [`crate::host::loopback_hosts`] for the bound port; bound
+    /// beyond loopback, no check (a warning is logged at start).
+    /// [`Self::allow_any_host`] (an entry [`crate::host::ANY`]) answers any.
     pub allowed_hosts: Vec<String>,
     /// AUTH-12: how many sockets may be open, in all and per caller.
     pub quotas: ConnectionQuotas,
@@ -123,6 +129,13 @@ impl Default for ConnectionQuotas {
 }
 
 impl WebSocketConfig {
+    /// A listener on `127.0.0.1:<port>`. KEEL-29: closed to web pages by
+    /// default — an upgrade carrying a foreign `Origin` is refused 403, and
+    /// a `Host` other than the loopback names for the port is refused 421;
+    /// a client that sends no `Origin` connects as ever. Name what a browser
+    /// client needs with [`Self::with_allowed_origins`] /
+    /// [`Self::with_allowed_hosts`], or open it on purpose with
+    /// [`Self::allow_any_origin`] / [`Self::allow_any_host`].
     pub fn new(port: u16) -> Self {
         Self {
             addr: format!("127.0.0.1:{}", port)
@@ -167,6 +180,33 @@ impl WebSocketConfig {
         S: Into<String>,
     {
         self.allowed_hosts = hosts.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// IDENTITY-20: the origins a browser page may open a socket from, e.g.
+    /// `http://127.0.0.1:5173` for a UI served on another port (see
+    /// [`Self::allowed_origins`]).
+    pub fn with_allowed_origins<I, S>(mut self, origins: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_origins = origins.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// KEEL-29: the opt-out — any web page, from any site, may open a socket
+    /// and call this service with the visitor's browser. Only for a service
+    /// meant to be open to every page.
+    pub fn allow_any_origin(mut self) -> Self {
+        self.allowed_origins = vec![crate::host::ANY.to_string()];
+        self
+    }
+
+    /// KEEL-29: the opt-out — any `Host` is answered, so a page that rebinds
+    /// its own name to this address (DNS rebinding) reaches the listener.
+    pub fn allow_any_host(mut self) -> Self {
+        self.allowed_hosts = vec![crate::host::ANY.to_string()];
         self
     }
 

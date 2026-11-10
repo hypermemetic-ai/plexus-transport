@@ -752,7 +752,9 @@ impl<A: Activation> TransportServerBuilder<A> {
     /// `null`, from a sandboxed frame, included — is refused with 403 before
     /// any credential is read. An upgrade with no `Origin` (synapse, a
     /// server, a CLI: browsers always send one) proceeds. Origins compare
-    /// case-insensitively, without a trailing slash. Empty: no check.
+    /// case-insensitively, without a trailing slash. KEEL-29: empty (the
+    /// default) admits only the listener's own origin — no other page;
+    /// [`Self::allow_any_origin`] is the opt-out.
     pub fn with_allowed_origins<I, S>(mut self, origins: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -762,12 +764,29 @@ impl<A: Activation> TransportServerBuilder<A> {
         self
     }
 
+    /// KEEL-29: the opt-out — any web page, from any site, may open the
+    /// WebSocket and call this service with the visitor's browser
+    /// ([`WebSocketConfig::allow_any_origin`]).
+    pub fn allow_any_origin(mut self) -> Self {
+        self.allowed_origins = vec![crate::host::ANY.to_string()];
+        self
+    }
+
+    /// KEEL-29: the opt-out — the WebSocket answers any `Host`, DNS
+    /// rebinding included ([`WebSocketConfig::allow_any_host`]).
+    pub fn allow_any_host(mut self) -> Self {
+        self.allowed_hosts = vec![crate::host::ANY.to_string()];
+        self
+    }
+
     /// ACCESS-25: the `Host` values the WebSocket answers to, e.g.
     /// [`crate::host::loopback_hosts`]`(4455)` — a page that rebinds its
     /// own name to this address (DNS rebinding) is refused 421 before
     /// anything else is read, the RFC 9728 metadata included. Entries are
     /// `host:port`, or `host` for a default port; they compare
-    /// case-insensitively and exactly. Empty (the default): no check. The
+    /// case-insensitively and exactly. KEEL-29: empty (the default) is, on
+    /// loopback, the loopback names for the port; beyond loopback, no check
+    /// (warned at start). [`Self::allow_any_host`] is the opt-out. The
     /// REST bridge's list is [`crate::config::RestHttpConfig::with_allowed_hosts`],
     /// since its port differs.
     pub fn with_allowed_hosts<I, S>(mut self, hosts: I) -> Self

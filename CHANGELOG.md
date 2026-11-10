@@ -3,6 +3,31 @@
 All notable changes to plexus-transport are documented here. This file starts
 at 0.6.0; earlier changes are in the git history.
 
+## [0.10.1] — unreleased
+
+KEEL-29 (security): **a WebSocket server built with the defaults is closed
+to web pages.** Before, `WebSocketConfig::new` (and the builder's
+`.with_websocket`) checked neither `Origin` nor `Host`, so any page a person
+had open could open `ws://127.0.0.1:<port>/` and call every method of a
+loopback service (cross-site WebSocket hijacking), and a page that rebound
+its own name to 127.0.0.1 could do the same (DNS rebinding). No API changes;
+the defaults change.
+
+### Breaking (behaviour) — for a browser client of an unconfigured server
+
+| Change | Before (0.10.0) | After | What to do |
+|---|---|---|---|
+| No Origin list | any `Origin` admitted | an upgrade carrying an `Origin` is refused 403, unless it is the listener's own origin (`http(s)://` + the request's `Host`, that `Host` on the listener's host list) | name a UI on another port or site: `.with_allowed_origins(["http://127.0.0.1:5173"])`; or open on purpose: `.allow_any_origin()` |
+| No Host list, bound to loopback | any `Host` answered | only `127.0.0.1:<port>`, `localhost:<port>` (and `[::1]:<port>` on IPv6) for the bound port; any other refused 421 | name other names: `.with_allowed_hosts([...])`; or `.allow_any_host()` |
+| No Host list, bound beyond loopback (`0.0.0.0`) | any `Host` answered | the same, and a warning logged at start | name the hosts: `.with_allowed_hosts([...])` |
+
+A client that sends no `Origin` — synapse, a service-to-service link, a CLI,
+a test — connects exactly as before. With a list set, the check is as
+before. New: `WebSocketConfig::allow_any_origin`, `allow_any_host` and
+`with_allowed_origins`; `TransportServerBuilder::allow_any_origin` and
+`allow_any_host`; `host::ANY` (`"*"`, the entry they write). The REST
+bridge, `/mcp` and `serve_combined` are unchanged.
+
 ## [0.10.0] — unreleased
 
 NEST-24: on plexus-core 0.11 (NEST-15, NEST-16, DYNAUTH-5..8, NEST-21) and,

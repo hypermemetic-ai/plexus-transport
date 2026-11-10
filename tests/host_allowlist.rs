@@ -1,6 +1,7 @@
 //! ACCESS-25: a `Host` allow-list on the WebSocket upgrade and the REST
 //! bridge. A page that rebinds its own name to 127.0.0.1 names its own host:
-//! refused 421 before anything routes it. No list: nothing is refused.
+//! refused 421 before anything routes it. No list: on the REST bridge nothing
+//! is refused; on a loopback WebSocket, the loopback names (KEEL-29).
 
 use std::sync::Arc;
 
@@ -81,11 +82,18 @@ async fn the_websocket_answers_only_its_hosts() {
     handle.stop().unwrap();
 }
 
-/// No list (the default): any host is answered, as before ACCESS-25.
+/// No list (the default). KEEL-29: bound to loopback, the loopback names for
+/// the port — another host is refused 421; bound beyond loopback, any host is
+/// answered, as before ACCESS-25 (and tests/browser_defaults.rs).
 #[tokio::test]
-async fn without_a_list_the_websocket_answers_any_host() {
+async fn without_a_list_the_loopback_websocket_answers_only_loopback_names() {
     let port = ws_anywhere().await;
-    assert_eq!(raw(port, "/", Some("evil.example"), UPGRADE).await.0, 101);
+    assert_eq!(raw(port, "/", Some("evil.example"), UPGRADE).await.0, 421);
+    assert_eq!(raw(port, "/", Some(&format!("localhost:{port}")), UPGRADE).await.0, 101);
+    let cfg = WebSocketConfig::new(0).with_addr("0.0.0.0:0".parse().unwrap());
+    let (handle, addr) = serve_websocket_with(module(), cfg, None, UpgradeOptions::default()).await.unwrap();
+    std::mem::forget(handle);
+    assert_eq!(raw(addr.port(), "/", Some("evil.example"), UPGRADE).await.0, 101);
 }
 
 /// The builder's list reaches the WebSocket config.

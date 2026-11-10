@@ -110,9 +110,15 @@ async fn no_origin_is_a_cli_and_proceeds() {
     assert_eq!(upgrade(&mut svc, &[("cookie", "session=good")]).await.0, 200);
 }
 
+/// KEEL-29: without an allow-list a page's origin is refused (before
+/// KEEL-29 it proceeded), and `*` is the opt-out.
 #[tokio::test]
-async fn without_an_allow_list_any_origin_proceeds() {
+async fn without_an_allow_list_a_page_s_origin_is_refused() {
     let (v, inner) = (Validator::default(), Inner::default());
     let mut svc = middleware(&[], &v, &inner);
-    assert_eq!(upgrade(&mut svc, &[("origin", "http://evil.example"), ("cookie", "session=good")]).await.0, 200);
+    assert_eq!(upgrade(&mut svc, &[("origin", "http://evil.example"), ("cookie", "session=good")]).await.0, 403);
+    assert_eq!(v.calls.load(Ordering::SeqCst), 0, "the validator never saw the cookie");
+    assert_eq!(upgrade(&mut svc, &[("cookie", "session=good")]).await.0, 200, "no origin: a CLI, as before");
+    let mut open = middleware(&["*"], &v, &inner);
+    assert_eq!(upgrade(&mut open, &[("origin", "http://evil.example"), ("cookie", "session=good")]).await.0, 200);
 }

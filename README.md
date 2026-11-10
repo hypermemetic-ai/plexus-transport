@@ -154,6 +154,26 @@ let mcp_config = McpHttpConfig::new(8889)
 
 `serve_combined_with_allowed_hosts` does the same for `serve_combined`.
 
+### Web pages and the WebSocket (KEEL-29)
+
+A browser sends `Origin` on every WebSocket, and sockets have no same-origin
+rule, so the WebSocket listener (`WebSocketConfig::new`, `.with_websocket`) is
+closed to web pages unless told otherwise:
+
+- **Origin.** With no list, an upgrade carrying an `Origin` is refused 403,
+  unless it is the listener's own origin (a page served on that very port and
+  `Host`). A client that sends no `Origin` — synapse, a service, a CLI —
+  connects as ever. A UI on another port or site is named:
+  `.with_allowed_origins(["http://127.0.0.1:5173"])`.
+- **Host.** With no list and bound to loopback, the listener answers only
+  `127.0.0.1:<port>` and `localhost:<port>` (and `[::1]:<port>` on IPv6);
+  any other `Host` is refused 421 (DNS rebinding). Bound beyond loopback
+  (`0.0.0.0`), `Host` is not checked — the names it is reached by are not
+  the transport's to know — and a warning is logged at start: name them with
+  `.with_allowed_hosts([...])`.
+- **Opting out**, on purpose, one line each: `.allow_any_origin()` (any site
+  may call the service in its visitor's browser) and `.allow_any_host()`.
+
 ### SQLite Session Persistence (Optional)
 
 ```rust
@@ -390,7 +410,10 @@ TransportServer::builder(hub, converter)
   `Host` check, with the request's `ForwardedClient` and `Connection` in its
   extensions. Without routes the port is the socket's on every path, as
   before.
-- **Origins**: an `https://` page's origin is admitted only when named —
+- **Origins**: a page these routes serve is the listener's own origin, and
+  connects when its `Host` is on the listener's host list (the loopback
+  names by default on loopback; KEEL-29). Behind a name, an `https://`
+  page's origin is admitted only when named —
   `with_allowed_origins`, or plexus-login's `public_url` / `allowed_origins`
   (its `shell_origins` adds the https `public_url`'s origin, and its
   `resource_url` already names that origin's `/ws`).

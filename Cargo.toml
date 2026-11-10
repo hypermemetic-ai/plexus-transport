@@ -1,6 +1,6 @@
 [package]
 name = "plexus-transport"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 license = "MIT"
 description = "Transport implementations for Plexus RPC: WebSocket, HTTP/SSE"
