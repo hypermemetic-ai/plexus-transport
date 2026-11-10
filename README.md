@@ -161,8 +161,10 @@ rule, so the WebSocket listener (`WebSocketConfig::new`, `.with_websocket`) is
 closed to web pages unless told otherwise:
 
 - **Origin.** With no list, an upgrade carrying an `Origin` is refused 403,
-  unless it is the listener's own origin (a page served on that very port and
-  `Host`). A client that sends no `Origin` — synapse, a service, a CLI —
+  unless it is the listener's own origin: a page served on that very port,
+  scheme and `Host` (`http://` on a plain listener, `https://` over its TLS;
+  behind a trusted proxy, the proxy's `X-Forwarded-Proto` — with none, no
+  origin is its own). A client that sends no `Origin` — synapse, a service, a CLI —
   connects as ever. A UI on another port or site is named:
   `.with_allowed_origins(["http://127.0.0.1:5173"])`.
 - **Host.** With no list and bound to loopback, the listener answers only
@@ -170,9 +172,13 @@ closed to web pages unless told otherwise:
   any other `Host` is refused 421 (DNS rebinding). Bound beyond loopback
   (`0.0.0.0`), `Host` is not checked — the names it is reached by are not
   the transport's to know — and a warning is logged at start: name them with
-  `.with_allowed_hosts([...])`.
-- **Opting out**, on purpose, one line each: `.allow_any_origin()` (any site
-  may call the service in its visitor's browser) and `.allow_any_host()`.
+  `.with_allowed_hosts([...])`. The pages on its port (`HostRoutes`) and its
+  own origin then answer only the loopback names and the bound address.
+- **Opting out**, on purpose, one line each in code: `.allow_any_origin()`
+  (any site may call the service in its visitor's browser) and
+  `.allow_any_host()`. A list entry `*` is no wildcard: a listener given one
+  (`--allowed-host '*'` from a flag, an environment variable, a file) refuses
+  to start, naming the call — so no configured value opens a listener.
 
 ### SQLite Session Persistence (Optional)
 
@@ -411,8 +417,9 @@ TransportServer::builder(hub, converter)
   extensions. Without routes the port is the socket's on every path, as
   before.
 - **Origins**: a page these routes serve is the listener's own origin, and
-  connects when its `Host` is on the listener's host list (the loopback
-  names by default on loopback; KEEL-29). Behind a name, an `https://`
+  connects when its scheme is the listener's and its `Host` is on the
+  listener's host list (by default the loopback names, and beyond loopback
+  the bound address; KEEL-29). Behind a name, an `https://`
   page's origin is admitted only when named —
   `with_allowed_origins`, or plexus-login's `public_url` / `allowed_origins`
   (its `shell_origins` adds the https `public_url`'s origin, and its

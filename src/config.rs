@@ -63,15 +63,20 @@ pub struct WebSocketConfig {
     /// server, synapse) always proceeds. KEEL-29: empty (the default) admits
     /// only the listener's own origin (a page served on this very port and
     /// `Host`), so no other web page can call the service;
-    /// [`Self::allow_any_origin`] (an entry [`crate::host::ANY`]) admits any.
+    /// [`Self::allow_any_origin`] admits any. An entry `*` is no wildcard:
+    /// the listener refuses to start with one.
     pub allowed_origins: Vec<String>,
     /// ACCESS-25: the `Host` values the upgrade answers to (see
     /// [`crate::host`]); any other host is refused 421 before anything else
     /// is read. KEEL-29: empty (the default) is resolved at bind — bound to
     /// loopback, [`crate::host::loopback_hosts`] for the bound port; bound
     /// beyond loopback, no check (a warning is logged at start).
-    /// [`Self::allow_any_host`] (an entry [`crate::host::ANY`]) answers any.
+    /// [`Self::allow_any_host`] answers any. An entry `*` is no wildcard:
+    /// the listener refuses to start with one.
     pub allowed_hosts: Vec<String>,
+    /// KEEL-29: what [`Self::allow_any_origin`] / [`Self::allow_any_host`]
+    /// opened — a state only those calls set, never a list's value.
+    pub opened: crate::host::Opened,
     /// AUTH-12: how many sockets may be open, in all and per caller.
     pub quotas: ConnectionQuotas,
     /// TRANSPORT-7: the proxies in front, whose `X-Forwarded-For` /
@@ -145,6 +150,7 @@ impl WebSocketConfig {
             api_key_header: http::HeaderName::from_static("x-plexus-api-key"),
             allowed_origins: Vec::new(),
             allowed_hosts: Vec::new(),
+            opened: crate::host::Opened::default(),
             quotas: ConnectionQuotas::default(),
             trusted_proxies: Default::default(),
             #[cfg(feature = "tls")]
@@ -199,14 +205,14 @@ impl WebSocketConfig {
     /// and call this service with the visitor's browser. Only for a service
     /// meant to be open to every page.
     pub fn allow_any_origin(mut self) -> Self {
-        self.allowed_origins = vec![crate::host::ANY.to_string()];
+        self.opened.any_origin = true;
         self
     }
 
     /// KEEL-29: the opt-out — any `Host` is answered, so a page that rebinds
     /// its own name to this address (DNS rebinding) reaches the listener.
     pub fn allow_any_host(mut self) -> Self {
-        self.allowed_hosts = vec![crate::host::ANY.to_string()];
+        self.opened.any_host = true;
         self
     }
 

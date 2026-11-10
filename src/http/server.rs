@@ -174,6 +174,8 @@ pub async fn serve_rest_http_as<A: Activation>(
     config: RestHttpConfig,
     api_key: Option<String>,
 ) -> Result<JoinHandle<std::result::Result<(), std::io::Error>>> {
+    // KEEL-29: a `*` host is no wildcard (it matched nothing before).
+    crate::host::refuse_star(&config.allowed_hosts, "host")?;
     tracing::info!(
         "Starting REST HTTP server at http://{} (server: {}, version: {})",
         config.addr,
