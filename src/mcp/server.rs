@@ -237,9 +237,10 @@ where
 {
     let server_config = StreamableHttpServerConfig::default()
         .with_allowed_hosts(effective_allowed_hosts(config.addr, &config.allowed_hosts));
+    // KEEL-59: a session that ends cancels its calls at once.
     let mcp_service = StreamableHttpService::new(
         move || Ok(bridge.clone()),
-        session_manager.into(),
+        Arc::new(plexus_transport_mcp::gone::EndsCalls::new(session_manager)),
         server_config,
     );
 
