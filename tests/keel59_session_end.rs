@@ -201,3 +201,37 @@ async fn a_viewer_whose_grant_is_revoked_mid_stream_is_told_forbidden_and_the_wo
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(s.work[2].ticks() > before, "the public call stopped");
 }
+
+/// A validator that keeps saying alive past the session's stamp (a session
+/// re-minted, a clock stepped back): counted.
+struct StillAlive(Arc<std::sync::atomic::AtomicUsize>);
+
+#[async_trait]
+impl SessionValidator for StillAlive {
+    async fn validate(&self, _token: &str) -> Option<AuthContext> {
+        Some(AuthContext::for_principal(&ADA.parse().unwrap(), "s", vec![], json!({ "expires_at": now_secs() + 1 })))
+    }
+    fn alive(&self, _ctx: &AuthContext) -> Result<(), String> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Review L1: past its `expires_at`, a sign-in the validator still holds is
+/// asked again at the liveness tick (1 s), never in a spin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sign_in_still_held_past_its_stamp_is_not_asked_in_a_spin() {
+    let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let validator: Arc<dyn SessionValidator> = Arc::new(StillAlive(asked.clone()));
+    let service = DynamicHub::new("svc").register(WorkActivation::default());
+    let (handle, addr) = serve_websocket_with(service.into_rpc_module().unwrap(), WebSocketConfig::new(0), Some(validator), UpgradeOptions::default()).await.unwrap();
+    std::mem::forget(handle);
+    let mut ws = signed_in(addr.port()).await;
+    // The stamp passes within 1 s; then 3 s more.
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let n = asked.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(n <= 6, "asked {n} times in 4 s: a spin");
+    assert!(n >= 2, "asked {n} times: not watched");
+    ws.send(Message::Ping(vec![].into())).await.unwrap();
+    println!("    asked {n} times in 4 s");
+}

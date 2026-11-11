@@ -373,14 +373,18 @@ fn watch_liveness(
     let ends = ctx.metadata.get("expires_at").and_then(serde_json::Value::as_i64);
     tokio::spawn(async move {
         loop {
-            let wait = match ends {
-                Some(at) => {
+            // Its end still ahead: at that moment (at most a tick away).
+            // Past it — a validator that still says alive (a session
+            // re-minted, a clock stepped back) — the tick again, never a
+            // spin (review L1).
+            let wait = ends
+                .and_then(|at| {
                     let end = std::time::UNIX_EPOCH + Duration::from_secs(at.max(0) as u64);
-                    end.duration_since(std::time::SystemTime::now()).unwrap_or_default().min(LIVENESS_EVERY)
-                }
-                None => LIVENESS_EVERY,
-            };
-            tokio::time::sleep(wait.max(Duration::from_millis(1))).await;
+                    end.duration_since(std::time::SystemTime::now()).ok()
+                })
+                .filter(|left| !left.is_zero())
+                .map_or(LIVENESS_EVERY, |left| left.min(LIVENESS_EVERY));
+            tokio::time::sleep(wait).await;
             let Some(conn) = conn.upgrade() else { return };
             if conn.is_closed() {
                 return;
