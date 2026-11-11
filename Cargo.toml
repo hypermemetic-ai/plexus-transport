@@ -108,6 +108,8 @@ plexus-core = { path = "../plexus-core", version = "0.11.0" }
 duplex-fixture = { path = "tests/duplex_fixture" }
 # RETURNS-47: activations that read their caller, for tests/returns47_bridges.rs.
 returns47-fixture = { path = "tests/returns47_fixture" }
+# KEEL-59: work that ticks a counter, for tests/keel59_*.rs.
+keel59-fixture = { path = "tests/keel59_fixture" }
 # TRANSPORT-26: a test CA and its certificates, made in each test.
 rcgen = "0.14"
 

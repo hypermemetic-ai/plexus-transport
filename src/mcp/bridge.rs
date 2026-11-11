@@ -290,189 +290,197 @@ impl<A: Activation> ServerHandler for ActivationMcpBridge<A> {
         request: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, McpError> {
-        let method_name = &request.name;
-        let mut arguments_map = request
-            .arguments
-            .unwrap_or_else(|| serde_json::Map::new());
+        // KEEL-59: a cancel (`notifications/cancelled`) or a client gone
+        // away ends the call at once — the call's future, and the method's
+        // stream inside it, dropped here — not at the method's next item;
+        // a unary method still being routed, and a send to a gone peer, are
+        // cut off with it.
+        let work = async {
+            let method_name = &request.name;
+            let mut arguments_map = request
+                .arguments
+                .unwrap_or_else(|| serde_json::Map::new());
 
-        tracing::debug!("Calling tool: {} with args: {}", method_name, plexus_core::plexus::redact::redact_str(&format!("{arguments_map:?}")));
+            tracing::debug!("Calling tool: {} with args: {}", method_name, plexus_core::plexus::redact::redact_str(&format!("{arguments_map:?}")));
 
-        // Extract HTTP connection metadata from extensions and inject into arguments.
-        // This makes the gateway transparent: all HTTP-level metadata (query params, headers)
-        // is forwarded to the backend without the gateway needing to know what it means.
-        tracing::debug!("[MCP BRIDGE] call_tool: method={}, checking for HTTP metadata...", method_name);
-        if let Some(parts) = ctx.extensions.get::<http::request::Parts>() {
-            tracing::debug!("[MCP BRIDGE] Found HTTP Parts! URI: {}", plexus_core::plexus::redact::redact_str(&parts.uri.to_string()));
-            let mut connection_meta = serde_json::Map::new();
+            // Extract HTTP connection metadata from extensions and inject into arguments.
+            // This makes the gateway transparent: all HTTP-level metadata (query params, headers)
+            // is forwarded to the backend without the gateway needing to know what it means.
+            tracing::debug!("[MCP BRIDGE] call_tool: method={}, checking for HTTP metadata...", method_name);
+            if let Some(parts) = ctx.extensions.get::<http::request::Parts>() {
+                tracing::debug!("[MCP BRIDGE] Found HTTP Parts! URI: {}", plexus_core::plexus::redact::redact_str(&parts.uri.to_string()));
+                let mut connection_meta = serde_json::Map::new();
 
-            // Forward ALL query parameters
-            if let Some(query) = parts.uri.query() {
-                tracing::debug!("[MCP BRIDGE] Query string: {}", plexus_core::plexus::redact::redact_str(query));
-                for (key, value) in form_urlencoded::parse(query.as_bytes()) {
-                    tracing::debug!("[MCP BRIDGE] Query param: {}", plexus_core::plexus::redact::redact_str(&format!("{key}={value}")));
-                    connection_meta.insert(
-                        format!("query.{}", key),
-                        json!(value.to_string()),
-                    );
-                }
-            } else {
-                tracing::debug!("[MCP BRIDGE] No query string in URI");
-            }
-
-            // If we extracted any connection metadata, inject it
-            if !connection_meta.is_empty() {
-                arguments_map.insert("_connection".to_string(), json!(connection_meta));
-                tracing::debug!("[MCP BRIDGE] Injected connection metadata: {}", plexus_core::plexus::redact::redact_str(&format!("{connection_meta:?}")));
-                tracing::debug!("Injected connection metadata: {}", plexus_core::plexus::redact::redact_str(&format!("{connection_meta:?}")));
-            } else {
-                tracing::debug!("[MCP BRIDGE] No connection metadata to inject");
-            }
-        } else {
-            tracing::debug!("[MCP BRIDGE] No HTTP Parts in extensions!");
-        }
-
-        let arguments_value = serde_json::Value::Object(arguments_map);
-
-        // Get progress token if provided
-        let progress_token = ctx.meta.get_progress_token();
-
-        // Logger name: namespace.method (e.g., bash.execute)
-        let logger = method_name.to_string();
-
-        // Call activation and get stream.
-        // If a router is available (hub activations), use it to dispatch the full
-        // namespaced method name (e.g., "loopback.permit") to the correct child.
-        // Otherwise strip the namespace prefix and call activation directly.
-        let stream = if let Some(ref router) = self.router {
-            router(method_name.to_string(), arguments_value)
-                .await
-                .map_err(plexus_to_mcp_error)?
-        } else {
-            let method = if method_name.contains('.') {
-                method_name.split('.').nth(1).unwrap_or(method_name)
-            } else {
-                method_name
-            };
-            // RETURNS-47: the leaf path. This bridge names no caller, and
-            // with no service there is no gate: the call runs as a service
-            // with no gate runs one, anonymous and admitted everywhere
-            // (`call::ungated`). `Activation::call` alone runs in no context,
-            // where a method reading `reach` or `caller()` is refused.
-            plexus_core::call::ungated(&*self.activation, method, arguments_value, None, None)
-                .await
-                .map_err(plexus_to_mcp_error)?
-        };
-
-        // Stream events via notifications AND buffer for final result
-        let mut fatal: Option<RemoteError> = None;
-        let mut buffered_data: Vec<serde_json::Value> = Vec::new();
-
-        tokio::pin!(stream);
-        while let Some(item) = stream.next().await {
-            // Check cancellation on each iteration
-            if ctx.ct.is_cancelled() {
-                return Err(McpError::internal_error("Cancelled", None));
-            }
-
-            match &item {
-                PlexusStreamItem::Progress {
-                    content_type,
-                    content,
-                    ..
-                } => {
-                    // The typed progress value, whole, for every consumer
-                    let _ = ctx
-                        .peer
-                        .notify_logging_message(log_param(LoggingLevel::Info, &logger, json!({
-                                "type": "progress",
-                                "content_type": content_type,
-                                "content": content,
-                            })))
-                        .await;
-
-                    // MCP-native progress only if the client provided a token
-                    if let Some(ref token) = progress_token {
-                        let (message, percentage) = progress_note(content);
-                        let mut progress =
-                            ProgressNotificationParam::new(token.clone(), percentage.unwrap_or(0.0));
-                        progress.message = Some(message);
-                        let _ = ctx.peer.notify_progress(progress).await;
+                // Forward ALL query parameters
+                if let Some(query) = parts.uri.query() {
+                    tracing::debug!("[MCP BRIDGE] Query string: {}", plexus_core::plexus::redact::redact_str(query));
+                    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+                        tracing::debug!("[MCP BRIDGE] Query param: {}", plexus_core::plexus::redact::redact_str(&format!("{key}={value}")));
+                        connection_meta.insert(
+                            format!("query.{}", key),
+                            json!(value.to_string()),
+                        );
                     }
-                }
-
-                PlexusStreamItem::Data {
-                    content,
-                    content_type,
-                    ..
-                } => {
-                    // Buffer data for final result
-                    buffered_data.push(content.to_value());
-
-                    // Also stream via notifications for real-time consumers
-                    let _ = ctx
-                        .peer
-                        .notify_logging_message(log_param(LoggingLevel::Info, &logger, json!({
-                                "type": "data",
-                                "content_type": content_type,
-                                "data": content,
-                            })))
-                        .await;
-                }
-
-                PlexusStreamItem::Error {
-                    error,
-                    recoverable,
-                    ..
-                } => {
-                    let _ = ctx
-                        .peer
-                        .notify_logging_message(log_param(LoggingLevel::Error, &logger, json!({
-                                "type": "error",
-                                "error": error,
-                                "recoverable": recoverable,
-                            })))
-                        .await;
-
-                    // The first non-recoverable error is why the call failed
-                    if !recoverable && fatal.is_none() {
-                        fatal = Some(error.clone());
-                    }
-                }
-
-                PlexusStreamItem::Done { .. } => {
-                    break;
-                }
-            }
-        }
-
-        // Return buffered data in the final result
-        if let Some(error) = fatal {
-            Ok(remote_error_tool_result(&error).into())
-        } else {
-            // Convert buffered data to content
-            let text_content = if buffered_data.is_empty() {
-                "(no output)".to_string()
-            } else if buffered_data.len() == 1 {
-                // Single value - return as text if string, otherwise JSON
-                match &buffered_data[0] {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => serde_json::to_string_pretty(other).unwrap_or_default(),
-                }
-            } else {
-                // Multiple values - join strings or return as JSON array
-                let all_strings = buffered_data.iter().all(|v| v.is_string());
-                if all_strings {
-                    buffered_data
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .collect::<Vec<_>>()
-                        .join("")
                 } else {
-                    serde_json::to_string_pretty(&buffered_data).unwrap_or_default()
+                    tracing::debug!("[MCP BRIDGE] No query string in URI");
                 }
+
+                // If we extracted any connection metadata, inject it
+                if !connection_meta.is_empty() {
+                    arguments_map.insert("_connection".to_string(), json!(connection_meta));
+                    tracing::debug!("[MCP BRIDGE] Injected connection metadata: {}", plexus_core::plexus::redact::redact_str(&format!("{connection_meta:?}")));
+                    tracing::debug!("Injected connection metadata: {}", plexus_core::plexus::redact::redact_str(&format!("{connection_meta:?}")));
+                } else {
+                    tracing::debug!("[MCP BRIDGE] No connection metadata to inject");
+                }
+            } else {
+                tracing::debug!("[MCP BRIDGE] No HTTP Parts in extensions!");
+            }
+
+            let arguments_value = serde_json::Value::Object(arguments_map);
+
+            // Get progress token if provided
+            let progress_token = ctx.meta.get_progress_token();
+
+            // Logger name: namespace.method (e.g., bash.execute)
+            let logger = method_name.to_string();
+
+            // Call activation and get stream.
+            // If a router is available (hub activations), use it to dispatch the full
+            // namespaced method name (e.g., "loopback.permit") to the correct child.
+            // Otherwise strip the namespace prefix and call activation directly.
+            let stream = if let Some(ref router) = self.router {
+                router(method_name.to_string(), arguments_value)
+                    .await
+                    .map_err(plexus_to_mcp_error)?
+            } else {
+                let method = if method_name.contains('.') {
+                    method_name.split('.').nth(1).unwrap_or(method_name)
+                } else {
+                    method_name
+                };
+                // RETURNS-47: the leaf path. This bridge names no caller, and
+                // with no service there is no gate: the call runs as a service
+                // with no gate runs one, anonymous and admitted everywhere
+                // (`call::ungated`). `Activation::call` alone runs in no context,
+                // where a method reading `reach` or `caller()` is refused.
+                plexus_core::call::ungated(&*self.activation, method, arguments_value, None, None)
+                    .await
+                    .map_err(plexus_to_mcp_error)?
             };
 
-            Ok(CallToolResult::success(vec![ContentBlock::text(text_content)]).into())
+            // Stream events via notifications AND buffer for final result
+            let mut fatal: Option<RemoteError> = None;
+            let mut buffered_data: Vec<serde_json::Value> = Vec::new();
+
+            tokio::pin!(stream);
+            while let Some(item) = stream.next().await {
+                match &item {
+                    PlexusStreamItem::Progress {
+                        content_type,
+                        content,
+                        ..
+                    } => {
+                        // The typed progress value, whole, for every consumer
+                        let _ = ctx
+                            .peer
+                            .notify_logging_message(log_param(LoggingLevel::Info, &logger, json!({
+                                    "type": "progress",
+                                    "content_type": content_type,
+                                    "content": content,
+                                })))
+                            .await;
+
+                        // MCP-native progress only if the client provided a token
+                        if let Some(ref token) = progress_token {
+                            let (message, percentage) = progress_note(content);
+                            let mut progress =
+                                ProgressNotificationParam::new(token.clone(), percentage.unwrap_or(0.0));
+                            progress.message = Some(message);
+                            let _ = ctx.peer.notify_progress(progress).await;
+                        }
+                    }
+
+                    PlexusStreamItem::Data {
+                        content,
+                        content_type,
+                        ..
+                    } => {
+                        // Buffer data for final result
+                        buffered_data.push(content.to_value());
+
+                        // Also stream via notifications for real-time consumers
+                        let _ = ctx
+                            .peer
+                            .notify_logging_message(log_param(LoggingLevel::Info, &logger, json!({
+                                    "type": "data",
+                                    "content_type": content_type,
+                                    "data": content,
+                                })))
+                            .await;
+                    }
+
+                    PlexusStreamItem::Error {
+                        error,
+                        recoverable,
+                        ..
+                    } => {
+                        let _ = ctx
+                            .peer
+                            .notify_logging_message(log_param(LoggingLevel::Error, &logger, json!({
+                                    "type": "error",
+                                    "error": error,
+                                    "recoverable": recoverable,
+                                })))
+                            .await;
+
+                        // The first non-recoverable error is why the call failed
+                        if !recoverable && fatal.is_none() {
+                            fatal = Some(error.clone());
+                        }
+                    }
+
+                    PlexusStreamItem::Done { .. } => {
+                        break;
+                    }
+                }
+            }
+
+            // Return buffered data in the final result
+            if let Some(error) = fatal {
+                Ok(remote_error_tool_result(&error).into())
+            } else {
+                // Convert buffered data to content
+                let text_content = if buffered_data.is_empty() {
+                    "(no output)".to_string()
+                } else if buffered_data.len() == 1 {
+                    // Single value - return as text if string, otherwise JSON
+                    match &buffered_data[0] {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => serde_json::to_string_pretty(other).unwrap_or_default(),
+                    }
+                } else {
+                    // Multiple values - join strings or return as JSON array
+                    let all_strings = buffered_data.iter().all(|v| v.is_string());
+                    if all_strings {
+                        buffered_data
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .collect::<Vec<_>>()
+                            .join("")
+                    } else {
+                        serde_json::to_string_pretty(&buffered_data).unwrap_or_default()
+                    }
+                };
+
+                Ok(CallToolResult::success(vec![ContentBlock::text(text_content)]).into())
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = ctx.ct.cancelled() => Err(McpError::internal_error("Cancelled", None)),
+            _ = plexus_transport_mcp::gone::client_gone(&ctx) => Err(McpError::internal_error("Cancelled: the client went away", None)),
+            answer = work => answer,
         }
     }
 }

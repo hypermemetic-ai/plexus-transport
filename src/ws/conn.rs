@@ -88,6 +88,11 @@ const READ_BUDGET: usize = 64;
 const OUT_HIGH: usize = 1024;
 /// How long a close handshake is given before the socket is dropped.
 const CLOSE_WAIT: Duration = Duration::from_secs(2);
+/// KEEL-59: how long the calls of a connection closing because its sign-in
+/// ended are given to say so before the close goes out (each writes one
+/// item as it learns the connection is closing; a call still being routed,
+/// with no subscription yet, is not waited for past this).
+const SAYING_WAIT: Duration = Duration::from_millis(250);
 
 /// Why a socket's loop ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -663,7 +668,46 @@ impl Loop {
     /// The socket ends: every call still writing learns it is gone, the close
     /// (or the reply to the peer's) goes out, and the peer's answer is read.
     async fn end(self, end: End) -> Option<Arc<dyn ConnectionHook>> {
+        let saying = match end {
+            End::Closed => self.conn.saying().map(str::to_string),
+            _ => None,
+        };
         let Loop { mut ws, mut table, mut own, mut frames, accepting, tx, dispatch, ext, hook, .. } = self;
+        if let Some(why) = saying {
+            // KEEL-59: the calls are told why (each writes its one item as
+            // it learns the table closed), and what they write goes out
+            // before the close.
+            if let Some(sink) = ext.get::<FrameSink>() {
+                sink.end_saying(&why);
+            }
+            table.close();
+            drop(accepting);
+            let _ = tokio::time::timeout(SAYING_WAIT, async {
+                loop {
+                    let open = dispatch.subscriptions_open();
+                    match tokio::time::timeout(Duration::from_millis(5), frames.recv()).await {
+                        Ok(Some(f)) => {
+                            if ws.send(framed(WireFrame::into_bytes(f))).await.is_err() {
+                                return;
+                            }
+                        }
+                        Ok(None) => return,
+                        Err(_) if open == 0 => return,
+                        Err(_) => {}
+                    }
+                }
+            })
+            .await;
+            own.close();
+            frames.close();
+            drop((table, own, frames, tx, dispatch, ext));
+            let _ = tokio::time::timeout(CLOSE_WAIT, async {
+                let _ = ws.send(Message::Close(end.frame())).await;
+                while let Some(Ok(_)) = ws.next().await {}
+            })
+            .await;
+            return hook;
+        }
         table.close();
         own.close();
         frames.close();
