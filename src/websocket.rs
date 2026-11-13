@@ -109,6 +109,9 @@ pub struct Connection {
     pending: Mutex<Option<PendingPlace>>,
     /// TRANSPORT-26: it came over TLS, terminated here.
     tls: bool,
+    /// KEEL-59: why it is closing, when its calls are told
+    /// ([`Connection::close_saying`]).
+    saying: OnceLock<String>,
 }
 
 impl Connection {
@@ -121,6 +124,7 @@ impl Connection {
             upgraded: OnceLock::new(),
             pending: Mutex::new(pending),
             tls: false,
+            saying: OnceLock::new(),
         }
     }
 
@@ -160,6 +164,21 @@ impl Connection {
     /// Close this connection: its WebSocket is sent a close, its calls end.
     pub fn close(&self) {
         self.closed.send_replace(true);
+    }
+
+    /// KEEL-59: close this connection because its sign-in ended: every call
+    /// open on it is sent one `unauthenticated` item saying `why` (an
+    /// expiry, a sign-out, a session revoked), then the close goes out. A
+    /// call that has already said its end adds nothing. The first `why`
+    /// stands.
+    pub fn close_saying(&self, why: &str) {
+        let _ = self.saying.set(why.to_string());
+        self.close();
+    }
+
+    /// KEEL-59: why it is closing, when its calls are told.
+    pub(crate) fn saying(&self) -> Option<&str> {
+        self.saying.get().map(String::as_str)
     }
 
     /// Whether it has been closed (asked to, or over).
@@ -348,16 +367,32 @@ fn watch_liveness(
     validator: Arc<dyn plexus_core::plexus::SessionValidator>,
     ctx: plexus_core::plexus::AuthContext,
 ) {
+    // KEEL-59: a sign-in that carries its end (`expires_at`, a capped
+    // session's too) is asked again at that moment, not at the next tick.
+    // (`expires_at`: plexus-auth-core's `EXPIRES_AT_KEY`, unix seconds.)
+    let ends = ctx.metadata.get("expires_at").and_then(serde_json::Value::as_i64);
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(LIVENESS_EVERY).await;
+            // Its end still ahead: at that moment (at most a tick away).
+            // Past it — a validator that still says alive (a session
+            // re-minted, a clock stepped back) — the tick again, never a
+            // spin (review L1).
+            let wait = ends
+                .and_then(|at| {
+                    let end = std::time::UNIX_EPOCH + Duration::from_secs(at.max(0) as u64);
+                    end.duration_since(std::time::SystemTime::now()).ok()
+                })
+                .filter(|left| !left.is_zero())
+                .map_or(LIVENESS_EVERY, |left| left.min(LIVENESS_EVERY));
+            tokio::time::sleep(wait).await;
             let Some(conn) = conn.upgrade() else { return };
             if conn.is_closed() {
                 return;
             }
             if let Err(why) = validator.alive(&ctx) {
                 tracing::info!(user_id = %ctx.user_id, peer = %conn.peer, reason = %why, "closing socket: its sign-in ended");
-                conn.close();
+                // KEEL-59: each open call is told first, then the close.
+                conn.close_saying(&why);
                 return;
             }
         }

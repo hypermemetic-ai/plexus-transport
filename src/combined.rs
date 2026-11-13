@@ -163,11 +163,12 @@ where
         bridge = bridge.with_router(rf);
     }
 
-    let session_manager = LocalSessionManager::default();
+    // KEEL-59: a session that ends cancels its calls at once.
+    let session_manager = plexus_transport_mcp::gone::EndsCalls::new(LocalSessionManager::default());
     let bridge_clone = bridge.clone();
     let mcp_service = StreamableHttpService::new(
         move || Ok(bridge_clone.clone()),
-        session_manager.into(),
+        std::sync::Arc::new(session_manager),
         StreamableHttpServerConfig::default()
             .with_allowed_hosts(crate::mcp::server::effective_allowed_hosts(addr, &allowed_hosts)),
     );
