@@ -1,0 +1,16 @@
+# LMLS-2: the browser adapter fixture. The wire crate compiled for
+# wasm32-unknown-unknown behind a four-function ABI, loaded with the
+# WebAssembly API a browser has (web/wire.mjs). No bindgen, no JS glue to
+# generate: the module imports nothing. Never published.
+[package]
+name = "mls-wire-browser-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+name = "mls_wire_browser"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+plexus-transport-mls = { path = "../.." }

@@ -1,0 +1,29 @@
+# LMLS-2: the wire and intent profile of the MLS agent transport. Versioned and
+# published on its own: nothing here depends on plexus-transport, plexus-core or
+# an application runtime, and the default build is `no_std` + `alloc`, so a
+# browser client compiles the same types and decoders as a native endpoint.
+[package]
+name = "plexus-transport-mls"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+license = "MIT"
+description = "Wire profile of the Plexus MLS agent transport: bounded v1 records, deterministic CBOR for signed intents, strict decoding"
+repository = "https://github.com/hypermemetic-ai/plexus-transport"
+readme = "README.md"
+include = ["src/**", "docs/**", "vectors/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+# The only dependency: SHA-256 for the intent digest and the derived references.
+sha2 = { version = "0.10", default-features = false }
+
+# The adapter fixtures are members of this crate's own workspace: each depends
+# on this package and on nothing else of ours, and this package depends on
+# neither (scripts/cross-check.sh asserts it).
+[workspace]
+members = [".", "fixtures/native", "fixtures/browser"]
+resolver = "2"
+
+[profile.release]
+opt-level = "s"
+panic = "abort"
